@@ -7,8 +7,8 @@ to use the real exchange so the bot's signal logic is exercised against
 live data.
 
 Usage (handled automatically by setup_bot when live.dry_run is true):
-    DryRunBybitBot = type("DryRunBybitBot", (DryRunMixin, BybitBot), {})
-    bot = DryRunBybitBot(config)
+    DryRunBot = type("DryRunBot", (DryRunMixin, ExchangeBot), {})
+    bot = DryRunBot(config)
 """
 
 import asyncio
@@ -43,19 +43,26 @@ class DryRunMixin:
         self._dry_run_open_orders: dict = {}
         self._dry_run_initialized = True
         logging.info(
-            f"[DRY RUN] paper wallet initialised at {self._dry_run_balance} USDT"
+            f"[DRY RUN] paper wallet initialised at {self._dry_run_balance} USDC"
         )
 
     def _get_fee_rate(self, symbol: str) -> float:
         try:
-            return self.markets_dict[symbol].get("maker", 0.0002) or 0.0002
+            fee = self.markets_dict[symbol].get("maker", 0.0)
+            if fee:
+                return fee
         except Exception:
-            return 0.0002
+            pass
+        # Fallback: exchange-level default (e.g. set _default_maker_fee on the exchange class)
+        return getattr(self, "_default_maker_fee", 0.0)
 
     def _dry_run_fill_order(self, order: dict, fill_price: float):
         """Apply a filled limit order to paper state (synchronous)."""
         symbol = order["symbol"]
-        pside = order.get("position_side", "long")
+        pside = order.get("position_side")
+        if not pside:
+            logging.warning(f"[DRY RUN] order missing position_side, defaulting to 'long': {order}")
+            pside = "long"
         qty = abs(order.get("qty", order.get("amount", 0.0)))
         reduce_only = order.get("reduce_only", False)
         c_mult = self.c_mults.get(symbol, 1.0) if hasattr(self, "c_mults") else 1.0
@@ -105,6 +112,17 @@ class DryRunMixin:
             )
         else:
             # Opening / adding to a position — update weighted average entry
+            # Basic margin check: reject if balance is insufficient
+            from config_utils import get_optional_config_value
+
+            leverage = float(get_optional_config_value(self.config, "live.leverage", 10))
+            required_cost = fill_price * qty * c_mult
+            if self._dry_run_balance < required_cost / leverage:
+                logging.warning(
+                    f"[DRY RUN] insufficient margin for {pside} {symbol} entry, rejecting: "
+                    f"need ~{required_cost / leverage:.2f} ({leverage}x), have {self._dry_run_balance:.2f}"
+                )
+                return
             fee = fill_price * qty * c_mult * fee_rate
             self._dry_run_balance -= fee
             pos = self._dry_run_positions.get(key, {"size": 0.0, "price": 0.0})
@@ -145,6 +163,8 @@ class DryRunMixin:
                 filled_ids.append(order_id)
         for oid in filled_ids:
             self._dry_run_open_orders.pop(oid, None)
+        if filled_ids and hasattr(self, "execution_scheduled"):
+            self.execution_scheduled = True
 
     # ------------------------------------------------------------------ #
     #  Overridden private endpoints                                        #
@@ -182,17 +202,20 @@ class DryRunMixin:
         self._ensure_dry_run_state()
         order_id = f"dry_run_{next(_dry_run_id_counter)}"
         qty = abs(order.get("qty", order.get("amount", 0.0)))
+        if not order.get("position_side"):
+            logging.warning(f"[DRY RUN] execute_order missing position_side, defaulting to 'long': {order}")
         pending = {
             "id": order_id,
             "symbol": order["symbol"],
             "side": order.get("side", ""),
-            "position_side": order.get("position_side", "long"),
+            "position_side": order.get("position_side") or "long",
             "qty": qty,
             "price": float(order["price"]),
             "amount": qty,
             "reduce_only": order.get("reduce_only", False),
             "timestamp": utc_ms(),
             "status": "open",
+            "type": order.get("type", "limit"),
         }
 
         # Immediate fill for market orders
@@ -209,8 +232,8 @@ class DryRunMixin:
                         f" {pending['symbol']} qty={qty} @ {fill_price}"
                     )
                     return {**pending, "filled": qty, "remaining": 0.0, "status": "closed"}
-            except Exception:
-                pass  # fall through to limit queue
+            except Exception as e:
+                logging.warning(f"[DRY RUN] market order price lookup failed, queuing as limit: {e}")
 
         self._dry_run_open_orders[order_id] = pending
         logging.info(
@@ -224,6 +247,38 @@ class DryRunMixin:
         self._ensure_dry_run_state()
         self._dry_run_open_orders.pop(order.get("id", ""), None)
         return {"id": order.get("id", ""), "symbol": order.get("symbol", ""), "status": "canceled"}
+
+    async def execute_orders(self, orders):
+        """Override batch creates — route each through dry-run execute_order.
+
+        Without this, exchange adapters with batch implementations (e.g. Lighter's
+        _sign_and_send_batch) would bypass dry-run and send real orders.
+        """
+        return [await self.execute_order(o) for o in orders]
+
+    async def execute_cancellations(self, orders):
+        """Override batch cancels — route each through dry-run execute_cancellation.
+
+        Prevents any future exchange batch-cancel implementation from bypassing dry-run.
+        """
+        return [await self.execute_cancellation(o) for o in orders]
+
+    async def start_data_maintainers(self):
+        """Start only base maintainers, skipping exchange-specific WS (e.g. TxWebSocket)."""
+        if hasattr(self, "maintainers"):
+            self.stop_data_maintainers()
+        maintainer_names = ["maintain_hourly_cycle"]
+        if self.ws_enabled:
+            maintainer_names.append("watch_orders")
+        else:
+            logging.info("Websocket maintainers skipped (ws disabled via custom endpoints).")
+        self.maintainers = {
+            name: asyncio.create_task(getattr(self, name)()) for name in maintainer_names
+        }
+
+    async def _start_ws_early(self):
+        """No-op in dry-run: avoids waiting for WS caches that never populate."""
+        pass
 
     async def fetch_pnls(self, start_time=None, end_time=None, limit=None):
         """No historical fill records in dry-run mode."""

@@ -904,6 +904,8 @@ class LighterBot(Passivbot):
                         "amount": {"min": min_base},
                         "cost": {"min": min_quote},
                     },
+                    "maker": 0.0,  # Lighter has zero fees
+                    "taker": 0.0,
                     "contractSize": 1.0,
                     "info": {
                         "market_id": market_id,
@@ -996,6 +998,8 @@ class LighterBot(Passivbot):
                         "amount": {"min": float(m["min_base"])},
                         "cost": {"min": float(m["min_quote"])},
                     },
+                    "maker": 0.0,  # Lighter has zero fees
+                    "taker": 0.0,
                     "contractSize": 1.0,
                     "info": {
                         "market_id": market_id,
@@ -1196,7 +1200,7 @@ class LighterBot(Passivbot):
                         positions.append({
                             "symbol": symbol,
                             "position_side": "long" if signed_size > 0 else "short",
-                            "size": signed_size,
+                            "size": abs(signed_size),
                             "price": entry_price,
                         })
                     except Exception as e:
@@ -1286,6 +1290,7 @@ class LighterBot(Passivbot):
                             "position_side": self.determine_pos_side(
                                 {"symbol": sym, "side": side, "reduceOnly": bool(o.get("reduce_only", False))}
                             ),
+                            "reduce_only": bool(o.get("reduce_only", False)),
                             "info": o,
                         }
                         # Track client->exchange order ID mapping
@@ -2474,7 +2479,7 @@ class LighterBot(Passivbot):
                     positions.append({
                         "symbol": symbol,
                         "position_side": "long" if signed_size > 0 else "short",
-                        "size": signed_size,
+                        "size": abs(signed_size),
                         "price": entry_price,
                     })
                 except Exception as e:
