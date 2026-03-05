@@ -123,6 +123,9 @@ Add these two keys to the `live` section of your config JSON:
 
 - `dry_run` — set to `true` to activate paper trading.
 - `dry_run_wallet` — starting simulated balance (default: 10000.0 USDC).
+- Dry-run reserves margin across existing positions and pending entry orders, so impossible overlapping entries are rejected before or at fill time.
+- Dry-run uses mark-to-market equity for margin availability with entry-price fallback when fresh marks are unavailable.
+- Market orders use taker fees, validate against the fetched execution price, and are rejected if no fresh price is available.
 
 Then run normally:
 

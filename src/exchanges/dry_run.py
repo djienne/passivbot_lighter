@@ -41,23 +41,159 @@ class DryRunMixin:
         self._dry_run_positions = {}
         # {order_id: order_dict} — pending limit orders waiting to be matched
         self._dry_run_open_orders: dict = {}
+        if not hasattr(self, "pnls"):
+            self.pnls = []
         self._dry_run_initialized = True
         logging.info(
             f"[DRY RUN] paper wallet initialised at {self._dry_run_balance} USDC"
         )
 
-    def _get_fee_rate(self, symbol: str) -> float:
+    def _get_fee_rate(self, symbol: str, is_taker: bool = False) -> float:
         try:
-            fee = self.markets_dict[symbol].get("maker", 0.0)
+            key = "taker" if is_taker else "maker"
+            fee = self.markets_dict[symbol].get(key, 0.0)
             if fee:
                 return fee
         except Exception:
             pass
-        # Fallback: exchange-level default (e.g. set _default_maker_fee on the exchange class)
-        return getattr(self, "_default_maker_fee", 0.0)
+        # Fallback: exchange-level defaults.
+        default_key = "_default_taker_fee" if is_taker else "_default_maker_fee"
+        return getattr(self, default_key, 0.0)
 
-    def _dry_run_fill_order(self, order: dict, fill_price: float):
-        """Apply a filled limit order to paper state (synchronous)."""
+    def _get_dry_run_leverage(self) -> float:
+        from config_utils import get_optional_config_value
+
+        try:
+            leverage = float(get_optional_config_value(self.config, "live.leverage", 10))
+        except (TypeError, ValueError):
+            leverage = 10.0
+        return max(leverage, 1e-12)
+
+    def _get_order_required_margin(self, order: dict, fill_price: float | None = None) -> float:
+        qty = abs(order.get("qty", order.get("amount", 0.0)))
+        if qty <= 0.0 or order.get("reduce_only", False):
+            return 0.0
+        symbol = order["symbol"]
+        price = float(fill_price if fill_price is not None else order.get("price", 0.0))
+        c_mult = self.c_mults.get(symbol, 1.0) if hasattr(self, "c_mults") else 1.0
+        return (price * qty * c_mult) / self._get_dry_run_leverage()
+
+    def _get_used_margin(self) -> float:
+        used_margin = 0.0
+        for (symbol, _pside), pos in self._dry_run_positions.items():
+            size = abs(pos.get("size", 0.0))
+            price = float(pos.get("price", 0.0))
+            c_mult = self.c_mults.get(symbol, 1.0) if hasattr(self, "c_mults") else 1.0
+            used_margin += (size * price * c_mult) / self._get_dry_run_leverage()
+        return used_margin
+
+    def _get_reserved_margin(self, exclude_order_id: str | None = None) -> float:
+        reserved_margin = 0.0
+        for order_id, order in self._dry_run_open_orders.items():
+            if exclude_order_id is not None and order_id == exclude_order_id:
+                continue
+            reserved_margin += self._get_order_required_margin(order)
+        return reserved_margin
+
+    def _get_position_mark_price(self, symbol: str, pos: dict, mark_prices: dict | None = None) -> float:
+        if mark_prices and mark_prices.get(symbol) is not None:
+            return float(mark_prices[symbol])
+        return float(pos.get("price", 0.0))
+
+    def _get_dry_run_equity(self, mark_prices: dict | None = None) -> float:
+        equity = self._dry_run_balance
+        for (symbol, pside), pos in self._dry_run_positions.items():
+            size = abs(pos.get("size", 0.0))
+            if size == 0.0:
+                continue
+            entry_price = float(pos.get("price", 0.0))
+            mark_price = self._get_position_mark_price(symbol, pos, mark_prices)
+            c_mult = self.c_mults.get(symbol, 1.0) if hasattr(self, "c_mults") else 1.0
+            if pside == "long":
+                equity += (mark_price - entry_price) * size * c_mult
+            else:
+                equity += (entry_price - mark_price) * size * c_mult
+        return equity
+
+    def _get_available_margin(
+        self, exclude_order_id: str | None = None, mark_prices: dict | None = None
+    ) -> float:
+        return (
+            self._get_dry_run_equity(mark_prices=mark_prices)
+            - self._get_used_margin()
+            - self._get_reserved_margin(exclude_order_id=exclude_order_id)
+        )
+
+    async def _get_latest_dry_run_marks(self, extra_symbols=None) -> dict:
+        symbols = {symbol for symbol, _pside in self._dry_run_positions}
+        if extra_symbols:
+            symbols.update(extra_symbols)
+        if not symbols or not hasattr(self, "cm"):
+            return {}
+        try:
+            prices = await self.cm.get_last_prices(symbols, max_age_ms=10_000)
+            return {
+                symbol: float(price)
+                for symbol, price in prices.items()
+                if price is not None
+            }
+        except Exception:
+            return {}
+
+    def _make_rejected_order_result(
+        self, order: dict, reason: str, *, order_id=None, remaining=None
+    ) -> dict:
+        qty = abs(order.get("qty", order.get("amount", 0.0)))
+        if remaining is None:
+            remaining = qty
+        return {
+            "id": order_id,
+            "symbol": order.get("symbol", ""),
+            "side": order.get("side", ""),
+            "position_side": order.get("position_side") or "long",
+            "qty": qty,
+            "price": float(order.get("price", 0.0) or 0.0),
+            "amount": qty,
+            "reduce_only": order.get("reduce_only", False),
+            "timestamp": utc_ms(),
+            "status": "rejected",
+            "type": order.get("type", "limit"),
+            "filled": 0.0,
+            "remaining": remaining,
+            "rejected": True,
+            "reason": reason,
+        }
+
+    async def _check_margin_available(
+        self,
+        order: dict,
+        fill_price: float,
+        exclude_order_id: str | None = None,
+        mark_prices: dict | None = None,
+    ) -> tuple[bool, str, float, float]:
+        required_margin = self._get_order_required_margin(order, fill_price=fill_price)
+        fee_rate = self._get_fee_rate(symbol=order["symbol"], is_taker=order.get("type") == "market")
+        qty = abs(order.get("qty", order.get("amount", 0.0)))
+        c_mult = self.c_mults.get(order["symbol"], 1.0) if hasattr(self, "c_mults") else 1.0
+        fee = fill_price * qty * c_mult * fee_rate
+        if mark_prices is None:
+            mark_prices = await self._get_latest_dry_run_marks({order["symbol"]})
+        available_margin = self._get_available_margin(
+            exclude_order_id=exclude_order_id, mark_prices=mark_prices
+        )
+        required_available = required_margin + fee
+        if available_margin + 1e-12 >= required_available:
+            return True, "", required_margin, fee
+        reason = (
+            f"insufficient margin: need {required_available:.6f}, "
+            f"have {available_margin:.6f}"
+        )
+        return False, reason, required_margin, fee
+
+    async def _dry_run_fill_order(
+        self, order: dict, fill_price: float, mark_prices: dict | None = None
+    ):
+        """Apply a filled order to paper state and return a structured result."""
         symbol = order["symbol"]
         pside = order.get("position_side")
         if not pside:
@@ -66,7 +202,7 @@ class DryRunMixin:
         qty = abs(order.get("qty", order.get("amount", 0.0)))
         reduce_only = order.get("reduce_only", False)
         c_mult = self.c_mults.get(symbol, 1.0) if hasattr(self, "c_mults") else 1.0
-        fee_rate = self._get_fee_rate(symbol)
+        fee_rate = self._get_fee_rate(symbol, is_taker=order.get("type") == "market")
 
         key = (symbol, pside)
 
@@ -75,6 +211,10 @@ class DryRunMixin:
             pos = self._dry_run_positions.get(key, {"size": 0.0, "price": 0.0})
             old_size = pos["size"]
             effective_qty = min(qty, old_size)
+            if effective_qty <= 0.0:
+                reason = f"no {pside} position available to reduce"
+                logging.warning(f"[DRY RUN] rejecting reduce-only order: {reason} {order}")
+                return self._make_rejected_order_result(order, reason, order_id=order.get("id"))
             if qty > old_size:
                 logging.warning(
                     f"[DRY RUN] close {pside} {symbol}: close qty={qty} exceeds "
@@ -110,20 +250,30 @@ class DryRunMixin:
                 f"[DRY RUN] fill (close) {pside} {symbol} qty={effective_qty} @ {fill_price}"
                 f"  pnl={pnl:.4f}  fee={fee:.4f}  balance={self._dry_run_balance:.2f}"
             )
+            return {
+                "id": order.get("id"),
+                "symbol": symbol,
+                "position_side": pside,
+                "qty": qty,
+                "filled_qty": effective_qty,
+                "price": fill_price,
+                "status": "filled",
+                "fee": fee,
+                "pnl": pnl,
+                "balance_after": self._dry_run_balance,
+                "rejected": False,
+            }
         else:
             # Opening / adding to a position — update weighted average entry
-            # Basic margin check: reject if balance is insufficient
-            from config_utils import get_optional_config_value
-
-            leverage = float(get_optional_config_value(self.config, "live.leverage", 10))
-            required_cost = fill_price * qty * c_mult
-            if self._dry_run_balance < required_cost / leverage:
-                logging.warning(
-                    f"[DRY RUN] insufficient margin for {pside} {symbol} entry, rejecting: "
-                    f"need ~{required_cost / leverage:.2f} ({leverage}x), have {self._dry_run_balance:.2f}"
-                )
-                return
-            fee = fill_price * qty * c_mult * fee_rate
+            can_fill, reason, required_margin, fee = await self._check_margin_available(
+                order,
+                fill_price,
+                exclude_order_id=order.get("id"),
+                mark_prices=mark_prices,
+            )
+            if not can_fill:
+                logging.warning(f"[DRY RUN] rejecting {pside} {symbol} entry: {reason}")
+                return self._make_rejected_order_result(order, reason, order_id=order.get("id"))
             self._dry_run_balance -= fee
             pos = self._dry_run_positions.get(key, {"size": 0.0, "price": 0.0})
             old_size = pos["size"]
@@ -138,6 +288,19 @@ class DryRunMixin:
                 f"  fee={fee:.4f}  pos_size={new_size:.6f}  avg_price={new_price:.4f}"
                 f"  balance={self._dry_run_balance:.2f}"
             )
+            return {
+                "id": order.get("id"),
+                "symbol": symbol,
+                "position_side": pside,
+                "qty": qty,
+                "filled_qty": qty,
+                "price": fill_price,
+                "status": "filled",
+                "fee": fee,
+                "required_margin": required_margin,
+                "balance_after": self._dry_run_balance,
+                "rejected": False,
+            }
 
     async def _dry_run_match_orders(self):
         """Match pending limit orders against current market prices."""
@@ -159,8 +322,11 @@ class DryRunMixin:
             limit_price = order["price"]
             if (side == "buy" and last_price <= limit_price) or \
                (side == "sell" and last_price >= limit_price):
-                self._dry_run_fill_order(order, fill_price=limit_price)
-                filled_ids.append(order_id)
+                fill_result = await self._dry_run_fill_order(
+                    order, fill_price=limit_price, mark_prices=last_prices
+                )
+                if fill_result and not fill_result.get("rejected", False):
+                    filled_ids.append(order_id)
         for oid in filled_ids:
             self._dry_run_open_orders.pop(oid, None)
         if filled_ids and hasattr(self, "execution_scheduled"):
@@ -186,7 +352,8 @@ class DryRunMixin:
                         "timestamp": now,
                     }
                 )
-        return positions, self._dry_run_balance
+        mark_prices = await self._get_latest_dry_run_marks()
+        return positions, self._get_dry_run_equity(mark_prices=mark_prices)
 
     async def fetch_open_orders(self, symbol=None):
         """Run the matching engine then return remaining pending orders."""
@@ -219,21 +386,43 @@ class DryRunMixin:
         }
 
         # Immediate fill for market orders
-        if order.get("type") == "market" and hasattr(self, "cm"):
+        if order.get("type") == "market":
+            if not hasattr(self, "cm"):
+                reason = "market order rejected: no price source available"
+                logging.warning(f"[DRY RUN] {reason}")
+                return self._make_rejected_order_result(pending, reason, order_id=None)
             try:
                 prices = await self.cm.get_last_prices(
                     {order["symbol"]}, max_age_ms=10_000
                 )
-                fill_price = prices.get(order["symbol"])
-                if fill_price:
-                    self._dry_run_fill_order(pending, fill_price)
-                    logging.info(
-                        f"[DRY RUN] market fill {pending['side']} {pending['position_side']}"
-                        f" {pending['symbol']} qty={qty} @ {fill_price}"
-                    )
-                    return {**pending, "filled": qty, "remaining": 0.0, "status": "closed"}
             except Exception as e:
-                logging.warning(f"[DRY RUN] market order price lookup failed, queuing as limit: {e}")
+                reason = f"market order rejected: price lookup failed ({e})"
+                logging.warning(f"[DRY RUN] {reason}")
+                return self._make_rejected_order_result(pending, reason, order_id=None)
+            fill_price = prices.get(order["symbol"])
+            if not fill_price:
+                reason = "market order rejected: no fresh price available"
+                logging.warning(f"[DRY RUN] {reason}")
+                return self._make_rejected_order_result(pending, reason, order_id=None)
+            fill_result = await self._dry_run_fill_order(
+                pending, fill_price, mark_prices=prices
+            )
+            if fill_result and not fill_result.get("rejected", False):
+                logging.info(
+                    f"[DRY RUN] market fill {pending['side']} {pending['position_side']}"
+                    f" {pending['symbol']} qty={qty} @ {fill_price}"
+                )
+                return {**pending, "filled": qty, "remaining": 0.0, "status": "closed"}
+            return fill_result
+
+        can_place, reason, _, _ = await self._check_margin_available(
+            pending, pending["price"]
+        )
+        if not can_place:
+            logging.warning(f"[DRY RUN] rejecting order placement: {reason} {pending}")
+            return self._make_rejected_order_result(
+                pending, reason, order_id=None, remaining=qty
+            )
 
         self._dry_run_open_orders[order_id] = pending
         logging.info(
@@ -316,7 +505,11 @@ class DryRunMixin:
     def did_create_order(self, executed) -> bool:
         """Accept any response that carries a non-None id (shadows exchange overrides)."""
         try:
-            return "id" in executed and executed["id"] is not None
+            return (
+                "id" in executed
+                and executed["id"] is not None
+                and executed.get("status") != "rejected"
+            )
         except Exception:
             return False
 
