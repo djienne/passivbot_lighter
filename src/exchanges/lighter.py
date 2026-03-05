@@ -44,7 +44,20 @@ _PONG_MSG = '{"type":"pong"}'
 def _is_quota_error(exc_or_msg) -> bool:
     """Return True if the error is specifically a volume-quota exhaustion."""
     msg = str(exc_or_msg).lower()
-    return "volume quota" in msg or ("quota" in msg and "not enough" in msg) or ("quota" in msg and "exhausted" in msg)
+    if any(
+        phrase in msg
+        for phrase in (
+            "didn't use volume quota",
+            "did not use volume quota",
+            "didnt use volume quota",
+        )
+    ):
+        return False
+    return (
+        "volume quota" in msg
+        or ("quota" in msg and "not enough" in msg)
+        or ("quota" in msg and "exhausted" in msg)
+    )
 
 
 def _is_transient_error(exc) -> bool:
@@ -60,6 +73,37 @@ def _detect_429(exc) -> bool:
     """Return True if the exception indicates a 429 rate-limit."""
     msg = str(exc).lower()
     return "429" in msg or "too many" in msg
+
+
+def _get_lighter_response_code(resp) -> int:
+    """Normalize transaction response codes across SDK REST and WS wrappers."""
+    if resp is None:
+        return -1
+
+    if isinstance(resp, dict):
+        raw_code = resp.get("code", resp.get("status_code"))
+        err = resp.get("error")
+        if isinstance(err, dict):
+            raw_code = err.get("code", raw_code)
+    else:
+        raw_code = getattr(resp, "code", getattr(resp, "status_code", None))
+
+    try:
+        code = int(raw_code) if raw_code is not None else 0
+    except (TypeError, ValueError):
+        code = 0
+    return 0 if code == 200 else code
+
+
+def _get_lighter_response_message(resp) -> str:
+    if resp is None:
+        return ""
+    if isinstance(resp, dict):
+        err = resp.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message", ""))
+        return str(resp.get("message", ""))
+    return str(getattr(resp, "message", str(resp)))
 
 
 class _WsBatchResponse:
@@ -1884,8 +1928,9 @@ class LighterBot(Passivbot):
                     self._order_cancel_events.pop(exchange_order_id, None)
                     return {}
 
-            if hasattr(resp, "code") and resp.code != 0:
-                err_msg = getattr(resp, "message", str(resp))
+            resp_code = _get_lighter_response_code(resp)
+            if resp_code != 0:
+                err_msg = _get_lighter_response_message(resp)
                 logging.error(f"cancel order failed: {err_msg}")
                 self._handle_nonce_error(err_msg, api_key_idx)
                 self._order_cancel_events.pop(exchange_order_id, None)
@@ -2161,9 +2206,9 @@ class LighterBot(Passivbot):
                 return results
 
         # -- Phase 3: process response (outside lock) --
-        resp_code = getattr(resp, "code", 0) if resp else -1
+        resp_code = _get_lighter_response_code(resp)
         if resp_code != 0:
-            err_msg = getattr(resp, "message", str(resp))
+            err_msg = _get_lighter_response_message(resp)
             err_lower = err_msg.lower() if isinstance(err_msg, str) else ""
             logging.error(f"batch send failed (code={resp_code}): {err_msg}")
             # Distinguish error types for proper recovery (matching reference impl)

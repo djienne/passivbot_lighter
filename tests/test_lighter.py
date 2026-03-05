@@ -714,6 +714,7 @@ class TestErrorClassification:
         from exchanges.lighter import _is_quota_error
         assert not _is_quota_error("network error")
         assert not _is_quota_error("invalid nonce")
+        assert not _is_quota_error('{"ratelimit": "didn\'t use volume quota"}')
 
     def test_is_transient_error_429(self):
         from exchanges.lighter import _is_transient_error
@@ -1921,6 +1922,27 @@ class TestCancelRespCodeError:
         result = await lighter_bot.execute_cancellation(order)
         assert result == {}
 
+    @pytest.mark.asyncio
+    async def test_cancel_http_200_response_is_treated_as_success(self, lighter_bot):
+        lighter_bot._known_exchange_order_ids.add(501)
+        lighter_bot.lighter_client.send_tx = AsyncMock(
+            return_value=types.SimpleNamespace(
+                code=200,
+                message='{"ratelimit": "didn\'t use volume quota"}',
+            )
+        )
+        lighter_bot.fetch_open_orders = AsyncMock(return_value=[])
+
+        async def _timeout(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError()
+
+        with patch("asyncio.wait_for", side_effect=_timeout):
+            order = {"id": "501", "symbol": "HYPE/USDC:USDC"}
+            result = await lighter_bot.execute_cancellation(order)
+
+        assert lighter_bot.did_cancel_order(result)
+
 
 # ===========================================================================
 # C2: execute_cancellation — rate-limit blocks cancel
@@ -2279,6 +2301,25 @@ class TestBatchRespCodeError:
         results = await lighter_bot._sign_and_send_batch(ops)
         assert len(results) == 2
         assert all(r == {} for r in results)
+
+    @pytest.mark.asyncio
+    async def test_batch_http_200_response_is_treated_as_success(self, lighter_bot):
+        lighter_bot.lighter_client.send_tx_batch = AsyncMock(
+            return_value=types.SimpleNamespace(
+                code=200,
+                message='{"ratelimit": "didn\'t use volume quota"}',
+                tx_hash=["0xabc"],
+            )
+        )
+        lighter_bot._volume_quota_remaining = 50
+        ops = [
+            {"action": "create", "symbol": "HYPE/USDC:USDC", "side": "buy",
+             "qty": 1.0, "price": 15.0, "reduce_only": False}
+        ]
+        results = await lighter_bot._sign_and_send_batch(ops)
+        assert len(results) == 1
+        assert lighter_bot.did_create_order(results[0])
+        assert lighter_bot._volume_quota_remaining == 50
 
 
 # ===========================================================================
