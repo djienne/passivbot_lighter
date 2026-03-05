@@ -1,0 +1,32 @@
+networks:
+  default:
+    external: true
+    name: passivbot_default
+services:
+  passivbot-lighter-live:
+    build:
+      context: .
+      dockerfile: Dockerfile_live
+    image: passivbot-lighter:latest
+    container_name: passivbot-lighter-live
+    restart: unless-stopped
+    volumes:
+      - ./:/app/
+      - ./api-keys.json:/app/api-keys.json
+    working_dir: /app
+    command: python src/main.py configs/hype_top.json
+
+  passivbot-live:
+    profiles:
+     - live
+    build:
+      context: .
+      dockerfile: Dockerfile_live
+    image: passivbot-lighter:latest
+    container_name: passivbot-lighter-standalone
+    restart: unless-stopped
+    volumes:
+      - ./configs/:/app/configs/
+      - ./api-keys.json:/app/api-keys.json
+    working_dir: /app
+    # command: python src/main.py configs/hype_top.json

@@ -1,0 +1,18 @@
+-r requirements-rust.txt
+-r requirements-live.txt
+matplotlib==3.5.1
+prospector==1.6.0
+colorama==0.4.4
+mkdocs==1.4.0
+mkdocs-material==8.1.8
+pymdown-extensions==9.1
+PyYAML==6.0
+pyecharts==1.9.1
+deap==1.4.1
+websockets==10.4
+aiohttp==3.11.18
+dictdiffer==0.9.0
+openpyxl==3.1.5
+msgpack==1.1.0
+plotly==6.0.1
+git+https://github.com/elliottech/lighter-python.git@b7fc10b288f317e9c974f318d8de7fcc5cc557e4

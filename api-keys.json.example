@@ -1,0 +1,51 @@
+{
+    "referrals": {
+        "bybit": "https://partner.bybit.com/b/passivbot",
+        "bitget": "https://partner.bitget.com/bg/Y8FU1W",
+        "okx": "https://www.okx.com/join/PASSIVBOT",
+        "binance": "https://accounts.binance.com/register?ref=TII4B07C",
+        "gateio": "https://www.gate.io/signup/AQCRUVTE",
+        "hyperliquid": "https://app.hyperliquid.xyz/join/PASSIVBOT",
+        "defx": "https://app.defx.com/join/4DKR14",
+        "kucoin": "https://www.kucoin.com/r/rf/CX8Q6DUF"
+    },
+    "binance_01" : {
+        "exchange": "binance",
+        "key": "key",
+        "secret": "secret"
+    },
+    "bybit_01" : {
+        "exchange": "bybit",
+        "key": "key",
+        "secret": "secret"
+    },
+    "bitget_01" : {
+        "exchange": "bitget",
+        "key": "key",
+        "secret": "secret",
+        "passphrase": "passphrase"
+    },
+    "okx_01" : {
+        "exchange": "okx",
+        "key": "key",
+        "secret": "secret",
+        "passphrase": "passphrase"
+    },
+    "hyperliquid_01" : {
+        "exchange": "hyperliquid",
+        "wallet_address": "wallet_address",
+        "private_key": "private_key",
+        "is_vault": false
+    },
+    "gateio_01" : {
+        "exchange": "gateio",
+        "key": "key",
+        "secret": "secret"
+    },
+    "lighter_01" : {
+        "exchange": "lighter",
+        "private_key": "your_api_key_private_key_hex",
+        "account_index": 0,
+        "api_key_index": 3
+    }
+}
