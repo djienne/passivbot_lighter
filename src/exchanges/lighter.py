@@ -1,5 +1,6 @@
 from passivbot import Passivbot, logging
 import asyncio
+import math
 import random
 import traceback
 import time
@@ -435,6 +436,164 @@ class LighterBot(Passivbot):
 
     def _symbol_to_market_index(self, symbol):
         return self.market_id_map[symbol]
+
+    @staticmethod
+    def _extract_lighter_balance(data, fields):
+        for field in fields:
+            val = getattr(data, field, None) if not isinstance(data, dict) else data.get(field)
+            if val is not None:
+                try:
+                    parsed = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(parsed):
+                    return parsed
+        return None
+
+    def _get_balance_value_from_account_data(self, account_data):
+        balance = self._extract_lighter_balance(
+            account_data, ["total_asset_value", "collateral", "available_balance"]
+        )
+        if balance is None:
+            logging.warning(
+                "no balance field found in account data (total_asset_value, collateral, available_balance all None)"
+            )
+            return 0.0
+        return balance
+
+    def _get_balance_value_from_user_stats(self, stats):
+        return self._extract_lighter_balance(
+            stats, ["portfolio_value", "collateral", "available_balance"]
+        )
+
+    def _normalize_market_order_for_lighter(self, order: dict):
+        order_type = order.get("type", "limit")
+        tif_config = require_live_value(self.config, "time_in_force")
+        if order_type == "market":
+            if tif_config == "post_only":
+                logging.warning("lighter: rejecting market order while time_in_force=post_only")
+                return None
+            # Use an aggressive GTC limit to preserve one-send execution semantics
+            # without additional REST reads or quota consumption.
+            return (
+                lighter.SignerClient.ORDER_TYPE_LIMIT,
+                lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            )
+        if tif_config == "post_only":
+            return (
+                lighter.SignerClient.ORDER_TYPE_LIMIT,
+                lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,
+            )
+        return (
+            lighter.SignerClient.ORDER_TYPE_LIMIT,
+            lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+        )
+
+    def _get_cached_market_ticker(self, symbol: str) -> dict | None:
+        for source in (
+            self._ws_tickers_cache,
+            getattr(self, "tickers", None),
+            self._tickers_cache,
+        ):
+            if source and symbol in source and isinstance(source[symbol], dict):
+                return source[symbol]
+        return None
+
+    def _get_market_execution_price(self, order: dict) -> float:
+        price = float(order["price"])
+        if order.get("type") != "market":
+            return price
+
+        symbol = order["symbol"]
+        tick = float(self.price_steps.get(symbol, 0.0) or 0.0)
+        ticker = self._get_cached_market_ticker(symbol) or {}
+        last = float(ticker.get("last", 0.0) or 0.0)
+
+        if order["side"] == "buy":
+            best = float(ticker.get("ask", 0.0) or last or price)
+            aggressive = max(price, best)
+            if tick > 0.0:
+                aggressive = max(aggressive * 1.001, aggressive + tick)
+            return aggressive
+
+        best = float(ticker.get("bid", 0.0) or last or price)
+        aggressive = min(price, best)
+        if tick > 0.0:
+            aggressive = min(aggressive * 0.999, aggressive - tick)
+            aggressive = max(tick, aggressive)
+        return aggressive
+
+    @staticmethod
+    def _parse_candles_payload(payload):
+        if payload is None:
+            return []
+
+        if isinstance(payload, dict):
+            candles_raw = payload.get("c") or payload.get("candlesticks") or []
+        else:
+            candles_raw = getattr(payload, "c", None)
+            if candles_raw is None:
+                candles_raw = getattr(payload, "candlesticks", [])
+
+        candles = []
+        for candle in candles_raw:
+            if isinstance(candle, dict):
+                if "t" in candle:
+                    ts = candle.get("t")
+                    open_ = candle.get("o")
+                    high = candle.get("h")
+                    low = candle.get("l")
+                    close = candle.get("c")
+                    volume = candle.get("v", 0)
+                else:
+                    ts = candle.get("timestamp")
+                    open_ = candle.get("open")
+                    high = candle.get("high")
+                    low = candle.get("low")
+                    close = candle.get("close")
+                    volume = candle.get("volume", 0)
+            else:
+                ts = getattr(candle, "t", None)
+                open_ = getattr(candle, "o", None)
+                high = getattr(candle, "h", None)
+                low = getattr(candle, "l", None)
+                close = getattr(candle, "c", None)
+                volume = getattr(candle, "v", 0)
+                if ts is None:
+                    ts = getattr(candle, "timestamp", None)
+                    open_ = getattr(candle, "open", None)
+                    high = getattr(candle, "high", None)
+                    low = getattr(candle, "low", None)
+                    close = getattr(candle, "close", None)
+                    volume = getattr(candle, "volume", 0)
+
+            if None in (ts, open_, high, low, close):
+                continue
+            candles.append(
+                [
+                    int(ts),
+                    float(open_),
+                    float(high),
+                    float(low),
+                    float(close),
+                    float(volume or 0),
+                ]
+            )
+        return candles
+
+    async def _fetch_candles_via_sdk(self, symbol, timeframe, n_candles, since=None):
+        if self.candlestick_api is None or not hasattr(self.candlestick_api, "candlesticks"):
+            return []
+
+        params = {
+            "market_id": self.market_id_map[symbol],
+            "resolution": timeframe,
+            "count_back": n_candles,
+        }
+        if since is not None:
+            params["start_timestamp"] = int(since)
+        payload = await self.candlestick_api.candlesticks(**params)
+        return self._parse_candles_payload(payload)
 
     # --- Persistent aiohttp session ---
 
@@ -1122,11 +1281,6 @@ class LighterBot(Passivbot):
                      and (now - self._ws_balance_cache_ts) < self._ws_cache_max_age)
         if pos_fresh and bal_fresh:
             return self._ws_positions_cache, self._ws_balance_cache
-        # If positions are fresh but balance is stale, still use WS caches —
-        # balance from user_stats was already applied to self.balance directly,
-        # and the cached value is good enough to avoid a REST call.
-        if pos_fresh and self._ws_balance_cache is not None:
-            return self._ws_positions_cache, self._ws_balance_cache
 
         if not await self._wait_for_read_slot():
             return False
@@ -1143,14 +1297,7 @@ class LighterBot(Passivbot):
             account_data = info.accounts[0]
 
             # Extract balance
-            balance = 0.0
-            for field in ["available_balance", "collateral", "total_asset_value"]:
-                val = getattr(account_data, field, None)
-                if val is not None:
-                    balance = float(val)
-                    break
-            else:
-                logging.warning("no balance field found in account data (available_balance, collateral, total_asset_value all None)")
+            balance = self._get_balance_value_from_account_data(account_data)
 
             # Extract positions
             positions = []
@@ -1200,7 +1347,7 @@ class LighterBot(Passivbot):
                         positions.append({
                             "symbol": symbol,
                             "position_side": "long" if signed_size > 0 else "short",
-                            "size": abs(signed_size),
+                            "size": signed_size,
                             "price": entry_price,
                         })
                     except Exception as e:
@@ -1234,7 +1381,7 @@ class LighterBot(Passivbot):
             if symbol:
                 markets_to_check = [symbol]
             else:
-                # Only check active markets (approved + those with positions)
+                # Only check relevant markets (approved + those with positions/open orders)
                 active = set()
                 if hasattr(self, "approved_coins_minus_ignored_coins"):
                     active.update(*self.approved_coins_minus_ignored_coins.values())
@@ -1242,6 +1389,8 @@ class LighterBot(Passivbot):
                     for s, sides in self.positions.items():
                         if any(float(sides.get(ps, {}).get("size", 0)) != 0 for ps in ("long", "short")):
                             active.add(s)
+                if hasattr(self, "open_orders") and isinstance(self.open_orders, dict):
+                    active.update([s for s, orders in self.open_orders.items() if orders])
                 markets_to_check = [s for s in active if s in self.market_id_map]
                 if not markets_to_check:
                     markets_to_check = list(self.market_id_map.keys())
@@ -1451,32 +1600,19 @@ class LighterBot(Passivbot):
             "count_back": capped,
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/api/v1/candles", params=params
-                ) as resp:
-                    if resp.status == 429:
-                        self._trigger_global_backoff()
-                        return []
-                    data = await resp.json()
+            session = await self._get_aiohttp_session()
+            async with session.get(
+                f"{self.base_url}/api/v1/candles", params=params
+            ) as resp:
+                if resp.status == 429:
+                    self._trigger_global_backoff()
+                    return []
+                data = await resp.json()
         except Exception as e:
             if _detect_429(e):
                 self._trigger_global_backoff()
             raise
-
-        candles = []
-        for c in data.get("c", []):
-            if c.get("o") is None or c.get("h") is None or c.get("l") is None or c.get("c") is None:
-                continue
-            candles.append([
-                int(c["t"]),
-                float(c["o"]),
-                float(c["h"]),
-                float(c["l"]),
-                float(c["c"]),
-                float(c.get("v", 0) or 0),
-            ])
-        return candles
+        return self._parse_candles_payload(data)
 
     async def fetch_ohlcv(self, symbol, timeframe="1m", since=None, limit=None, **kwargs):
         """Fetch OHLCV candles from Lighter CandlestickApi."""
@@ -1486,7 +1622,14 @@ class LighterBot(Passivbot):
                 return []
 
             n_candles = limit if limit else 480
-            return await self._fetch_candles(symbol, timeframe, n_candles, since)
+            try:
+                candles = await self._fetch_candles(symbol, timeframe, n_candles, since)
+                if candles:
+                    return candles
+            except Exception as direct_error:
+                logging.warning(f"direct candle fetch failed for {symbol}: {direct_error}")
+
+            return await self._fetch_candles_via_sdk(symbol, timeframe, n_candles, since)
         except Exception as e:
             logging.error(f"error fetching ohlcv for {symbol}: {e}")
             traceback.print_exc()
@@ -1498,7 +1641,14 @@ class LighterBot(Passivbot):
             if symbol not in self.market_id_map:
                 return []
             n_candles = 5000 if limit is None else limit
-            return await self._fetch_candles(symbol, "1m", n_candles, since)
+            try:
+                candles = await self._fetch_candles(symbol, "1m", n_candles, since)
+                if candles:
+                    return candles
+            except Exception as direct_error:
+                logging.warning(f"direct 1m candle fetch failed for {symbol}: {direct_error}")
+
+            return await self._fetch_candles_via_sdk(symbol, "1m", n_candles, since)
         except Exception as e:
             logging.error(f"error fetching ohlcvs_1m for {symbol}: {e}")
             traceback.print_exc()
@@ -1575,19 +1725,17 @@ class LighterBot(Passivbot):
             symbol = order["symbol"]
             market_index = self._symbol_to_market_index(symbol)
             is_ask = order["side"] == "sell"
-            price = order["price"]
+            price = self._get_market_execution_price(order)
             qty = abs(order["qty"])
             raw_price = self._to_raw_price(price, symbol)
             raw_amount = self._to_raw_amount(qty, symbol)
             client_order_id = self._generate_client_order_id()
 
             # Determine order type / time in force
-            order_type = lighter.SignerClient.ORDER_TYPE_LIMIT
-            tif_config = require_live_value(self.config, "time_in_force")
-            if tif_config == "post_only":
-                tif = lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY
-            else:
-                tif = lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+            normalized = self._normalize_market_order_for_lighter(order)
+            if normalized is None:
+                return {}
+            order_type, tif = normalized
 
             # Rate limiting gate
             if not await self._wait_for_write_slot(op_count=1, cancel_only=False):
@@ -1639,7 +1787,7 @@ class LighterBot(Passivbot):
                     "tx_hash": tx_hash,
                     "client_order_index": client_order_id,
                     "filled": None,
-                    "resting": True,
+                    "resting": order.get("type") != "market",
                 },
             }
             return executed
@@ -1749,14 +1897,8 @@ class LighterBot(Passivbot):
             if hasattr(resp, "volume_quota_remaining"):
                 self._update_volume_quota(getattr(resp, "volume_quota_remaining", None))
 
-            # Clean up order ID mapping (fix memory leak)
-            try:
-                client_id = int(order_id)
-                self._client_to_exchange_order_id.pop(client_id, None)
-            except (ValueError, TypeError):
-                pass
-
             # Fix 5: Wait for WS cancel confirmation, with REST fallback
+            cancel_confirmed = True
             try:
                 await asyncio.wait_for(evt.wait(), timeout=2.0)
             except asyncio.TimeoutError:
@@ -1772,10 +1914,21 @@ class LighterBot(Passivbot):
                             logging.warning(
                                 f"cancel REST fallback: order {exchange_order_id} still open"
                             )
+                            cancel_confirmed = False
                 except Exception as rest_err:
                     logging.debug(f"cancel REST fallback check failed: {rest_err}")
             finally:
                 self._order_cancel_events.pop(exchange_order_id, None)
+
+            if not cancel_confirmed:
+                return {}
+
+            # Clean up order ID mapping only after cancellation is confirmed.
+            try:
+                client_id = int(order_id)
+                self._client_to_exchange_order_id.pop(client_id, None)
+            except (ValueError, TypeError):
+                pass
 
             executed = {"id": order_id, "symbol": symbol, "status": "success"}
             return executed
@@ -1869,17 +2022,17 @@ class LighterBot(Passivbot):
                             continue
                         market_index = self._symbol_to_market_index(symbol)
                         is_ask = op["side"] == "sell"
-                        price = op["price"]
+                        price = self._get_market_execution_price(op)
                         raw_price = self._to_raw_price(price, symbol)
                         raw_amount = self._to_raw_amount(qty, symbol)
                         client_order_id = self._generate_client_order_id()
 
-                        order_type = lighter.SignerClient.ORDER_TYPE_LIMIT
-                        tif_config = require_live_value(self.config, "time_in_force")
-                        if tif_config == "post_only":
-                            tif = lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY
-                        else:
-                            tif = lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+                        normalized = self._normalize_market_order_for_lighter(op)
+                        if normalized is None:
+                            results[i] = {}
+                            self._acknowledge_nonce_failure(api_key_idx)
+                            continue
+                        order_type, tif = normalized
 
                         reduce_only = bool(op.get("reduce_only", False))
 
@@ -2064,7 +2217,7 @@ class LighterBot(Passivbot):
                         "tx_hash": tx_hash,
                         "client_order_index": meta["client_order_id"],
                         "filled": None,
-                        "resting": True,
+                        "resting": op.get("type") != "market",
                     },
                 }
             elif action == "cancel":
@@ -2135,7 +2288,7 @@ class LighterBot(Passivbot):
                 market_id = self.market_id_map.get(symbol)
                 if market_id is None:
                     continue
-                if not await self._wait_for_read_slot():
+                if not await self._wait_for_write_slot(op_count=1, cancel_only=False):
                     continue
                 leverage = int(
                     min(
@@ -2152,6 +2305,8 @@ class LighterBot(Passivbot):
                 if err:
                     logging.error(f"{symbol}: error setting leverage: {err}")
                 else:
+                    self._record_ops_sent(1)
+                    self._reset_global_backoff()
                     logging.info(f"{symbol}: set leverage to {leverage}x cross")
             except Exception as e:
                 logging.error(f"{symbol}: error setting leverage: {e}")
@@ -2479,7 +2634,7 @@ class LighterBot(Passivbot):
                     positions.append({
                         "symbol": symbol,
                         "position_side": "long" if signed_size > 0 else "short",
-                        "size": abs(signed_size),
+                        "size": signed_size,
                         "price": entry_price,
                     })
                 except Exception as e:
@@ -2506,9 +2661,7 @@ class LighterBot(Passivbot):
             except (ValueError, TypeError):
                 logging.warning(f"WS user_stats: invalid portfolio_value {pv!r}")
                 return
-        bal = stats.get("available_balance")
-        if bal is None:
-            bal = stats.get("collateral")
+        bal = self._get_balance_value_from_user_stats(stats)
         if bal is not None:
             try:
                 bal_float = float(bal)

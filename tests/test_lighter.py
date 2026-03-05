@@ -3,6 +3,7 @@
 Tests Lighter SDK integration, price/amount conversion, market mapping,
 order execution, and WebSocket parsing — all using mock data, no network.
 """
+import asyncio
 import copy
 import math
 import sys
@@ -562,7 +563,7 @@ class TestFetchPositions:
         assert pos["position_side"] == "long"
         assert pos["size"] == 10.0
         assert pos["price"] == 14.50
-        assert balance == 5000.0
+        assert balance == 5500.0
 
     @pytest.mark.asyncio
     async def test_fetch_positions_empty(self, lighter_bot):
@@ -3960,14 +3961,14 @@ class TestWsUserStatsPortfolioValue:
         lighter_bot.balance = 5000.0
         data = {"stats": {"available_balance": 6000.0, "portfolio_value": 10000.0}}
         lighter_bot._handle_ws_user_stats(data)
-        assert lighter_bot.balance == 6000.0
+        assert lighter_bot.balance == 10000.0
 
     def test_zero_portfolio_value_allows_update(self, lighter_bot):
         """Zero portfolio_value should be accepted (not negative)."""
         lighter_bot.balance = 5000.0
         data = {"stats": {"available_balance": 3000.0, "portfolio_value": 0.0}}
         lighter_bot._handle_ws_user_stats(data)
-        assert lighter_bot.balance == 3000.0
+        assert lighter_bot.balance == 0.0
 
     def test_missing_portfolio_value_allows_update(self, lighter_bot):
         """Missing portfolio_value should not block update."""
@@ -3981,13 +3982,159 @@ class TestWsUserStatsPortfolioValue:
         lighter_bot.balance = 5000.0
         data = {"stats": {"available_balance": 6000.0, "portfolio_value": "NaN"}}
         lighter_bot._handle_ws_user_stats(data)
-        # float("NaN") doesn't raise but is not < 0 either, so accepted
-        # Only truly non-convertible strings would reject
-        # Let's test with a truly bad value
+        assert lighter_bot.balance == 6000.0
         lighter_bot.balance = 5000.0
         data2 = {"stats": {"available_balance": 6000.0, "portfolio_value": "not_a_number"}}
         lighter_bot._handle_ws_user_stats(data2)
-        assert lighter_bot.balance == 5000.0  # unchanged
+        assert lighter_bot.balance == 5000.0
+
+
+# ===========================================================================
+# Sync parity checks (runnable without pytest-asyncio)
+# ===========================================================================
+
+class TestLighterLiveParitySync:
+    def test_fetch_positions_prefers_account_value_balance(self):
+        lighter_bot = _create_bot()
+        lighter_bot.account_api.account = AsyncMock(
+            return_value=_build_account_response(MOCK_ACCOUNT_RESPONSE)
+        )
+
+        positions, balance = asyncio.run(lighter_bot.fetch_positions())
+
+        assert len(positions) == 1
+        assert balance == 5500.0
+
+    def test_fetch_positions_ignores_stale_ws_balance(self):
+        lighter_bot = _create_bot()
+        lighter_bot._ws_positions_cache = [
+            {
+                "symbol": "HYPE/USDC:USDC",
+                "position_side": "long",
+                "size": 1.0,
+                "price": 14.5,
+            }
+        ]
+        lighter_bot._ws_positions_cache_ts = time.monotonic()
+        lighter_bot._ws_balance_cache = 4000.0
+        lighter_bot._ws_balance_cache_ts = time.monotonic() - lighter_bot._ws_cache_max_age - 1.0
+        lighter_bot.account_api.account = AsyncMock(
+            return_value=_build_account_response(MOCK_ACCOUNT_RESPONSE)
+        )
+
+        positions, balance = asyncio.run(lighter_bot.fetch_positions())
+
+        assert positions[0]["symbol"] == "HYPE/USDC:USDC"
+        assert balance == 5500.0
+
+    def test_fetch_open_orders_includes_local_open_order_symbols(self):
+        lighter_bot = _create_bot()
+        lighter_bot.open_orders = {"BTC/USDC:USDC": [{"id": "1"}]}
+        lighter_bot.positions = {}
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"orders": []})
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.get.return_value = mock_resp
+        lighter_bot._aiohttp_session = mock_session
+
+        asyncio.run(lighter_bot.fetch_open_orders())
+
+        market_ids = [
+            call.kwargs["params"]["market_id"]
+            for call in mock_session.get.call_args_list
+        ]
+        assert lighter_bot.market_id_map["BTC/USDC:USDC"] in market_ids
+
+    def test_market_order_rejected_when_post_only_enabled(self):
+        lighter_bot = _create_bot()
+        lighter_bot.config["live"]["time_in_force"] = "post_only"
+
+        result = asyncio.run(
+            lighter_bot.execute_order(
+                {
+                    "symbol": "HYPE/USDC:USDC",
+                    "side": "buy",
+                    "qty": 1.0,
+                    "price": 15.0,
+                    "reduce_only": False,
+                    "type": "market",
+                    "custom_id": "test",
+                }
+            )
+        )
+
+        assert result == {}
+        lighter_bot.lighter_client.create_order.assert_not_called()
+
+    def test_market_order_normalizes_to_non_post_only_limit(self):
+        lighter_bot = _create_bot()
+
+        result = asyncio.run(
+            lighter_bot.execute_order(
+                {
+                    "symbol": "HYPE/USDC:USDC",
+                    "side": "buy",
+                    "qty": 1.0,
+                    "price": 15.0,
+                    "reduce_only": False,
+                    "type": "market",
+                    "custom_id": "test",
+                }
+            )
+        )
+
+        assert lighter_bot.did_create_order(result)
+        call_kwargs = lighter_bot.lighter_client.create_order.call_args.kwargs
+        assert call_kwargs["time_in_force"] == lighter_bot.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+
+    def test_market_order_uses_aggressive_cached_price(self):
+        lighter_bot = _create_bot()
+        lighter_bot._ws_tickers_cache["HYPE/USDC:USDC"] = {
+            "bid": 14.9,
+            "ask": 15.2,
+            "last": 15.05,
+        }
+
+        result = asyncio.run(
+            lighter_bot.execute_order(
+                {
+                    "symbol": "HYPE/USDC:USDC",
+                    "side": "buy",
+                    "qty": 1.0,
+                    "price": 15.0,
+                    "reduce_only": False,
+                    "type": "market",
+                    "custom_id": "test",
+                }
+            )
+        )
+
+        assert lighter_bot.did_create_order(result)
+        call_kwargs = lighter_bot.lighter_client.create_order.call_args.kwargs
+        assert call_kwargs["price"] > lighter_bot._to_raw_price(15.0, "HYPE/USDC:USDC")
+
+    def test_cancel_returns_failure_if_rest_fallback_shows_order_still_open(self):
+        lighter_bot = _create_bot()
+        lighter_bot._client_to_exchange_order_id[333] = 444
+        lighter_bot.fetch_open_orders = AsyncMock(
+            return_value=[{"id": "444", "symbol": "HYPE/USDC:USDC"}]
+        )
+
+        async def _timeout(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError()
+
+        with patch("asyncio.wait_for", side_effect=_timeout):
+            result = asyncio.run(
+                lighter_bot.execute_cancellation({"id": "333", "symbol": "HYPE/USDC:USDC"})
+            )
+
+        assert result == {}
 
 
 # ===========================================================================
