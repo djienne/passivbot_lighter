@@ -61,12 +61,20 @@ def _is_quota_error(exc_or_msg) -> bool:
 
 
 def _is_transient_error(exc) -> bool:
-    """Return True for rate-limit (429) and nonce errors — temporary, not fatal.
+    """Return True for rate-limit (429), server errors (5xx), and nonce errors — temporary, not fatal.
 
     Note: quota errors are intentionally excluded; use ``_is_quota_error`` for those.
     """
     msg = str(exc).lower()
-    return "429" in msg or "too many" in msg or "invalid nonce" in msg
+    if "429" in msg or "too many" in msg or "invalid nonce" in msg:
+        return True
+    # Detect 5xx server errors (502 Bad Gateway, 503 Service Unavailable, etc.)
+    if "bad gateway" in msg or "service unavailable" in msg or "gateway timeout" in msg:
+        return True
+    s = str(exc)
+    if any(f"({code})" in s for code in (500, 502, 503, 504)):
+        return True
+    return False
 
 
 def _detect_429(exc) -> bool:
@@ -1401,12 +1409,16 @@ class LighterBot(Passivbot):
             self._reset_global_backoff()
             return positions, balance
         except Exception as e:
-            logging.error(f"error fetching positions and balance: {e}")
-            if _detect_429(e):
+            if _is_transient_error(e):
+                logging.warning(f"transient error fetching positions and balance: {type(e).__name__}")
                 self._trigger_global_backoff()
-            if info:
-                print_async_exception(info)
-            traceback.print_exc()
+            else:
+                logging.error(f"error fetching positions and balance: {e}")
+                if _detect_429(e):
+                    self._trigger_global_backoff()
+                if info:
+                    print_async_exception(info)
+                traceback.print_exc()
             return False
 
     async def fetch_open_orders(self, symbol=None):
@@ -1532,8 +1544,11 @@ class LighterBot(Passivbot):
 
             return sorted(all_orders, key=lambda x: x["timestamp"])
         except Exception as e:
-            logging.error(f"error fetching open orders: {e}")
-            traceback.print_exc()
+            if _is_transient_error(e):
+                logging.warning(f"transient error fetching open orders: {type(e).__name__}")
+            else:
+                logging.error(f"error fetching open orders: {e}")
+                traceback.print_exc()
             return False
 
     async def fetch_tickers(self):
@@ -1580,12 +1595,16 @@ class LighterBot(Passivbot):
             self._reset_global_backoff()
             return tickers
         except Exception as e:
-            logging.error(f"error fetching tickers: {e}")
-            if _detect_429(e):
+            if _is_transient_error(e):
+                logging.warning(f"transient error fetching tickers: {type(e).__name__}")
                 self._trigger_global_backoff()
-            if fetched:
-                print_async_exception(fetched)
-            traceback.print_exc()
+            else:
+                logging.error(f"error fetching tickers: {e}")
+                if _detect_429(e):
+                    self._trigger_global_backoff()
+                if fetched:
+                    print_async_exception(fetched)
+                traceback.print_exc()
             return False
 
     async def update_tickers(self):
