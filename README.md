@@ -12,6 +12,14 @@ Passivbot is a high-frequency market-making bot that places and cancels large nu
 
 > **Affiliate link to support this project:** [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees (100% kickback with this link).
 
+> :warning: **Lighter account type requirement:** Use a **Simple Trading Account**. Do **not** use a **Unified Trading Account (UTA)**.
+>
+> **Recommended Lighter tier:** The **Free** tier works well with Passivbot. It keeps trading at **0 fees**, and in practice its latency has not been a problem for this bot.
+
+<p align="center">
+  <img src="account.png" alt="Lighter account type selection showing that Simple Trading Account should be used instead of Unified Trading Account (UTA)" width="900" />
+</p>
+
 v7.4.4
 
 ## Fork Overview
