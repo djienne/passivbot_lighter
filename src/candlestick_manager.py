@@ -724,6 +724,45 @@ class CandlestickManager:
                     if record is not None:
                         await self._release_lock(record.lock, lock_path, symbol, tf_norm)
                 return
+            except PermissionError as exc:
+                self._log(
+                    "warning",
+                    "fetch_lock_permission_denied",
+                    symbol=symbol,
+                    timeframe=tf_norm,
+                    lock_path=lock_path,
+                    error=str(exc),
+                )
+                removed = False
+                try:
+                    os.remove(lock_path)
+                    removed = True
+                except Exception:
+                    pass
+                if not removed:
+                    try:
+                        import subprocess
+                        result = subprocess.run(
+                            ["sudo", "rm", "-f", lock_path],
+                            capture_output=True,
+                            timeout=5,
+                        )
+                        removed = result.returncode == 0
+                    except Exception:
+                        pass
+                if removed:
+                    self._log(
+                        "info",
+                        "fetch_lock_permission_removed",
+                        symbol=symbol,
+                        timeframe=tf_norm,
+                        lock_path=lock_path,
+                    )
+                    continue
+                raise PermissionError(
+                    f"Cannot remove lock file '{lock_path}' (permission denied). "
+                    f"Run: sudo chown -R $USER caches/"
+                ) from exc
             except portalocker.exceptions.LockException as exc:
                 age = self._lockfile_age(lock_path)
                 if age is not None and age > self._lock_stale_seconds:
