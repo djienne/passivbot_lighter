@@ -6,11 +6,21 @@ A fork of [Passivbot](https://github.com/enarjord/passivbot) adapted to run on [
 
 Passivbot is a high-frequency market-making bot that places and cancels large numbers of limit orders. On a traditional exchange, fees would eat deeply into returns. Lighter's zero-fee model makes it an ideal venue for this strategy: every trade that would otherwise cost fees is pure profit instead.
 
+> **Affiliate link to support this project:** [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees (100% kickback with this link).
+
 :warning: **Used at one's own risk** :warning:
 
 > :penguin: **Linux only** — the `lighter` Python SDK requires Linux for transaction signing. Windows users must run this inside [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) or Docker.
 
-> **Affiliate link to support this project:** [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees (100% kickback with this link).
+> :warning: **Lighter account type requirement:** Use a **Simple Trading Account**. Do **not** use a **Unified Trading Account (UTA)**.
+> 
+> :warning: Recommended to use a **sub-account**.
+>
+> **Recommended Lighter tier:** The **Free** tier works well with Passivbot. It keeps trading at **0 fees**, and in practice its latency has not been a problem for this bot.
+
+<p align="center">
+  <img src="account.png" alt="Lighter account type selection showing that Simple Trading Account should be used instead of Unified Trading Account (UTA)" width="900" />
+</p>
 
 v7.4.4
 
