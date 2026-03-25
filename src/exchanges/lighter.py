@@ -1823,11 +1823,11 @@ class LighterBot(Passivbot):
                         else:
                             computed_pnl = close_qty * (avg_entry - trade_price)
 
-                # Derive position_side from position state
-                pos_after = pos_before + trade_delta
-                if pos_after > 0:
+                # Derive position_side from position before trade
+                # (a sell closing a long belongs to "long", not "short")
+                if pos_before > 0:
                     position_side = "long"
-                elif pos_after < 0:
+                elif pos_before < 0:
                     position_side = "short"
                 else:
                     position_side = "long" if trade_delta > 0 else "short"
