@@ -1718,55 +1718,170 @@ class LighterBot(Passivbot):
             return []
 
     async def fetch_pnls(self, start_time=None, end_time=None, limit=None):
-        """Fetch PnL / trade history from Lighter."""
+        """Fetch PnL / trade history from Lighter using /api/v1/trades.
+
+        Computes per-trade realized PnL from the exchange's position tracking
+        data (position_size_before, entry_quote_before). Falls back to local
+        reconstruction if exchange position data is unavailable.
+        """
+        # When limit is None, paginate until start_time is reached (up to 50 pages)
+        uncapped = limit is None
         if limit is None:
-            limit = 100
+            limit = 5000
         if not await self._wait_for_read_slot():
             return []
         try:
             auth = await self._get_auth_token()
-            url = f"{self.base_url}/api/v1/accountInactiveOrders"
-            params = {
-                "account_index": self.account_index,
-                "auth": auth,
-            }
-            if start_time:
-                params["start_time"] = int(start_time)
-            if end_time:
-                params["end_time"] = int(end_time)
-            if limit:
-                params["limit"] = limit
+            url = f"{self.base_url}/api/v1/trades"
 
-            session = await self._get_aiohttp_session()
-            async with session.get(url, params=params) as resp:
-                if resp.status == 429:
-                    self._trigger_global_backoff()
-                    return []
-                if resp.status != 200:
-                    logging.error(f"error fetching pnls: status {resp.status}")
-                    return []
-                data = await resp.json()
+            # Collect trades, paginating as needed
+            all_trades = []
+            cursor = None
+            max_pages = 50 if uncapped else max(1, (limit + 99) // 100)
 
-            orders = data.get("orders", [])
+            for _ in range(max_pages):
+                params = {
+                    "account_index": self.account_index,
+                    "auth": auth,
+                    "sort_by": "timestamp",
+                    "sort_dir": "desc",
+                    "limit": min(100, limit - len(all_trades)),
+                    "market_id": 24,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+
+                session = await self._get_aiohttp_session()
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 429:
+                        self._trigger_global_backoff()
+                        break
+                    if resp.status != 200:
+                        logging.error(f"error fetching pnls: status {resp.status}")
+                        break
+                    data = await resp.json()
+
+                trades = data.get("trades", [])
+                if not trades:
+                    break
+
+                found_start = False
+                for t in trades:
+                    ts = int(t.get("timestamp", 0))
+                    if end_time and ts > int(end_time):
+                        continue
+                    if start_time and ts < int(start_time):
+                        found_start = True
+                        break
+                    all_trades.append(t)
+
+                if found_start or not data.get("next_cursor"):
+                    break
+                cursor = data.get("next_cursor")
+                if len(all_trades) >= limit:
+                    break
+
+            # Process trades into PnL entries
             pnls = []
-            for o in orders:
-                if o.get("status") != "filled":
-                    continue
-                pnl_val = float(o.get("realized_pnl", 0) or 0)
-                is_ask = self._coerce_is_ask(o.get("is_ask", False))
-                market_id = int(o.get("market_id", -1))
+            has_position_data = False
+            for t in all_trades:
+                trade_id = str(t.get("trade_id", f"unk_{int(time.time_ns())}"))
+                market_id = int(t.get("market_id", -1))
                 symbol = self.market_index_to_symbol.get(market_id, "")
+                ts = int(t.get("timestamp", 0))
+                trade_size = float(t.get("size", 0))
+                trade_price = float(t.get("price", 0))
+
+                # Determine our side (ask = sell, bid = buy)
+                ask_acct = int(t.get("ask_account_id", -1))
+                we_are_ask = (ask_acct == self.account_index)
+                side = "sell" if we_are_ask else "buy"
+
+                # Determine our role (maker or taker)
+                is_maker_ask = t.get("is_maker_ask", False)
+                if we_are_ask:
+                    we_are_maker = bool(is_maker_ask)
+                else:
+                    we_are_maker = not bool(is_maker_ask)
+
+                role = "maker" if we_are_maker else "taker"
+                pos_before = float(t.get(f"{role}_position_size_before", 0))
+                entry_quote = float(t.get(f"{role}_entry_quote_before", 0))
+
+                # Compute PnL from exchange position data
+                computed_pnl = 0.0
+                trade_delta = -trade_size if we_are_ask else trade_size
+
+                if pos_before != 0.0 and entry_quote != 0.0:
+                    has_position_data = True
+                    avg_entry = entry_quote / pos_before
+                    # Reducing position -> realized PnL
+                    if (pos_before > 0 and trade_delta < 0) or (pos_before < 0 and trade_delta > 0):
+                        close_qty = min(abs(trade_delta), abs(pos_before))
+                        if pos_before > 0:
+                            computed_pnl = close_qty * (trade_price - avg_entry)
+                        else:
+                            computed_pnl = close_qty * (avg_entry - trade_price)
+
+                # Derive position_side from position state
+                pos_after = pos_before + trade_delta
+                if pos_after > 0:
+                    position_side = "long"
+                elif pos_after < 0:
+                    position_side = "short"
+                else:
+                    position_side = "long" if trade_delta > 0 else "short"
+
                 pnls.append({
-                    "id": str(o.get("order_index", o.get("client_order_index", f"unk_{int(time.time_ns())}"))),
+                    "id": trade_id,
                     "symbol": symbol,
-                    "timestamp": int(o.get("timestamp", 0)),
-                    "pnl": pnl_val,
-                    "position_side": "short" if is_ask else "long",
-                    "side": "sell" if is_ask else "buy",
-                    "qty": float(o.get("initial_base_amount", o.get("size", 0))),
-                    "price": float(o.get("price", 0)),
+                    "timestamp": ts,
+                    "pnl": computed_pnl,
+                    "position_side": position_side,
+                    "side": side,
+                    "qty": trade_size,
+                    "price": trade_price,
                 })
-            return sorted(pnls, key=lambda x: x["timestamp"])
+
+            pnls = sorted(pnls, key=lambda x: x["timestamp"])
+
+            # Fallback: reconstruct PnL if exchange position data was absent
+            if not has_position_data and pnls:
+                net_pos = 0.0
+                avg_entry = 0.0
+                for p in pnls:
+                    qty = p["qty"]
+                    price = p["price"]
+                    trade_qty = qty if p["side"] == "buy" else -qty
+                    new_pos = net_pos + trade_qty
+                    computed_pnl = 0.0
+
+                    if net_pos == 0.0:
+                        avg_entry = price
+                    elif (net_pos > 0 and trade_qty < 0) or (net_pos < 0 and trade_qty > 0):
+                        close_qty = min(abs(trade_qty), abs(net_pos))
+                        if net_pos > 0:
+                            computed_pnl = close_qty * (price - avg_entry)
+                        else:
+                            computed_pnl = close_qty * (avg_entry - price)
+                        if new_pos != 0.0 and ((new_pos > 0) != (net_pos > 0)):
+                            avg_entry = price
+                    else:
+                        total_cost = abs(net_pos) * avg_entry + abs(trade_qty) * price
+                        if new_pos != 0.0:
+                            avg_entry = total_cost / abs(new_pos)
+
+                    net_pos = new_pos
+                    p["pnl"] = computed_pnl
+
+                    if net_pos > 0:
+                        p["position_side"] = "long"
+                    elif net_pos < 0:
+                        p["position_side"] = "short"
+                    else:
+                        p["position_side"] = "long" if trade_qty > 0 else "short"
+
+            return pnls
         except Exception as e:
             logging.error(f"error fetching pnls: {e}")
             if _detect_429(e):
