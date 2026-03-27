@@ -1,24 +1,18 @@
 from __future__ import annotations
-from passivbot import Passivbot, logging
-from uuid import uuid4
+from exchanges.ccxt_bot import CCXTBot
+from passivbot import logging
 import ccxt.pro as ccxt_pro
 import ccxt.async_support as ccxt_async
 import asyncio
-import traceback
-import numpy as np
 import passivbot_rust as pbr
 from utils import ts_to_date, utc_ms
-from pure_funcs import (
-    floatify,
-    calc_hash,
-    shorten_custom_id,
-)
-from procedures import print_async_exception, assert_correct_ccxt_version
+from procedures import assert_correct_ccxt_version
 from collections import defaultdict
-from typing import Any
 import hmac
 import hashlib
 import base64
+
+calc_order_price_diff = pbr.calc_order_price_diff
 
 # ---------------------------------------------------------------------------
 # Broker mixin classes for injecting KC-BROKER-NAME on KuCoin futures requests.
@@ -95,12 +89,14 @@ class ProKucoinBrokerFutures(ccxt_pro.kucoinfutures):
 assert_correct_ccxt_version(ccxt=ccxt_async)
 
 
-class KucoinBot(Passivbot):
+class KucoinBot(CCXTBot):
+    MAX_OPEN_ORDERS = 150
+
     def __init__(self, config: dict):
         super().__init__(config)
         self.custom_id_max_length = 40
         self.quote = "USDT"
-        self.hedge_mode = False
+        self.hedge_mode = True
 
     def _get_partner_signature(self, timestamp: str) -> str:
         prehash = f"{timestamp}{self.partner}{self.api_key}"
@@ -151,58 +147,29 @@ class KucoinBot(Passivbot):
         )
 
         self.cca = async_cls(dict(base_kwargs))
-        try:
-            self.cca.options["defaultType"] = "swap"
-        except Exception:
-            pass
+        self.cca.options.update(self._build_ccxt_options())
+        self.cca.options["defaultType"] = "swap"
         self._apply_endpoint_override(self.cca)
 
         if self.ws_enabled:
             self.ccp = pro_cls(dict(base_kwargs))
-            try:
-                self.ccp.options["defaultType"] = "swap"
-            except Exception:
-                pass
+            self.ccp.options.update(self._build_ccxt_options())
+            self.ccp.options["defaultType"] = "swap"
             self._apply_endpoint_override(self.ccp)
         elif self.endpoint_override:
             logging.info("Skipping Kucoin websocket session due to custom endpoint override.")
 
-    def set_market_specific_settings(self):
-        super().set_market_specific_settings()
-        for symbol in self.markets_dict:
-            elm = self.markets_dict[symbol]
-            self.symbol_ids[symbol] = elm["id"]
-            self.min_costs[symbol] = (
-                0.1 if elm["limits"]["cost"]["min"] is None else elm["limits"]["cost"]["min"]
-            )
-            self.min_qtys[symbol] = elm["limits"]["amount"]["min"]
-            self.qty_steps[symbol] = elm["precision"]["amount"]
-            self.price_steps[symbol] = elm["precision"]["price"]
-            self.c_mults[symbol] = elm["contractSize"]
-            self.max_leverage[symbol] = int(elm["limits"]["leverage"]["max"])
-
     async def watch_ohlcvs_1m(self):
-        # print("debug watch_ohlcvs_1m")
+        """KuCoin: No-op - OHLCV websocket not used."""
         return
 
     async def watch_ohlcv_1m_single(self, symbol):
-        # print('debug watch_ohlcv_1m_single', symbol)
+        """KuCoin: No-op - OHLCV websocket not used."""
         return
 
-    async def watch_orders(self):
-        while True:
-            try:
-                if self.stop_websocket:
-                    break
-                res = await self.ccp.watch_orders()
-                for order in res:
-                    order["position_side"] = self.determine_pos_side(order)
-                    order["qty"] = order["amount"]
-                self.handle_order_update(res)
-            except Exception as e:
-                logging.error(f"exception watch_orders {e}")
-                traceback.print_exc()
-                await asyncio.sleep(1)
+    def _get_position_side_for_order(self, order: dict) -> str:
+        """KuCoin: Derive position_side from position state."""
+        return self.determine_pos_side(order)
 
     def determine_pos_side(self, order):
         # non hedge mode
@@ -216,77 +183,71 @@ class KucoinBot(Passivbot):
             return "short"
         raise Exception(f"unknown side {order['side']}")
 
-    async def fetch_open_orders(self, symbol: str = None):
-        fetched = None
+    async def fetch_open_orders(self, symbol: str = None) -> list:
+        """KuCoin: Fetch open orders with pagination.
+
+        Returns:
+            list: Orders sorted by timestamp with normalized fields.
+
+        Raises:
+            Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
+        """
         open_orders = []
-        try:
-            fetched = await self.cca.fetch_open_orders(symbol=symbol)
+        page_size = 100
+        current_page = 1
+        while True:
+            params = {"pageSize": page_size, "currentPage": current_page}
+            fetched = await self.cca.fetch_open_orders(symbol=symbol, params=params)
+            if not fetched:
+                break
             for order in fetched:
                 order["position_side"] = self.determine_pos_side(order)
                 order["qty"] = order["amount"]
-            return sorted(fetched, key=lambda x: x["timestamp"])
-        except Exception as e:
-            logging.error(f"error fetching open orders {e}")
-            print_async_exception(fetched)
-            traceback.print_exc()
-            return False
+            open_orders.extend(fetched)
+            if len(fetched) < page_size:
+                break
+            if len(open_orders) >= self.MAX_OPEN_ORDERS:
+                break
+            current_page += 1
+        return sorted(open_orders, key=lambda x: x["timestamp"])
 
-    async def fetch_positions(self):
-        fetched_positions, fetched_balance = None, None
-        try:
-            fetched_positions, fetched_balance = await asyncio.gather(
-                self.cca.fetch_positions(),
-                self.cca.fetch_balance(),
-            )
-            positions = []
-            for p in fetched_positions:
-                positions.append(
-                    {
-                        **p,
-                        **{
-                            "symbol": p["symbol"],
-                            "position_side": p["side"],
-                            "size": float(p["contracts"]),
-                            "price": float(p["entryPrice"]),
-                        },
-                    }
-                )
-            balance = fetched_balance["info"]["data"]["marginBalance"]
-            return positions, balance
-        except Exception as e:
-            logging.error(f"error fetching positions and balance {e}")
-            print_async_exception(fetched_positions)
-            print_async_exception(fetched_balance)
-            traceback.print_exc()
-            return False
+    def _get_balance(self, fetched: dict) -> float:
+        """KuCoin uses marginBalance in info.data."""
+        return float(fetched["info"]["data"]["marginBalance"])
 
-    async def fetch_tickers(self):
-        fetched = None
-        try:
-            fetched = await self.cca.fetch_tickers()
-            return fetched
-        except Exception as e:
-            logging.error(f"error fetching tickers {e}")
-            print_async_exception(fetched)
-            traceback.print_exc()
-            return False
-
-    async def fetch_ohlcvs_1m(self, symbol: str, limit=None):
-        n_candles_limit = 1000 if limit is None else limit
-        result = await self.cca.fetch_ohlcv(
-            symbol,
-            timeframe="1m",
-            limit=n_candles_limit,
-        )
-        return result
+    async def calc_ideal_orders(self):
+        # KuCoin enforces a 150 open-order cap; keep only the closest price targets.
+        ideal_orders = await super().calc_ideal_orders()
+        flattened = []
+        for symbol, orders in ideal_orders.items():
+            if not orders:
+                continue
+            market_price = await self.cm.get_current_close(symbol, max_age_ms=10_000)
+            for order in orders:
+                price_diff = calc_order_price_diff(order["side"], order["price"], market_price)
+                flattened.append((price_diff, symbol, order))
+        limit = getattr(self, "MAX_OPEN_ORDERS", 150)
+        flattened.sort(key=lambda x: x[0])
+        trimmed = flattened[:limit] if limit and limit > 0 else flattened
+        filtered: dict[str, list] = {symbol: [] for symbol in self.active_symbols}
+        for _, symbol, order in trimmed:
+            filtered.setdefault(symbol, []).append(order)
+        for symbol in ideal_orders:
+            filtered.setdefault(symbol, ideal_orders[symbol])
+        return filtered
 
     async def fetch_fills(self, start_time=None, end_time=None, limit=None):
+        if start_time is None:
+            logging.warning(
+                "fetch_fills called without start_time; "
+                "consider setting pnls_max_lookback_days in config to limit fetch"
+            )
         all_fills = []
-        ids_seen = set()
         params = {}
         if end_time:
             params["until"] = int(end_time)
         day = 1000 * 60 * 60 * 24
+        now_ms = self.get_exchange_time()
         while True:
             fills = await self.cca.fetch_my_trades(params=params)
             if fills:
@@ -297,10 +258,10 @@ class KucoinBot(Passivbot):
                 if "until" in params:
                     new_until = params["until"] - day
                 else:
-                    new_until = self.get_exchange_time() - day
+                    new_until = now_ms - day
             params["until"] = new_until
             all_fills = fills + all_fills
-            if start_time is None or new_until <= start_time + day:
+            if start_time is not None and new_until <= start_time + day:
                 break
             logging.info(
                 f"fetched {len(fills)} fill{'' if len(fills) == 1 else 's'}"
@@ -327,12 +288,17 @@ class KucoinBot(Passivbot):
         return sorted(deduped.values(), key=lambda x: x["timestamp"])
 
     async def fetch_positions_history(self, start_time=None, end_time=None, limit=None):
+        if start_time is None:
+            logging.warning(
+                "fetch_positions_history called without start_time; "
+                "consider setting pnls_max_lookback_days in config to limit fetch"
+            )
         all_ph = []
-        ids_seen = set()
         params = {}
         if end_time:
             params["until"] = int(end_time)
         day = 1000 * 60 * 60 * 24
+        now_ms = self.get_exchange_time()
         while True:
             ph = await self.cca.fetch_positions_history(params=params)
             ph = sorted(ph, key=lambda x: x["lastUpdateTimestamp"])
@@ -344,10 +310,10 @@ class KucoinBot(Passivbot):
                 if "until" in params:
                     new_until = params["until"] - day
                 else:
-                    new_until = self.get_exchange_time() - day
+                    new_until = now_ms - day
             params["until"] = new_until
             all_ph = ph + all_ph
-            if start_time is None or new_until <= start_time + day:
+            if start_time is not None and new_until <= start_time + day:
                 break
             logging.info(
                 f"fetched {len(ph)} pos histor{'y' if len(ph) == 1 else 'ies'}"
@@ -386,7 +352,7 @@ class KucoinBot(Passivbot):
         seen_trade_id = set()
         for symbol in phd:
             if symbol not in cld:
-                print(f"debug no fills for pos close {symbol} {phd[symbol]}")
+                logging.debug(f"no fills for pos close {symbol} {phd[symbol]}")
                 continue
             for p in phd[symbol]:
                 with_td = sorted(
@@ -394,26 +360,26 @@ class KucoinBot(Passivbot):
                     key=lambda x: abs(p["lastUpdateTimestamp"] - x["timestamp"]),
                 )
                 if not with_td:
-                    print(f"debug no matching fill for {p}")
+                    logging.debug(f"no matching fill for {p}")
                     continue
                 best_match = with_td[0]
                 matches.append((p, best_match))
                 timedelta = best_match["timestamp"] - p["lastUpdateTimestamp"]
                 if timedelta > 1000:
-                    print(
-                        f"debug best match fill and pos close {symbol} timedelta>1000ms: {best_match['timestamp'] - p['lastUpdateTimestamp']}ms"
+                    logging.debug(
+                        f"best match fill and pos close {symbol} timedelta>1000ms: {best_match['timestamp'] - p['lastUpdateTimestamp']}ms"
                     )
                 seen_trade_id.add(best_match["id"])
             if len(phd[symbol]) != len(cld[symbol]):
-                print(
-                    f"debug len mismatch between closes and positions_history for {symbol}: {len(cld[symbol])} {len(phd[symbol])}"
+                logging.debug(
+                    f"len mismatch between closes and positions_history for {symbol}: {len(cld[symbol])} {len(phd[symbol])}"
                 )
         # add pnls, dedup and return
         deduped = {}
         for p, c in matches:
             c["pnl"] = p["realizedPnl"]
             if c["id"] in deduped:
-                print(f"debug unexpected duplicate {c}")
+                logging.debug(f"unexpected duplicate {c}")
                 continue
             deduped[c["id"]] = c
         for t in mt:
@@ -422,13 +388,41 @@ class KucoinBot(Passivbot):
 
         return sorted(deduped.values(), key=lambda x: x["timestamp"])
 
-    def get_order_execution_params(self, order: dict) -> dict:
-        # defined for each exchange
+    async def gather_fill_events(self, start_time=None, end_time=None, limit=None):
+        """Return canonical fill events for KuCoin.
+
+        Returns:
+            list: Fill events with normalized fields.
+
+        Raises:
+            Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
+        """
+        fills = await self.fetch_pnls(start_time=start_time, end_time=end_time, limit=limit)
+        events = []
+        for fill in fills:
+            events.append(
+                {
+                    "id": fill.get("id") or fill.get("orderId"),
+                    "timestamp": fill.get("timestamp"),
+                    "symbol": fill.get("symbol"),
+                    "side": fill.get("side"),
+                    "position_side": fill.get("position_side"),
+                    "qty": fill.get("qty") or fill.get("amount"),
+                    "price": fill.get("price"),
+                    "pnl": fill.get("pnl"),
+                    "fee": fill.get("fee"),
+                    "info": fill.get("info"),
+                }
+            )
+        return events
+
+    def _build_order_params(self, order: dict) -> dict:
         return {
             "timeInForce": "GTC",
             "reduceOnly": order.get("reduce_only", False),
             "marginMode": "CROSS",
             "clientOid": order.get("custom_id", None),
+            "positionSide": order.get("position_side", "").upper(),
         }
 
     def did_cancel_order(self, executed, order=None) -> bool:
@@ -438,7 +432,7 @@ class KucoinBot(Passivbot):
             return order is not None and order["id"] in executed.get("info", {}).get("data", {}).get(
                 "cancelledOrderIds", []
             )
-        except:
+        except (KeyError, TypeError, AttributeError):
             return False
 
     async def determine_utc_offset(self, verbose=True):
@@ -452,6 +446,18 @@ class KucoinBot(Passivbot):
         )
         if verbose:
             logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
+
+    async def update_exchange_config(self):
+        """Ensure account-level settings (hedge mode) are applied."""
+        try:
+            # Hedge mode enabled so both long/short can coexist.
+            if hasattr(self.cca, "set_position_mode"):
+                res = await self.cca.set_position_mode(True)
+                logging.info(f"set_position_mode hedged=True {res}")
+            else:
+                logging.info("set_position_mode not supported by current KuCoin client; continuing")
+        except Exception as e:
+            logging.warning(f"set_position_mode hedged=True not applied: {e}")
 
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call = []

@@ -924,7 +924,7 @@ class LighterBot(Passivbot):
             # Snapshot balance before recovery for real PnL safety check
             initial_balance = None
             try:
-                result = await self.fetch_positions()
+                result = await self._fetch_positions_and_balance()
                 if result and isinstance(result, tuple) and len(result) == 2:
                     initial_balance = result[1]
             except Exception:
@@ -1031,7 +1031,7 @@ class LighterBot(Passivbot):
                     # Real PnL safety check: verify actual balance change
                     if initial_balance is not None:
                         try:
-                            result = await self.fetch_positions()
+                            result = await self._fetch_positions_and_balance()
                             if result and isinstance(result, tuple) and len(result) == 2:
                                 current_balance = result[1]
                                 actual_loss = initial_balance - current_balance
@@ -1323,8 +1323,11 @@ class LighterBot(Passivbot):
         if verbose:
             logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
 
-    async def fetch_positions(self):
-        """Fetch positions and balance from Lighter AccountApi."""
+    async def _fetch_positions_and_balance(self):
+        """Fetch positions and balance from Lighter AccountApi (internal).
+
+        Returns (positions_list, balance_float) on success, or False on failure.
+        """
         # Serve from WS cache if fresh
         now = time.monotonic()
         pos_fresh = (self._ws_positions_cache is not None
@@ -1420,6 +1423,30 @@ class LighterBot(Passivbot):
                     print_async_exception(info)
                 traceback.print_exc()
             return False
+
+    async def fetch_positions(self):
+        """Fetch positions from Lighter (v7.8.4 contract: returns list of position dicts)."""
+        res = await self._fetch_positions_and_balance()
+        if res is False:
+            return None
+        positions, balance = res
+        # Cache balance so fetch_balance() can return it without a second API call
+        self._last_fetched_balance = balance
+        return positions
+
+    async def fetch_balance(self):
+        """Fetch balance from Lighter (v7.8.4 contract: returns float)."""
+        # If we have a recently cached balance from fetch_positions, use it
+        if hasattr(self, "_last_fetched_balance") and self._last_fetched_balance is not None:
+            bal = self._last_fetched_balance
+            self._last_fetched_balance = None  # consume once
+            return bal
+        # Otherwise do a full fetch
+        res = await self._fetch_positions_and_balance()
+        if res is False:
+            return None
+        _positions, balance = res
+        return balance
 
     async def fetch_open_orders(self, symbol=None):
         """Fetch open orders from Lighter API."""

@@ -554,7 +554,7 @@ class TestFetchPositions:
         lighter_bot.account_api.account = AsyncMock(
             return_value=_build_account_response(MOCK_ACCOUNT_RESPONSE)
         )
-        result = await lighter_bot.fetch_positions()
+        result = await lighter_bot._fetch_positions_and_balance()
         assert isinstance(result, tuple)
         positions, balance = result
         assert len(positions) == 1
@@ -570,7 +570,7 @@ class TestFetchPositions:
         lighter_bot.account_api.account = AsyncMock(
             return_value=_build_account_response(MOCK_ACCOUNT_RESPONSE_EMPTY)
         )
-        result = await lighter_bot.fetch_positions()
+        result = await lighter_bot._fetch_positions_and_balance()
         positions, balance = result
         assert positions == []
         assert balance == 10000.0
@@ -932,7 +932,7 @@ class TestFetchShortPosition:
         lighter_bot.account_api.account = AsyncMock(
             return_value=_build_account_response(short_response)
         )
-        positions, _ = await lighter_bot.fetch_positions()
+        positions, _ = await lighter_bot._fetch_positions_and_balance()
         assert len(positions) == 1
         assert positions[0]["position_side"] == "short"
         assert positions[0]["size"] == -5.0
@@ -952,7 +952,7 @@ class TestFetchShortPosition:
         lighter_bot.account_api.account = AsyncMock(
             return_value=_build_account_response(mixed)
         )
-        positions, _ = await lighter_bot.fetch_positions()
+        positions, _ = await lighter_bot._fetch_positions_and_balance()
         assert len(positions) == 2
         shorts = [p for p in positions if p["position_side"] == "short"]
         assert len(shorts) == 1
@@ -1033,7 +1033,7 @@ class TestPositionSignEdgeCases:
         lighter_bot.account_api.account = AsyncMock(
             return_value=_build_account_response(response)
         )
-        positions, _ = await lighter_bot.fetch_positions()
+        positions, _ = await lighter_bot._fetch_positions_and_balance()
         assert len(positions) == 0
 
     @pytest.mark.asyncio
@@ -1049,7 +1049,7 @@ class TestPositionSignEdgeCases:
         lighter_bot.account_api.account = AsyncMock(
             return_value=_build_account_response(response)
         )
-        positions, _ = await lighter_bot.fetch_positions()
+        positions, _ = await lighter_bot._fetch_positions_and_balance()
         assert len(positions) == 1
         assert positions[0]["size"] == 7.0
         assert positions[0]["position_side"] == "long"
@@ -1884,7 +1884,7 @@ class TestFetchPositionsListFormat:
         )
         # market_index 0 (index from enumerate) won't map unless we handle it
         # The list format uses enumerate, so index 0 -> market_index 0 -> BTC
-        result = await lighter_bot.fetch_positions()
+        result = await lighter_bot._fetch_positions_and_balance()
         positions, balance = result
         # Index 0 maps to BTC in our test setup
         assert len(positions) == 1
@@ -2125,7 +2125,7 @@ class TestFetchPositionsException:
         lighter_bot.account_api.account = AsyncMock(
             side_effect=Exception("connection timeout")
         )
-        result = await lighter_bot.fetch_positions()
+        result = await lighter_bot._fetch_positions_and_balance()
         assert result is False
 
 
@@ -2140,7 +2140,7 @@ class TestFetchPositionsEmptyAccounts:
         lighter_bot.account_api.account = AsyncMock(
             return_value=types.SimpleNamespace(accounts=[])
         )
-        result = await lighter_bot.fetch_positions()
+        result = await lighter_bot._fetch_positions_and_balance()
         assert result is False
 
 
@@ -2558,7 +2558,7 @@ class TestBalanceWarningAllNone:
         lighter_bot.account_api.account = AsyncMock(
             return_value=types.SimpleNamespace(accounts=[acc])
         )
-        result = await lighter_bot.fetch_positions()
+        result = await lighter_bot._fetch_positions_and_balance()
         positions, balance = result
         assert balance == 0.0
         assert positions == []
@@ -2823,7 +2823,7 @@ class TestQuotaRecoveryOpsTiming:
         lighter_bot.fetch_tickers = AsyncMock(return_value={
             "HYPE/USDC:USDC": {"bid": 15.0, "ask": 15.1, "last": 15.05}
         })
-        lighter_bot.fetch_positions = AsyncMock(return_value=([], 5000.0))
+        lighter_bot._fetch_positions_and_balance = AsyncMock(return_value=([], 5000.0))
 
         # Make create_order return an error
         lighter_bot.lighter_client.create_order = AsyncMock(
@@ -4041,7 +4041,7 @@ class TestLighterLiveParitySync:
             return_value=_build_account_response(MOCK_ACCOUNT_RESPONSE)
         )
 
-        positions, balance = asyncio.run(lighter_bot.fetch_positions())
+        positions, balance = asyncio.run(lighter_bot._fetch_positions_and_balance())
 
         assert len(positions) == 1
         assert balance == 5500.0
@@ -4063,7 +4063,7 @@ class TestLighterLiveParitySync:
             return_value=_build_account_response(MOCK_ACCOUNT_RESPONSE)
         )
 
-        positions, balance = asyncio.run(lighter_bot.fetch_positions())
+        positions, balance = asyncio.run(lighter_bot._fetch_positions_and_balance())
 
         assert positions[0]["symbol"] == "HYPE/USDC:USDC"
         assert balance == 5500.0

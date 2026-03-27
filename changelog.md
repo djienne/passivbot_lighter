@@ -1,187 +1,79 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable user-facing changes will be documented in this file.
 
-## [v3.5.2] - 2021-05-10
-- walk forward optimization
-- more advanced backtest analysis tools
+## v7.6.2 - 2026-01-20
 
-## [v3.5.1] - 2021-05-09
-- optimize with sliding window
-- restructured dirs
-- new dirs
-- `backtests/{exchange}/{symbol}/optimize/`
-- `backtests/{exchange}/{symbol}/plots/`
-- `backtests/{exchange}/{symbol}/caches/`
-- if end_date = -1 in backtest_config.hjson, downloader will make a new ticks_cache.npy for each session
-- to reuse prev ticks cache, set end_date to a static date
-- when optimizing, intermediate_best_result.json is dumped as usable live_config
+### Fixed
+- One-way mode now respects disabled sides when choosing initial entry side, preventing a disabled side from blocking entries.
+- Startup banner now dynamically calculates width to prevent misaligned borders.
+- Bybit leverage/margin mode "not modified" errors now handled gracefully instead of logging full tracebacks.
+- Large warmup spans (>2 days) now properly trigger gap-filling via CCXT even when end_ts touches present, fixing issue where thousands of zero-candles were synthesized for historical gaps.
+- Windows compatibility: cache folder names now replace `:` with `_` on Windows or when `WINDOWS_COMPATIBILITY=1` env var is set (#547, thanks @FelixJongleur42). **Note:** Existing Windows caches will be orphaned and re-downloaded.
+- Pareto dashboard: fixed JavaScript callback errors when switching between tabs (#550, thanks @646826).
 
-## [v3.5.0] - 2021-05-02
-- added volatility indicator
-- split extract optimize.py from backtest.py
-- now `python3 backtest.py backtest_config.hjson live_config.json` will backtest and plot single candidate
-- `python3 optimize.py backtest_config.hjson` will optimize
-- refactoring of all @njit calcs, separating them into jitted.py
-- added telegram bot
+### Changed
+- Config modification logs now prefixed with `[config]` for easier filtering (e.g., `[config] changed live.user bybit_01 -> gateio_01`).
+- Zero-candle synthesis logs are now rate-limited to at most once per minute per symbol, reducing log spam.
+- Zero-candle logs now include human-readable UTC timestamps showing which candles were synthesized (e.g., `synthesized 3 zero-candles at 2026-01-19T22:15 to 2026-01-19T22:17`).
+- Synthetic candles are now tracked at runtime; when real data arrives for a previously-synthetic timestamp, the EMA cache is automatically invalidated and will be recomputed on next cycle.
+- FillEventsManager logs now prefixed with `[fills]` for easier filtering; verbose refresh logs consolidated into single summary line (e.g., `[fills] refresh: events=1311 (+1) | persisted 2 days (2026-01-19, 2026-01-20)`).
+- BybitFetcher residual PnL warnings reduced to debug level with compact summary (was logging all order IDs every cycle at WARNING level).
+- Health summary now includes realized PnL sum when fills > 0 (e.g., `fills=3 (pnl=+12.50)`).
+- Startup banner now shows "TWEL" (Total Wallet Exposure Limit) instead of "Exposure" to clarify it's a limit, not current exposure; long+short mode shows both limits (e.g., `TWEL: L:125% S:85%`).
+- Synthetic candle replacement logs now prefixed with `[candle]` for easier filtering.
 
-## [v3.4.0] - 2021-04-14
-- added binance USDT-margined backtester with stoploss
-- added binance COIN-margined backtester with stoploss
-- changed backtester usage -- now needs to specify whole path to .hjson config file
+### Added
+- `openpyxl` added to `requirements-live.txt` (required for Bitget archive XLSX parsing).
+- `CandlestickManager.needs_ema_recompute(symbol)`: check if EMAs should be recomputed due to synthetic→real data replacement.
+- `CandlestickManager.clear_synthetic_tracking(symbol)`: clear synthetic timestamp tracking after warmup completes.
+- `live.warmup_jitter_seconds` (default 30): random delay before warmup to prevent API rate limit storms when multiple bots start simultaneously.
+- `live.max_concurrent_api_requests` (default null): optional global concurrency limit for CCXT API calls via CandlestickManager's network semaphore.
+- `backtest.maker_fee_override` (default null): optional backtest/optimizer maker fee override (part-per-one) to replace exchange-derived fees.
+- `live.enable_archive_candle_fetch` (default false): opt-in to use exchange archive data for candle fetching in live bots; disabled by default to avoid potential timeout issues. Backtester always enables archive fetching regardless of this setting.
 
-## [v3.3.3] - 2021-04-05
+## v7.6.1 - 2026-01-03
 
-- added stop loss
-- todo: backtester with stop loss
+### Testing
+- Added comprehensive test coverage for HLCV preparation module (16 tests covering 1,017 lines of production code)
+- Added comprehensive orchestrator integration tests (19 tests for order accuracy, edge cases, multi-symbol coordination)
+- Added warmup utilities test coverage (20 tests for EMA warmup calculations and edge cases)
+- Improved Rust stub in conftest.py with correct parameter signatures and orchestrator JSON API support
+- Total: 55 new tests, bringing test suite from ~420 to 477 passing tests
 
-## [v3.3.2] - 2021-04-05
+## v7.6.0 - 2026-01-03
 
-- changed api key format. put api key/secret in api-keys.json in main dir.
-- changed name of live_settings dir to live_configs, removed subdirs binance/bybit
-- changed how to use start_bot.py. see updated startup instructions
-- improved backtester multiprocessing memory usage
+### Added
+- Shared Pareto core (`pareto_core.py`) with constraint-aware dominance, crowding, and extreme-preserving pruning; reused by ParetoStore.
+- Canonical suite metrics payload now shared by backtest and optimizer; suite summaries include the same schema as Pareto members.
+- Targeted Pareto tests to ensure consistency.
+- KuCoin exchange-config regression tests covering hedge-mode setup and leverage/margin configuration (guards CCXT upgrades).
+- Pareto explorer: added configurable “Closest config metrics” dropdown so users can choose which metrics are shown in the Closest Config table, defaulting to scoring/limit metrics.
+- `live.balance_override` setting/CLI flag to pin balance to a fixed value instead of fetching from the exchange (off by default).
+- Fill events manager: added Gate.io support via ccxt trade fetcher.
+- Rust build pipeline: pre-import staleness checks with skip/force/fail flags, shared helpers, and a `scripts/check_rust_extension.py` reporter; added tests for staleness detection.
+- Rust compile flow now less noisy in normal operation (debug lock prints removed); compile attempts still logged when rebuilding.
+- Balance hysteresis now applied centrally in core bot update_balance; exchange fetch_balance implementations return raw balances.
+- Added configurable `live.balance_hysteresis_snap_pct` (default 0.02); set 0.0 to disable balance hysteresis entirely.
+- Optimizer: bounds now support optional step size `[low, high, step]` for grid-based optimization; stepped parameters stay on-grid through sampling, crossover/mutation, and Pareto storage.
+- Live: added `live.candle_lock_timeout_seconds` to control how long CandlestickManager waits for per-symbol candle locks when multiple bot instances share the same cache (default 10s).
+- Rust orchestrator JSON API for unified order planning across live and backtest.
+- Backtest HLCV preparation pipeline now routes through CandlestickManager with shared warmup utilities.
 
-## [v3.1.1] - 2021-04-01
-
-- Binance inverse futures coin margined markets now supported
-
-## [v3.3.0] - 2021-03-30
-
-- Bybit usdt linear perpetual and Bybit inverse perpetual markets now supported
-- new downloader for historical backtesting data
-
-## [v3.2.1] - 2021-03-25
-
-- bug fixes
-- Bybit backtester improvements and bug fixes
-- numba is now enabled by default, use --nojit to disable numba
-- several renamings
-
-## [v3.2.0] - 2021-03-23
-
-- implemented particle swarm optimizationg algorithm, replacing jackrabbit
-- Bybit hedge mode with inverse futures
-- removed config param close_qty_pct
-- removed config param balance_pct
-- removed config param max_markup
-- added config param markup_range
-
-## [v3.1.0] - 2021-03-21
-
-- removed setting min_close_qty_multiplier
-- added setting close_qty_pct, which complements entry_qty_pct
-- rewrote iter_long/shrt_closes
-- fixed memory leak bug
-
-## [v3.0.1] - 2021-03-18
-
-- hedge mode backtester implemented
-- emas added back
-
-## [v3.0.0] - 2021-03-12
-
-- Binance hedge mode implemented (Bybit not yet supported)
-- emas removed
-- stop loss removed
-
-## [v2.0.3] - 2021-03-02
-
-- new default Bybit config
-- behavior change: reentry qtys may now be smaller than initial entry qty
-- backtest iterates a numpy array instead of a python list of dicts for reduced ram usage
-
-## [v2.0.2] - 2021-03-01
-
-- more jit'ed calcs
-
-## [v2.0.1] - 2021-02-28
-
-- added optional just-in-time compiling for faster backtesting
-
-## [v2.0.0] - 2021-02-23
-
-- major update to backtester
-- new backtest usage syntax
-- other changes
-
-## [v1.3.3] - 2021-02-18
-
-- minor refactoring
-
-## [v1.3.0] - 2021-02-17
-
-- added indicator_settings["tick_ema"]["spread"] to live bot and backtester
-    - optional setting -- ema_spread defaults to 0.0 if not present in config file
-
-## [v1.2.1] - 2021-02-17
-
-- backtester will cache exchange fetched settings after first run
-- backtester will prevent using leverage higher than max leverage, in case max leverage set in ranges.json was too high
-
-## [v1.2.0] - 2021-02-17
-
-- bug fixes
-- change in backtesting_notes.ipynb
-    - automatic plot dump
-    - other changes
-- backtester now fetches relevant data from exchanges instead of user having to input them manually
-
-## [v1.1.0] - 2021-02-16
-
-- bug fixes v1.0.2
-- updated default Bybit live settings v1.1.0
-
-## 2021-02-12
-
-- added indicator_settings["funding_fee_collect_mode"]
-    - if true, will enter long only if predicted fundig rate is negative and enter short only if predicted funding rate
-      is positive
-- added indicator rsi (not finished, not active)
-- changed entry_qty_pct formula
-    - before initial_entry_qty = balance_ito_contracts * entry_qty_pct
-    - now initial_entry_qty = balance_ito_contracts * leverage * entry_qty_pct
-- added logging
-- added "config_name" and "logging_level" to live settings
-- added break_on condition: break if balance + pnl < starting_balance
-
-## 2021-02-10
-
-- renamed settings["default_qty"] to settings["entry_qty_pct"]
-- settings["entry_qty_pct"] may now also be a positive value
-- renamed settings["balance"] to settings["balance_pct"]
-- settings["balance_pct"] may now also be a positive value
-- added balance_pct to backtester. backtester will now behave like live bot, taking balance_pct into account
-    - actual balance is used for liq price calc, otherwise balance * balance_pct is used
-
-## 2021-02-09
-
-- added classic stop loss
-
-## 2021-02-08
-
-- added min_close_qty_multiplier
-
-## 2021-02-03
-
-- backtester break conditions change
-- bug fixes
-
-## 2021-01-30
-
-- changed backtesting results formatting
-- fixed insufficient margin error
-- many other fixes and changes...
-- added possibility of running same backtest in two or more terminals for better cpu utilization
-
-## 2021-01-23
-
-- removed static mode
-- added indicator ema
-- rewrote backtester
-
-## 2021-01-19
-
-- renamed settings["margin_limit"] to settings["balance"]
-- bug fixes and changes in trade data downloading
-- if there already is historical trade data downloaded, run the script `rename_trade_data_csvs.py` to rename all files
+### Changed
+- Backtest fills now include signed `wallet_exposure` and `twe_long`/`twe_short`/`twe_net` (replacing the previous `total_wallet_exposure` fill column).
+- Pareto explorer: default metrics for X/Y/histogram, scenario comparison, param scatter, correlation heatmap, and Closest Config now derive from `config.optimize.scoring` and `config.optimize.limits` instead of first-alphabetical metrics; Closest Config table no longer shows raw *_mean/_min/_max/_std stat columns by default.
+- Suite summaries are leaner: redundant metric dumps removed; canonical metrics schema persisted alongside per-scenario timing.
+- Pareto pruning preserves per-objective extremes when enforcing max size.
+- Hyperliquid combined balance/position caching test isolated stubs to avoid polluting the rest of the suite.
+- Separated `fetch_positions` and `fetch_balance` responsibilities across all exchange wrappers (each now returns only positions or only balance) and added `update_positions_and_balance()` helper in the core bot to refresh both concurrently.
+- `update_positions_and_balance()` now runs balance and positions concurrently, logs position changes after both complete, and then emits a single balance-change event so equity logging always uses fresh positions.
+- KuCoin `get_order_execution_params` now aligns with the latest CCXT payload requirements so orders always include the correct margin/position parameters after the CCXT upgrade.
+- Added Pareto regression test to ensure per-metric extremes remain present after front pruning.
+- Metric adg_pnl now includes fees paid, effectively making it net pnl instead of gross pnl.
+- Risk management docs refreshed and consolidated; new notes on unstucking, WEL/TWEL enforcers, and conditional stop-loss concepts.
+- Balance updates now keep the previous value on fetch failures (no more transient zero balances); warnings are logged and the standard restart-on-errors flow handles persistent issues.
+- EMA log spam reduced: volume/log-range EMA summaries only emit when rankings change, keeping live logs quieter.
+- Suite configuration is canonical under `backtest.suite` for both backtesting and optimizer runs; `optimize.suite` (if present) is ignored and removed during config normalization.
+- Live orchestrator compare mode now derives all EMA inputs from a single per-symbol candle snapshot (1m + 1h), reducing redundant candle-lock contention and false compare failures in multi-bot deployments.
+- Live order generation now runs exclusively through the Rust orchestrator; legacy Python order planning paths are removed.
