@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows: file locking handled via msvcrt below
+    import msvcrt
 import json
 import logging
 import os
@@ -102,11 +106,17 @@ class RateLimitCoordinator:
             return []
         try:
             with self.temp_file.open("r") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                if fcntl is not None:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                else:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
                 try:
                     data = json.load(f)
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    if fcntl is not None:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    else:
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
                 return data.get("calls", [])
         except Exception as exc:
             logger.debug("RateLimitCoordinator: failed to load %s: %s", self.temp_file, exc)
@@ -130,11 +140,17 @@ class RateLimitCoordinator:
         tmp_file = self.temp_file.with_suffix(".tmp")
         try:
             with tmp_file.open("w") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                if fcntl is not None:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                else:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
                 try:
                     json.dump(data, f)
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    if fcntl is not None:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    else:
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
             os.replace(tmp_file, self.temp_file)
         except Exception as exc:
             logger.debug("RateLimitCoordinator: failed to save %s: %s", self.temp_file, exc)
