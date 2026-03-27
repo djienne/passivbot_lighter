@@ -46,7 +46,7 @@ def test_ensure_millis_seconds_to_ms():
             "volume": [1],
         }
     )
-    out = downloader.ensure_millis(df.copy())
+    out = downloader.ensure_millis_df(df.copy())
     assert out["timestamp"].iloc[0] == 1_600_000_000_000
 
 
@@ -61,7 +61,7 @@ def test_ensure_millis_micros_to_ms():
             "volume": [1],
         }
     )
-    out = downloader.ensure_millis(df.copy())
+    out = downloader.ensure_millis_df(df.copy())
     assert out["timestamp"].iloc[0] == 1_600_000_000_000
 
 
@@ -76,7 +76,7 @@ def test_ensure_millis_ms_unchanged():
             "volume": [1],
         }
     )
-    out = downloader.ensure_millis(df.copy())
+    out = downloader.ensure_millis_df(df.copy())
     assert out["timestamp"].iloc[0] == 1_600_000_000_000
 
 
@@ -179,9 +179,8 @@ async def test_load_markets_fetch_and_cache(tmp_path, monkeypatch):
     markets = await downloader.load_markets("binance")
     assert "BTC/USDT:USDT" in markets
 
-    # Ensure cache file exists
-    ex = downloader.normalize_exchange_name("binance")
-    cache_fp = tmp_path / "caches" / ex / "markets.json"
+    # Ensure cache file exists (uses non-normalized exchange name for cache path)
+    cache_fp = tmp_path / "caches" / "binance" / "markets.json"
     assert cache_fp.exists()
 
     # Second call: make cache fresh to test cache path

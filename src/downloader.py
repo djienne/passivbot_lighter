@@ -48,6 +48,7 @@ from utils import (
     date_to_ts,
     get_file_mod_ms,
     normalize_exchange_name,
+    denormalize_exchange_name,
     get_quote,
     symbol_to_coin,
     coin_to_symbol,
@@ -135,14 +136,14 @@ def compute_backtest_warmup_minutes(config: dict) -> int:
         "ema_span_0",
         "ema_span_1",
         "filter_volume_ema_span",
-        "filter_log_range_ema_span",
+        "filter_volatility_ema_span",
     ]
 
     for _, long_params, short_params in _iter_param_sets(config):
         for params in (long_params, short_params):
             for field in minute_fields:
                 max_minutes = max(max_minutes, _to_float(params.get(field)))
-            log_span_minutes = _to_float(params.get("entry_grid_spacing_log_span_hours")) * 60.0
+            log_span_minutes = _to_float(params.get("entry_volatility_ema_span_hours")) * 60.0
             max_minutes = max(max_minutes, log_span_minutes)
 
     bounds = config.get("optimize", {}).get("bounds", {})
@@ -150,15 +151,15 @@ def compute_backtest_warmup_minutes(config: dict) -> int:
         "long_ema_span_0",
         "long_ema_span_1",
         "long_filter_volume_ema_span",
-        "long_filter_log_range_ema_span",
+        "long_filter_volatility_ema_span",
         "short_ema_span_0",
         "short_ema_span_1",
         "short_filter_volume_ema_span",
-        "short_filter_log_range_ema_span",
+        "short_filter_volatility_ema_span",
     ]
     bound_keys_hours = [
-        "long_entry_grid_spacing_log_span_hours",
-        "short_entry_grid_spacing_log_span_hours",
+        "long_entry_volatility_ema_span_hours",
+        "short_entry_volatility_ema_span_hours",
     ]
 
     for key in bound_keys_minutes:
@@ -185,7 +186,7 @@ def compute_per_coin_warmup_minutes(config: dict) -> dict:
         "ema_span_0",
         "ema_span_1",
         "filter_volume_ema_span",
-        "filter_log_range_ema_span",
+        "filter_volatility_ema_span",
     ]
     for coin, long_params, short_params in _iter_param_sets(config):
         max_minutes = 0.0
@@ -194,7 +195,7 @@ def compute_per_coin_warmup_minutes(config: dict) -> dict:
                 max_minutes = max(max_minutes, _to_float(params.get(field)))
             max_minutes = max(
                 max_minutes,
-                _to_float(params.get("entry_grid_spacing_log_span_hours")) * 60.0,
+                _to_float(params.get("entry_volatility_ema_span_hours")) * 60.0,
             )
         if not math.isfinite(max_minutes):
             per_coin[coin] = 0
@@ -209,12 +210,74 @@ def compute_per_coin_warmup_minutes(config: dict) -> dict:
 def dump_ohlcv_data(data, filepath):
     columns = ["timestamp", "open", "high", "low", "close", "volume"]
     if isinstance(data, pd.DataFrame):
-        data = ensure_millis(data[columns]).astype(float).values
+        data = ensure_millis_df(data[columns]).astype(float).values
     elif isinstance(data, np.ndarray):
         pass
     else:
         raise Exception(f"Unknown data format for {filepath}")
     np.save(filepath, deduplicate_rows(data))
+
+
+def canonicalize_daily_ohlcvs(data, start_ts: int, interval_ms: int = 60_000) -> pd.DataFrame:
+    """
+    Return a 1-minute canonical OHLCV DataFrame for the given day.
+
+    Missing minutes are forward/back filled for price columns and zero-filled for volume.
+    Duplicate timestamps keep the last observation.
+    """
+    columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    if isinstance(data, np.ndarray):
+        df = pd.DataFrame(data, columns=columns)
+    elif isinstance(data, pd.DataFrame):
+        df = data[columns].copy()
+    else:
+        raise TypeError("data must be a pandas DataFrame or numpy array")
+
+    df = df.reset_index(drop=True)
+    df = ensure_millis_df(df)
+    for col in columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    end_ts = start_ts + 24 * 60 * 60 * 1000
+    df = df.dropna(subset=["timestamp"])
+    df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts)]
+    df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+
+    if df.empty:
+        raise ValueError("No data available for canonicalization")
+
+    expected_ts = np.arange(start_ts, end_ts, interval_ms)
+    reindexed = df.set_index("timestamp").reindex(expected_ts)
+    missing_mask = reindexed[["open", "high", "low", "close", "volume"]].isna().all(axis=1)
+
+    close = reindexed["close"].astype(float)
+    close = close.ffill().bfill()
+    if close.isna().any():
+        raise ValueError("Unable to fill close prices while canonicalizing daily OHLCV data")
+    reindexed["close"] = close
+
+    for col in ["open", "high", "low"]:
+        series = reindexed[col].astype(float)
+        series = series.ffill().bfill()
+        series = series.fillna(reindexed["close"])
+        series = pd.Series(
+            np.where(missing_mask, reindexed["close"], series),
+            index=reindexed.index,
+            dtype=float,
+        )
+        reindexed[col] = series
+
+    volume = reindexed["volume"].astype(float)
+    volume = volume.fillna(0.0)
+    reindexed["volume"] = volume
+
+    result = reindexed.reset_index().rename(columns={"index": "timestamp"})
+    return result[columns]
+
+
+def dump_daily_ohlcv_data(data, filepath, start_ts: int, interval_ms: int = 60_000):
+    canonical = canonicalize_daily_ohlcvs(data, start_ts, interval_ms=interval_ms)
+    dump_ohlcv_data(canonical, filepath)
 
 
 def deduplicate_rows(arr):
@@ -251,7 +314,7 @@ def load_ohlcv_data(filepath: str) -> pd.DataFrame:
         print(
             f"Caught .npy file with duplicate rows: {filepath} Overwrote with deduplicated version."
         )
-    return ensure_millis(pd.DataFrame(arr_deduplicated, columns=columns))
+    return ensure_millis_df(pd.DataFrame(arr_deduplicated, columns=columns))
 
 
 def get_days_in_between(start_day, end_day):
@@ -299,29 +362,19 @@ def attempt_gap_fix_ohlcvs(df, symbol=None, verbose=True):
     return new_df.reset_index().rename(columns={"index": "timestamp"})
 
 
-async def fetch_url(session, url, retries=10, backoff=1.0):
+async def fetch_url(session, url, retries=5, backoff=1.5):
     last_exc = None
     for attempt in range(retries):
         try:
             async with session.get(url) as response:
                 response.raise_for_status()
                 return await response.read()
-        except aiohttp.ClientResponseError as e:
-            status = getattr(e, "status", None)
-            # Treat 404/403 as "no data" and do not retry.
-            if status in (404, 403):
-                logging.warning(f"{url} returned {status}; skipping retries.")
-                return None
-            # For other HTTP errors (e.g. 429, 5xx), apply backoff but stop if out of retries.
-            last_exc = e
-            wait_time = backoff * (2 ** attempt)
-            logging.warning(
-                f"Attempt {attempt + 1} failed for {url}: HTTP {status} {e}, retrying in {wait_time:.1f}s..."
-            )
-            await asyncio.sleep(wait_time)
         except Exception as e:
+            if isinstance(e, aiohttp.ClientResponseError) and getattr(e, "status", None) == 404:
+                logging.warning(f"{url} returned 404; skipping retries.")
+                return None
             last_exc = e
-            wait_time = backoff * (2 ** attempt)
+            wait_time = backoff**attempt
             logging.warning(
                 f"Attempt {attempt + 1} failed for {url}: {e}, retrying in {wait_time:.1f}s..."
             )
@@ -367,14 +420,14 @@ async def get_zip_bitget(url):
         return pd.DataFrame(columns=col_names)
     dfs = []
     for z in zips:
-        df = ensure_millis(pd.read_excel(z))
+        df = ensure_millis_df(pd.read_excel(z))
         df.columns = col_names + [f"extra_{i}" for i in range(len(df.columns) - len(col_names))]
         dfs.append(df[col_names])
     dfc = pd.concat(dfs).sort_values("timestamp").reset_index(drop=True)
     return dfc[dfc.timestamp != "open_time"]
 
 
-def ensure_millis(df):
+def ensure_millis_df(df):
     """
     Normalize a DataFrame's 'timestamp' column to milliseconds.
 
@@ -446,15 +499,6 @@ def ensure_millis(df):
     return df
 
 
-def _clamp_end_date(end_date_str):
-    """Ensure end_date is no later than yesterday UTC (latest complete day)."""
-    yesterday = (datetime.datetime.utcnow() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    if end_date_str > yesterday:
-        logging.info(f"Clamping end_date from {end_date_str} to {yesterday} (latest complete day)")
-        return yesterday
-    return end_date_str
-
-
 class OHLCVManager:
     """
     Manages OHLCVs for multiple exchanges.
@@ -472,25 +516,22 @@ class OHLCVManager:
         self.exchange = normalize_exchange_name(exchange)
         self.quote = get_quote(exchange)
         self.start_date = "2020-01-01" if start_date is None else format_end_date(start_date)
-        self.end_date = _clamp_end_date(format_end_date("now" if end_date is None else end_date))
+        self.end_date = format_end_date("now" if end_date is None else end_date)
         self.start_ts = date_to_ts(self.start_date)
         self.end_ts = date_to_ts(self.end_date)
         self.cc = cc
+        # Use denormalized exchange name for cache paths (e.g., "binance" not "binanceusdm")
+        cache_exchange = denormalize_exchange_name(self.exchange)
         self.cache_filepaths = {
-            "markets": os.path.join("caches", self.exchange, "markets.json"),
-            "ohlcvs": os.path.join("historical_data", f"ohlcvs_{self.exchange}"),
-            "first_timestamps": os.path.join("caches", self.exchange, "first_timestamps.json"),
+            "markets": os.path.join("caches", cache_exchange, "markets.json"),
+            "ohlcvs": os.path.join("historical_data", f"ohlcvs_{cache_exchange}"),
+            "first_timestamps": os.path.join("caches", cache_exchange, "first_timestamps.json"),
         }
         self.markets = None
         self.verbose = verbose
         self.max_requests_per_minute = {"": 120, "gateio": 60}
         self.request_timestamps = deque(maxlen=1000)  # for rate-limiting checks
-        # Serialize rate-limit checks per exchange to avoid multiple tasks
-        # sleeping/logging concurrently.
-        self._rate_limit_lock = asyncio.Lock()
         self.gap_tolerance_ohlcvs_minutes = gap_tolerance_ohlcvs_minutes
-        # Limit concurrent network-heavy download tasks per manager
-        self._download_semaphore = asyncio.Semaphore(10)
 
     def update_date_range(self, new_start_date=None, new_end_date=None):
         if new_start_date:
@@ -508,7 +549,7 @@ class OHLCVManager:
                 self.end_date = new_end_date
             else:
                 raise Exception(f"invalid end date {new_end_date}")
-            self.end_date = _clamp_end_date(format_end_date(self.end_date))
+            self.end_date = format_end_date(self.end_date)
             self.end_ts = date_to_ts(self.end_date)
 
     def get_symbol(self, coin):
@@ -560,83 +601,25 @@ class OHLCVManager:
             return False
         return True
 
-    def _is_bybit_day_valid(self, coin: str, day: str, df: pd.DataFrame, max_missing_minutes: int = 61) -> bool:
-        """
-        Check whether a bybit daily OHLCV slice is acceptable.
-
-        - Requires no sub-minute intervals.
-        - Computes missing minutes across the full day [00:00, 24:00) including edges.
-        - Accepts days with missing_minutes <= max_missing_minutes.
-        """
-        start_ts_day = date_to_ts(day)
-        end_ts_day = start_ts_day + 24 * 60 * 60 * 1000
-        df_day = df[
-            (df["timestamp"] >= start_ts_day) & (df["timestamp"] < end_ts_day)
-        ].reset_index(drop=True)
-
-        if df_day.empty:
-            logging.info(
-                f"bybit {coin} {day}: Cached day has no candles, considered incomplete"
-            )
-            return False
-
-        intervals = np.diff(df_day["timestamp"].values)
-        if (intervals < 60000).any():
-            logging.info(
-                f"bybit {coin} {day}: Cached day has sub-minute intervals, considered incomplete"
-            )
-            return False
-
-        # Total missing minutes across the day, including edges
-        first_ts = int(df_day["timestamp"].iloc[0])
-        last_ts = int(df_day["timestamp"].iloc[-1])
-        missing_before_first = max(0, (first_ts - start_ts_day) // 60000)
-        missing_after_last = max(0, (end_ts_day - last_ts) // 60000 - 1)
-        missing_internal = int(sum((gap // 60000) - 1 for gap in intervals if gap > 60000))
-        missing_minutes = int(missing_before_first + missing_internal + missing_after_last)
-
-        if missing_minutes > max_missing_minutes:
-            logging.info(
-                f"bybit {coin} {day}: Cached day has {missing_minutes} missing minutes, considered incomplete"
-            )
-            return False
-
-        return True
-
     async def check_rate_limit(self):
-        # For bybit and bitget we rely on the exchange-side rate limiting and
-        # static archives; avoid adding extra sleeps or noisy logs here.
-        if self.exchange in ("bybit", "bitget"):
-            return
-        async with self._rate_limit_lock:
-            # Prune timestamps older than 60 seconds
-            now = time()
-            while self.request_timestamps and now - self.request_timestamps[0] > 60:
-                self.request_timestamps.popleft()
+        current_time = time()
+        while self.request_timestamps and current_time - self.request_timestamps[0] > 60:
+            self.request_timestamps.popleft()
+        mrpm = (
+            self.max_requests_per_minute[self.exchange]
+            if self.exchange in self.max_requests_per_minute
+            else self.max_requests_per_minute[""]
+        )
+        if len(self.request_timestamps) >= mrpm:
+            sleep_time = 60 - (current_time - self.request_timestamps[0])
+            if sleep_time > 0:
+                if self.verbose:
+                    logging.info(
+                        f"{self.exchange} Rate limit reached, sleeping for {sleep_time:.2f} seconds"
+                    )
+                await asyncio.sleep(sleep_time)
 
-            mrpm = (
-                self.max_requests_per_minute[self.exchange]
-                if self.exchange in self.max_requests_per_minute
-                else self.max_requests_per_minute[""]
-            )
-
-            if len(self.request_timestamps) >= mrpm:
-                # Earliest time when another request is allowed
-                earliest = self.request_timestamps[0] + 60.0
-                sleep_time = max(0.0, earliest - now)
-                if sleep_time > 0:
-                    if self.verbose:
-                        logging.info(
-                            f"{self.exchange} Rate limit reached, sleeping for {sleep_time:.2f} seconds"
-                        )
-                    await asyncio.sleep(sleep_time)
-                    # Recompute time and prune again after sleeping
-                    now = time()
-                    while self.request_timestamps and now - self.request_timestamps[0] > 60:
-                        self.request_timestamps.popleft()
-
-            # Record this request time
-            self.request_timestamps.append(time())
+        self.request_timestamps.append(current_time)
 
     async def get_ohlcvs(self, coin, start_date=None, end_date=None):
         """
@@ -659,53 +642,21 @@ class OHLCVManager:
         if missing_days:
             await self.download_ohlcvs(coin)
         ohlcvs = await self.load_ohlcvs_from_cache(coin)
-        # If nothing was loaded, return an empty frame with the expected schema
-        if ohlcvs is None or ohlcvs.empty:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-        # Ensure we have a volume column before attempting to rescale it
-        if "volume" not in ohlcvs.columns:
-            ohlcvs["volume"] = 0.0
-        else:
-            # Use quote volume
-            ohlcvs["volume"] = ohlcvs["volume"] * ohlcvs["close"]
+        ohlcvs.volume = ohlcvs.volume * ohlcvs.close  # use quote volume
         return ohlcvs
 
     async def get_start_date_modified(self, coin):
         fts = await self.get_first_timestamp(coin)
-        modified_start = ts_to_date(max(self.start_ts, fts))[:10]
-        logging.info(f"DEBUG {self.exchange} {coin}: first_timestamp={fts} ({ts_to_date(fts) if fts else 'N/A'}), requested_start={self.start_ts} ({ts_to_date(self.start_ts)}), modified_start={modified_start}")
-        return modified_start
+        return ts_to_date(max(self.start_ts, fts))[:10]
 
     async def get_missing_days_ohlcvs(self, coin):
         start_date = await self.get_start_date_modified(coin)
         days = get_days_in_between(start_date, self.end_date)
-        logging.info(f"DEBUG {self.exchange} {coin}: start_date={start_date}, end_date={self.end_date}, num_days={len(days)}")
         dirpath = os.path.join(self.cache_filepaths["ohlcvs"], coin)
         if not os.path.exists(dirpath):
-            logging.info(f"DEBUG {self.exchange} {coin}: cache dir doesn't exist, returning {len(days)} days to download")
             return days
         all_files = os.listdir(dirpath)
-        missing_days = [x for x in days if x + ".npy" not in all_files]
-        logging.info(f"DEBUG {self.exchange} {coin}: cache dir exists with {len(all_files)} files, missing {len(missing_days)} days")
-
-        # For bybit, also treat existing but incomplete or gap-filled days as missing
-        if self.exchange == "bybit":
-            for day in days:
-                fname = day + ".npy"
-                if fname not in all_files:
-                    continue
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    df = load_ohlcv_data(fpath)
-                    if not self._is_bybit_day_valid(coin, day, df):
-                        missing_days.append(day)
-                except Exception as e:
-                    logging.warning(
-                        f"bybit {coin} {day}: Error reading cached file {fpath} ({e}), scheduled for re-download"
-                    )
-                    missing_days.append(day)
-
-        return sorted(set(missing_days))
+        return sorted([x for x in days if x + ".npy" not in all_files])
 
     async def download_ohlcvs(self, coin):
         if not self.markets:
@@ -724,10 +675,6 @@ class OHLCVManager:
             if self.cc is None:
                 self.load_cc()
             await self.download_ohlcvs_gateio(coin)
-        elif self.exchange == "hyperliquid":
-            if self.cc is None:
-                self.load_cc()
-            await self.download_ohlcvs_hyperliquid(coin)
 
     def dump_ohlcvs_to_cache(self, coin):
         """
@@ -767,9 +714,6 @@ class OHLCVManager:
             return fts
         elif self.exchange == "bitget":
             fts = await self.find_first_day_bitget(coin)
-            return fts
-        elif self.exchange == "hyperliquid":
-            fts = await self.find_first_day_hyperliquid(coin)
             return fts
         if ohlcvs:
             fts = ohlcvs[0][0]
@@ -860,27 +804,19 @@ class OHLCVManager:
         df = self.filter_date_range(df)
 
         # ----------------------------------------------------------------------
-        # 2) Gap check with tolerance: if intervals != 60000 for any bar.
-        #    For most exchanges, large gaps cause us to return empty data.
-        #    For bitget, we aggressively fill gaps instead of treating them as fatal.
+        # 2) Gap check with tolerance: if intervals != 60000 for any bar, return empty.
         # ----------------------------------------------------------------------
         intervals = np.diff(df["timestamp"].values)
         # If any interval is not exactly 60000, we have a gap.
         if (intervals != 60000).any():
             greatest_gap = int(intervals.max() / 60000.0)
-            if self.exchange == "bitget":
+            if greatest_gap > self.gap_tolerance_ohlcvs_minutes:
                 logging.warning(
-                    f"[{self.exchange}] Gaps detected in {coin} OHLCV data. Greatest gap: {greatest_gap} minutes. Filling gaps aggressively."
+                    f"[{self.exchange}] Gaps detected in {coin} OHLCV data. Greatest gap: {greatest_gap} minutes. Returning empty DataFrame."
                 )
-                df = fill_gaps_in_ohlcvs(df)
+                return pd.DataFrame(columns=df.columns)
             else:
-                if greatest_gap > self.gap_tolerance_ohlcvs_minutes:
-                    logging.warning(
-                        f"[{self.exchange}] Gaps detected in {coin} OHLCV data. Greatest gap: {greatest_gap} minutes. Returning empty DataFrame."
-                    )
-                    return pd.DataFrame(columns=df.columns)
-                else:
-                    df = fill_gaps_in_ohlcvs(df)
+                df = fill_gaps_in_ohlcvs(df)
         return df
 
     def copy_ohlcvs_from_old_dir(self, new_dirpath, old_dirpath, missing_days, coin):
@@ -971,7 +907,11 @@ class OHLCVManager:
                         d_fpath = os.path.join(dirpath, fpath)
                         if not os.path.exists(d_fpath):
                             n_days_dumped += 1
-                            dump_ohlcv_data(daily_data, d_fpath)
+                            dump_daily_ohlcv_data(
+                                daily_data,
+                                d_fpath,
+                                date_to_ts(date.strftime("%Y-%m-%d")),
+                            )
                     else:
                         logging.info(
                             f"binanceusdm incomplete daily data for {coin} {date} {len(daily_data)}"
@@ -984,9 +924,6 @@ class OHLCVManager:
 
         # Download missing daily
         missing_days = filter_missing_days(await self.get_missing_days_ohlcvs(coin))
-        # Exclude current day as Binance archives don't include incomplete days
-        today = ts_to_date(utc_ms())[:10]
-        missing_days = [d for d in missing_days if d < today]
         now_dt = datetime.datetime.utcnow().replace(day=1)
         prev_month_dt = (now_dt - datetime.timedelta(days=1)).replace(day=1)
         recent_months = {
@@ -1013,10 +950,14 @@ class OHLCVManager:
 
     async def download_single_binance(self, url: str, fpath: str):
         try:
-            async with self._download_semaphore:
-                csv = await get_zip_binance(url)
+            csv = await get_zip_binance(url)
             if not csv.empty:
-                dump_ohlcv_data(ensure_millis(csv), fpath)
+                day = Path(fpath).stem
+                dump_daily_ohlcv_data(
+                    ensure_millis_df(csv),
+                    fpath,
+                    date_to_ts(day),
+                )
                 if self.verbose:
                     logging.info(f"binanceusdm Dumped data {fpath}")
                 return True
@@ -1045,40 +986,20 @@ class OHLCVManager:
         base_url = "https://public.bybit.com/trading/"
         webpage = urlopen(f"{base_url}{symbolf}/").read().decode()
 
-        # Split missing days into those with archive files and those without
-        days_with_archive = [
-            day for day in missing_days if f"{symbolf}{day}.csv.gz" in webpage
+        filenames = [
+            f"{symbolf}{day}.csv.gz" for day in missing_days if f"{symbolf}{day}.csv.gz" in webpage
         ]
-        days_without_archive = sorted(set(missing_days) - set(days_with_archive))
-
-        # Download concurrently from public trade archives, with per-day API fallback
+        # Download concurrently
         async with aiohttp.ClientSession() as session:
             tasks = []
-            for day in days_with_archive:
-                fn = f"{symbolf}{day}.csv.gz"
+            for fn in filenames:
                 url = f"{base_url}{symbolf}/{fn}"
-                tasks.append(
-                    asyncio.create_task(
-                        self.download_single_bybit_with_fallback(session, coin, url, dirpath, day)
-                    )
-                )
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        # For days that have no archive file at all, go straight to API fallback
-        if days_without_archive:
-            logging.info(
-                f"bybit {coin}: {len(days_without_archive)} day(s) have no archive file, using API klines only"
-            )
-            if self.cc is None:
-                self.load_cc()
-            for day in days_without_archive:
-                fpath = os.path.join(dirpath, day + ".npy")
+                day = fn[-17:-7]
                 await self.check_rate_limit()
-                success = await self.download_single_bybit_api(coin, day, fpath)
-                if not success:
-                    logging.info(
-                        f"bybit {coin} {day}: API-only fallback did not yield a complete day; data remains missing"
-                    )
+                tasks.append(
+                    asyncio.create_task(self.download_single_bybit(session, url, dirpath, day))
+                )
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
     async def find_first_day_bybit(self, coin: str, webpage=None) -> float:
         symbolf = self.get_symbol(coin).replace("/USDT:", "")
@@ -1093,12 +1014,7 @@ class OHLCVManager:
 
     async def download_single_bybit(self, session, url: str, dirpath: str, day: str) -> pd.DataFrame:
         try:
-            async with self._download_semaphore:
-                resp = await fetch_url(session, url)
-            if resp is None:
-                if self.verbose:
-                    logging.info(f"bybit No data at {url}")
-                return pd.DataFrame()
+            resp = await fetch_url(session, url)
             with gzip.open(BytesIO(resp)) as f:
                 raw = pd.read_csv(f)
             # Convert trades to OHLCV
@@ -1115,9 +1031,10 @@ class OHLCVManager:
             )
             ohlcvs["timestamp"] = ohlcvs.index
             fpath = os.path.join(dirpath, day + ".npy")
-            dump_ohlcv_data(
-                ensure_millis(ohlcvs[["timestamp", "open", "high", "low", "close", "volume"]]),
+            dump_daily_ohlcv_data(
+                ensure_millis_df(ohlcvs[["timestamp", "open", "high", "low", "close", "volume"]]),
                 fpath,
+                date_to_ts(day),
             )
             if self.verbose:
                 logging.info(f"bybit Dumped {fpath}")
@@ -1125,206 +1042,6 @@ class OHLCVManager:
             logging.error(f"bybit error {url}: {e}")
             traceback.print_exc()
             return pd.DataFrame()
-
-    async def download_single_bybit_with_fallback(
-        self, session, coin: str, url: str, dirpath: str, day: str
-    ) -> None:
-        """
-        Download a single Bybit day from the public trade archive, and if that fails
-        or produces an incomplete day, fall back to the kline API.
-        """
-        fpath = os.path.join(dirpath, day + ".npy")
-
-        # First attempt: public trade archive
-        await self.download_single_bybit(session, url, dirpath, day)
-
-        # Validate archive result (if any)
-        if os.path.exists(fpath):
-            try:
-                df = load_ohlcv_data(fpath)
-                if self._is_bybit_day_valid(coin, day, df):
-                    # Archive produced an acceptable day; nothing else to do
-                    return
-                else:
-                    logging.info(
-                        f"bybit {coin} {day}: Archive data incomplete, falling back to API klines"
-                    )
-            except Exception as e:
-                logging.warning(
-                    f"bybit {coin} {day}: Error reading archive file {fpath} ({e}), falling back to API klines"
-                )
-        else:
-            logging.info(
-                f"bybit {coin} {day}: No archive file written, falling back to API klines"
-            )
-
-        # Fallback: Bybit kline API
-        if self.cc is None:
-            self.load_cc()
-        await self.check_rate_limit()
-        success = await self.download_single_bybit_api(coin, day, fpath)
-        if not success:
-            # Ensure we don't keep a known-bad archive file on disk
-            if os.path.exists(fpath):
-                try:
-                    os.remove(fpath)
-                    logging.info(
-                        f"bybit {coin} {day}: Removed incomplete archive file after failed API fallback"
-                    )
-                except Exception as e:
-                    logging.warning(
-                        f"bybit {coin} {day}: Failed to remove incomplete file {fpath}: {e}"
-                    )
-            logging.info(
-                f"bybit {coin} {day}: API fallback did not yield a complete day; data remains missing"
-            )
-
-    async def download_single_bybit_api(self, coin: str, day: str, fpath: str) -> bool:
-        """
-        Fallback loader for Bybit using the official kline API when public
-        trade archive data is unavailable for a given day.
-
-        Uses Bybit's HTTP /v5/market/kline endpoint directly and enforces a
-        complete, gap-free 1m day (1440 candles) before saving.
-        """
-        start_ts = int(date_to_ts(day))
-        end_ts = start_ts + 24 * 60 * 60 * 1000
-
-        try:
-            symbol = self.get_symbol(coin)
-            if not symbol:
-                logging.warning(f"bybit API {coin} {day}: No symbol found, skipping")
-                return False
-
-            # Convert CCXT-style symbol (e.g. "BTC/USDT:USDT") to Bybit's "BTCUSDT"
-            symbolf = symbol.replace("/USDT:", "")
-
-            base_url = "https://api.bybit.com/v5/market/kline"
-            interval = "1"  # 1m
-            limit = 1000
-
-            # Page backwards in time by adjusting 'end' (API returns klines in reverse order)
-            all_rows = []
-            cursor_end = end_ts
-            max_pages = 10
-
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for page in range(max_pages):
-                    params = {
-                        "category": "linear",
-                        "symbol": symbolf,
-                        "interval": interval,
-                        "start": start_ts,
-                        "end": cursor_end,
-                        "limit": limit,
-                    }
-                    try:
-                        async with session.get(base_url, params=params) as response:
-                            text = await response.text()
-                            if response.status != 200:
-                                logging.error(
-                                    f"bybit API {coin} {day}: HTTP {response.status} response: {text[:200]}"
-                                )
-                                break
-                            try:
-                                data = json.loads(text)
-                            except Exception as e:
-                                logging.error(
-                                    f"bybit API {coin} {day}: Failed to parse JSON response: {e}"
-                                )
-                                break
-                    except Exception as e:
-                        logging.error(
-                            f"bybit API {coin} {day}: request error on page {page + 1}: {e}"
-                        )
-                        break
-
-                    if data.get("retCode") != 0:
-                        logging.error(
-                            f"bybit API {coin} {day}: retCode {data.get('retCode')} retMsg {data.get('retMsg')}"
-                        )
-                        break
-
-                    klines = (data.get("result") or {}).get("list") or []
-                    if not klines:
-                        break
-
-                    all_rows.extend(klines)
-
-                    # If we got fewer than 'limit' rows, no more pages
-                    if len(klines) < limit:
-                        break
-
-                    # API returns klines sorted in reverse by startTime, so the earliest is last
-                    earliest_ts = int(klines[-1][0])
-                    cursor_end = earliest_ts - 60_000
-                    if cursor_end <= start_ts:
-                        break
-
-            if not all_rows:
-                logging.info(f"bybit API {coin} {day}: No kline data returned")
-                return False
-
-            # Each item: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
-            records = []
-            for k in all_rows:
-                try:
-                    ts = int(k[0])
-                    op = float(k[1])
-                    hi = float(k[2])
-                    lo = float(k[3])
-                    cl = float(k[4])
-                    vol = float(k[5])
-                    records.append(
-                        [ts, op, hi, lo, cl, vol]
-                    )
-                except Exception:
-                    # Skip malformed entries
-                    continue
-
-            if not records:
-                logging.info(f"bybit API {coin} {day}: All kline entries malformed or empty")
-                return False
-
-            df = pd.DataFrame(
-                records,
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
-            # Ensure ms, sort ascending and deduplicate by timestamp
-            df = ensure_millis(df)
-            df = (
-                df.sort_values("timestamp")
-                .drop_duplicates("timestamp")
-                .reset_index(drop=True)
-            )
-            df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts)].reset_index(
-                drop=True
-            )
-
-            # Require a complete 1m day (1440 unique minutes) with no gaps
-            if len(df) != 1440:
-                logging.info(
-                    f"bybit API {coin} {day}: Incomplete day ({len(df)}/1440 candles), skipping"
-                )
-                return False
-
-            intervals = np.diff(df["timestamp"].values)
-            if not (intervals == 60000).all():
-                max_gap = int(intervals.max() / 60000)
-                logging.info(
-                    f"bybit API {coin} {day}: Gaps detected (max gap: {max_gap} minutes), skipping"
-                )
-                return False
-
-            dump_ohlcv_data(df, fpath)
-            if self.verbose:
-                logging.info(f"bybit API Dumped {fpath}")
-            return True
-        except Exception as e:
-            logging.error(f"bybit API error for {coin} {day}: {e}")
-            traceback.print_exc()
-            return False
 
     async def download_ohlcvs_bitget(self, coin: str):
         # Bitget has public data archives
@@ -1367,9 +1084,8 @@ class OHLCVManager:
 
     async def download_single_bitget(self, base_url, symbolf, day, fpath):
         url = self.get_url_bitget(base_url, symbolf, day)
-        async with self._download_semaphore:
-            res = await get_zip_bitget(url)
-        dump_ohlcv_data(ensure_millis(res), fpath)
+        res = await get_zip_bitget(url)
+        dump_daily_ohlcv_data(ensure_millis_df(res), fpath, date_to_ts(day))
         if self.verbose:
             logging.info(f"bitget Dumped daily data {fpath}")
 
@@ -1451,8 +1167,7 @@ class OHLCVManager:
     async def download_single_kucoin(self, symbolf: str, day: str, fpath: str):
         url = f"https://historical-data.kucoin.com/data/futures/daily/klines/{symbolf}/1m/{symbolf}-1m-{day}.zip"
         try:
-            async with self._download_semaphore:
-                zips = await fetch_zips(url)
+            zips = await fetch_zips(url)
             if not zips:
                 if self.verbose:
                     logging.info(f"kucoin No data at {url}")
@@ -1474,7 +1189,7 @@ class OHLCVManager:
                 dfc[c] = pd.to_numeric(dfc[c], errors="coerce")
             dfc = dfc.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
             # Normalize timestamp to ms
-            dfc = ensure_millis(dfc)
+            dfc = ensure_millis_df(dfc)
             # Clip to day and fill minute gaps
             start_ts_day = date_to_ts(day)
             end_ts_day = start_ts_day + 24 * 60 * 60 * 1000
@@ -1494,7 +1209,7 @@ class OHLCVManager:
             dfc["volume"] = dfc["volume"].fillna(0.0)
             dfc = dfc.reset_index().rename(columns={"index": "timestamp"})
             if len(dfc) == 1440:
-                dump_ohlcv_data(ensure_millis(dfc), fpath)
+                dump_daily_ohlcv_data(ensure_millis_df(dfc), fpath, start_ts_day)
                 if self.verbose:
                     logging.info(f"kucoin Dumped daily data {fpath}")
             else:
@@ -1614,200 +1329,9 @@ class OHLCVManager:
 
         # Dump final day data only if is a full day
         if len(df_day) == 1440:
-            dump_ohlcv_data(ensure_millis(df_day), fpath)
+            dump_daily_ohlcv_data(ensure_millis_df(df_day), fpath, start_ts_day)
             if self.verbose:
                 logging.info(f"gateio Dumped daily OHLCV data for {symbol} to {fpath}")
-
-    async def download_ohlcvs_hyperliquid(self, coin: str):
-        """
-        Download OHLCV data from Hyperliquid API.
-
-        Note: Hyperliquid only provides the most recent ~5000 candles (~3.5 days).
-        This method downloads available data for the requested date range using
-        Hyperliquid's native candleSnapshot endpoint (direct HTTP), instead of
-        going through ccxt.fetch_ohlcv. This avoids incompatibilities between
-        ccxt and the upstream API while keeping the on-disk format unchanged.
-        """
-        missing_days = await self.get_missing_days_ohlcvs(coin)
-        if not missing_days:
-            return
-
-        dirpath = make_get_filepath(os.path.join(self.cache_filepaths["ohlcvs"], coin, ""))
-
-        # Hyperliquid only provides ~5000 candles, so warn if trying to go back too far
-        now_ms = int(utc_ms())
-        max_lookback_ms = 5000 * 60 * 1000  # ~3.5 days
-        earliest_available_ts = now_ms - max_lookback_ms
-
-        # Filter missing days to only those within available range
-        available_days = []
-        for day in missing_days:
-            day_ts = date_to_ts(day)
-            if day_ts >= earliest_available_ts:
-                available_days.append(day)
-            else:
-                if self.verbose:
-                    logging.info(
-                        f"hyperliquid {coin} {day}: older than API's ~3.5-day window; "
-                        f"cannot download new data for this day"
-                    )
-
-        if not available_days:
-            if self.verbose:
-                logging.info(
-                    f"hyperliquid {coin}: no missing days within API's ~3.5-day window; "
-                    f"no new OHLCV downloaded for this coin"
-                )
-            return
-
-        # Download days
-        tasks = []
-        for day in available_days:
-            await self.check_rate_limit()
-            tasks.append(
-                asyncio.create_task(
-                    self.fetch_and_save_day_hyperliquid(coin, day, dirpath)
-                )
-            )
-        for task in tasks:
-            await task
-
-    async def fetch_and_save_day_hyperliquid(self, coin: str, day: str, dirpath: str):
-        """
-        Fetch one full day of OHLCV data for a given coin from Hyperliquid via
-        its /info candleSnapshot endpoint and save it to disk as a .npy file.
-        """
-        fpath = os.path.join(dirpath, f"{day}.npy")
-        start_ts_day = int(date_to_ts(day))
-        end_ts_day = start_ts_day + 24 * 60 * 60 * 1000
-        interval = "1m"
-
-        payload = {
-            "type": "candleSnapshot",
-            "req": {
-                "coin": coin,
-                "interval": interval,
-                "startTime": start_ts_day,
-                "endTime": end_ts_day,
-            },
-        }
-
-        try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    "https://api.hyperliquid.xyz/info",
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                ) as resp:
-                    if resp.status != 200:
-                        try:
-                            error_text = await resp.text()
-                        except Exception:
-                            error_text = "<no body>"
-                        logging.error(
-                            f"hyperliquid API error for {coin} {day}: "
-                            f"status {resp.status}, response: {error_text}"
-                        )
-                        return
-                    data = await resp.json()
-        except Exception as e:
-            logging.error(f"hyperliquid Error fetching {coin} {day}: {e}")
-            traceback.print_exc()
-            return
-
-        if not isinstance(data, list) or not data:
-            if self.verbose:
-                logging.info(f"hyperliquid {coin} {day}: No data returned")
-            return
-
-        # Convert API response to DataFrame in Passivbot's standard OHLCV format
-        try:
-            df_day = pd.DataFrame(
-                [
-                    {
-                        "timestamp": float(c["t"]),
-                        "open": float(c["o"]),
-                        "high": float(c["h"]),
-                        "low": float(c["l"]),
-                        "close": float(c["c"]),
-                        "volume": float(c.get("v", 0.0)),
-                    }
-                    for c in data
-                ]
-            )
-        except Exception as e:
-            logging.error(f"hyperliquid {coin} {day}: Failed to parse candles: {e}")
-            traceback.print_exc()
-            return
-
-        df_day = ensure_millis(df_day)
-        df_day = df_day.sort_values("timestamp").reset_index(drop=True)
-        # Filter to exact day range
-        df_day = df_day[
-            (df_day.timestamp >= start_ts_day) & (df_day.timestamp < end_ts_day)
-        ].reset_index(drop=True)
-
-        # Require a complete day with 1440 one-minute candles and no large gaps
-        if len(df_day) != 1440:
-            if self.verbose:
-                logging.warning(
-                    f"hyperliquid {coin} {day}: Incomplete day "
-                    f"({len(df_day)}/1440 candles), skipping"
-                )
-            return
-
-        intervals = np.diff(df_day["timestamp"].values)
-        if len(intervals) and not (intervals == 60000).all():
-            max_gap = int(intervals.max() / 60000)
-            logging.warning(
-                f"hyperliquid {coin} {day}: Gaps detected (max gap: {max_gap} minutes), skipping"
-            )
-            return
-
-        try:
-            dump_ohlcv_data(df_day, fpath)
-            if self.verbose:
-                logging.info(f"hyperliquid {coin} {day}: Saved {len(df_day)} candles to {fpath}")
-        except Exception as e:
-            logging.error(f"hyperliquid {coin} {day}: Error saving data: {e}")
-
-    async def find_first_day_hyperliquid(self, coin: str):
-        """
-        Find the first available timestamp for a coin on Hyperliquid.
-
-        Note: Hyperliquid only provides ~5000 candles, so this returns the
-        earliest timestamp currently available via API (~3.5 days ago).
-        """
-        symbol = self.get_symbol(coin)
-
-        try:
-            # Fetch the oldest available data
-            now_ms = int(utc_ms())
-            lookback_ms = 5000 * 60 * 1000  # ~5000 1-minute candles
-            start_ts = now_ms - lookback_ms
-
-            ohlcvs = await self.cc.fetch_ohlcv(
-                symbol, timeframe="1m", since=start_ts, limit=5000
-            )
-
-            if ohlcvs and len(ohlcvs) > 0:
-                fts = ohlcvs[0][0]
-                if self.verbose:
-                    logging.info(
-                        f"hyperliquid Found first timestamp for {coin}: "
-                        f"{ts_to_date(fts)} ({fts})"
-                    )
-                self.dump_first_timestamp(coin, fts)
-                return fts
-        except Exception as e:
-            logging.error(f"hyperliquid Error finding first timestamp for {coin}: {e}")
-            traceback.print_exc()
-
-        # Default to 0 if unable to fetch
-        fts = 0.0
-        self.dump_first_timestamp(coin, fts)
-        return fts
 
     def load_first_timestamp(self, coin):
         if os.path.exists(self.cache_filepaths["first_timestamps"]):
@@ -1885,25 +1409,14 @@ async def prepare_hlcvs(config: dict, exchange: str):
             om,
         )
 
-        use_btc_collateral = bool(require_config_value(config, "backtest.use_btc_collateral"))
+        om.update_date_range(timestamps[0], timestamps[-1])
+        btc_df = await om.get_ohlcvs("BTC")
+        if btc_df.empty:
+            raise ValueError(f"Failed to fetch BTC/USD prices from {exchange}")
 
-        if use_btc_collateral:
-            # Fetch BTC/USD prices for BTC-collateralized backtests
-            om.update_date_range(timestamps[0], timestamps[-1])
-            btc_df = await om.get_ohlcvs("BTC")
-            if btc_df.empty:
-                raise ValueError(f"Failed to fetch BTC/USD prices from {exchange}")
-
-            # Ensure BTC/USD timestamps align with HLCV timestamps
-            btc_df = (
-                btc_df.set_index("timestamp")
-                .reindex(timestamps, method="ffill")
-                .reset_index()
-            )
-            btc_usd_prices = btc_df["close"].values  # Extract 1D array of closing prices
-        else:
-            # Skip BTC downloads when not using BTC collateral; use a flat 1.0 series.
-            btc_usd_prices = np.ones(len(timestamps), dtype=np.float64)
+        # Ensure BTC/USD timestamps align with HLCV timestamps
+        btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").reset_index()
+        btc_usd_prices = btc_df["close"].values  # Extract 1D array of closing prices
 
         warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // minute_ms))
         mss["__meta__"] = {
@@ -2080,9 +1593,15 @@ async def prepare_hlcvs_internal(
     return mss, timestamps, unified_array
 
 
-async def prepare_hlcvs_combined(config):
+async def prepare_hlcvs_combined(config, forced_sources=None):
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
     exchanges_to_consider = [normalize_exchange_name(e) for e in backtest_exchanges]
+    forced_sources = forced_sources or {}
+    normalized_forced_sources = {
+        str(coin): normalize_exchange_name(exchange)
+        for coin, exchange in forced_sources.items()
+        if exchange
+    }
 
     requested_start_date = require_config_value(config, "backtest.start_date")
     requested_start_ts = int(date_to_ts(requested_start_date))
@@ -2112,6 +1631,16 @@ async def prepare_hlcvs_combined(config):
                 config, "backtest.gap_tolerance_ohlcvs_minutes"
             ),
         )
+    extra_forced = set(normalized_forced_sources.values()) - set(exchanges_to_consider)
+    for ex in extra_forced:
+        om_dict[ex] = OHLCVManager(
+            ex,
+            effective_start_date,
+            end_date,
+            gap_tolerance_ohlcvs_minutes=require_config_value(
+                config, "backtest.gap_tolerance_ohlcvs_minutes"
+            ),
+        )
     btc_om = None
 
     try:
@@ -2121,37 +1650,26 @@ async def prepare_hlcvs_combined(config):
             effective_start_ts,
             requested_start_ts,
             end_ts,
+            normalized_forced_sources,
         )
 
-        use_btc_collateral = bool(require_config_value(config, "backtest.use_btc_collateral"))
+        # Always fetch BTC/USD prices
+        btc_exchange = exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
+        btc_om = OHLCVManager(
+            btc_exchange,
+            effective_start_date,
+            end_date,
+            gap_tolerance_ohlcvs_minutes=require_config_value(
+                config, "backtest.gap_tolerance_ohlcvs_minutes"
+            ),
+        )
+        btc_df = await btc_om.get_ohlcvs("BTC")
+        if btc_df.empty:
+            raise ValueError(f"Failed to fetch BTC/USD prices from {btc_exchange}")
 
-        if use_btc_collateral:
-            # Fetch BTC/USD prices from the first exchange (or binanceusdm as a proxy)
-            btc_exchange = (
-                exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
-            )
-            btc_om = OHLCVManager(
-                btc_exchange,
-                effective_start_date,
-                end_date,
-                gap_tolerance_ohlcvs_minutes=require_config_value(
-                    config, "backtest.gap_tolerance_ohlcvs_minutes"
-                ),
-            )
-            btc_df = await btc_om.get_ohlcvs("BTC")
-            if btc_df.empty:
-                raise ValueError(f"Failed to fetch BTC/USD prices from {btc_exchange}")
-
-            # Align BTC/USD timestamps with unified timestamps
-            btc_df = (
-                btc_df.set_index("timestamp")
-                .reindex(timestamps, method="ffill")
-                .reset_index()
-            )
-            btc_usd_prices = btc_df["close"].values
-        else:
-            # Skip BTC downloads when not using BTC collateral; use a flat 1.0 series.
-            btc_usd_prices = np.ones(len(timestamps), dtype=np.float64)
+        # Align BTC/USD timestamps with unified timestamps
+        btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").reset_index()
+        btc_usd_prices = btc_df["close"].values
 
         warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // minute_ms))
         mss["__meta__"] = {
@@ -2178,6 +1696,7 @@ async def _prepare_hlcvs_combined_impl(
     base_start_ts,
     _requested_start_ts,
     end_ts,
+    forced_sources,
 ):
     """
     Amalgamates data from different exchanges for each coin in config, then unifies them into a single
@@ -2249,9 +1768,14 @@ async def _prepare_hlcvs_combined_impl(
             # No coverage needed or possible
             continue
 
-        # >>> Instead of a normal for-loop over exchanges, do concurrent tasks:
+        forced_exchange = forced_sources.get(coin)
+        candidate_exchanges = [forced_exchange] if forced_exchange else exchanges_to_consider
+        for ex in candidate_exchanges:
+            if ex not in om_dict:
+                raise ValueError(f"Unknown exchange '{ex}' requested for coin {coin}")
+
         tasks = []
-        for ex in exchanges_to_consider:
+        for ex in candidate_exchanges:
             tasks.append(
                 asyncio.create_task(
                     fetch_data_for_coin_and_exchange(
@@ -2271,24 +1795,30 @@ async def _prepare_hlcvs_combined_impl(
             exchange_candidates.append((ex, df, coverage_count, gap_count, total_volume))
 
         if not exchange_candidates:
+            if forced_exchange:
+                raise ValueError(
+                    f"No exchange data found for coin {coin} on forced exchange {forced_exchange}."
+                )
             logging.info(f"No exchange data found at all for coin {coin}. Skipping.")
             continue
 
-        # Now pick the "best" exchange (per your partial-coverage logic):
-        if len(exchange_candidates) == 1:
+        if forced_exchange:
+            chosen = [c for c in exchange_candidates if c[0] == forced_exchange]
+            if not chosen:
+                raise ValueError(
+                    f"Forced exchange {forced_exchange} returned no usable data for coin {coin}."
+                )
+            best_exchange, best_df, best_cov, best_gaps, best_vol = chosen[0]
+        elif len(exchange_candidates) == 1:
             best_exchange, best_df, best_cov, best_gaps, best_vol = exchange_candidates[0]
         else:
-            # Sort by coverage desc, gap_count asc, volume desc
             exchange_candidates.sort(key=lambda x: (x[2], -x[3], x[4]), reverse=True)
             best_exchange, best_df, best_cov, best_gaps, best_vol = exchange_candidates[0]
-        logging.info(
-            f"{coin}: using {best_exchange} OHLCV "
-            f"(exchange preference, best first: {[x[0] for x in exchange_candidates]})"
-        )
+        logging.info(f"{coin} exchange preference: {[x[0] for x in exchange_candidates]}")
 
         chosen_data_per_coin[coin] = best_df
         chosen_mss_per_coin[coin] = om_dict[best_exchange].get_market_specific_settings(coin)
-        chosen_mss_per_coin[coin]["exchange"] = best_exchange
+        chosen_mss_per_coin[coin]["exchange"] = denormalize_exchange_name(best_exchange)
     # ---------------------------------------------------------------
     # If no coins survived, raise error
     # ---------------------------------------------------------------
@@ -2572,7 +2102,7 @@ async def main():
     parser.add_argument(
         "config_path", type=str, default=None, nargs="?", help="path to json passivbot config"
     )
-    template_config = get_template_config("v7")
+    template_config = get_template_config()
     del template_config["optimize"]
     del template_config["bot"]
     template_config["live"] = {

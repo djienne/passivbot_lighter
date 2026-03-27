@@ -381,15 +381,9 @@ Cargo.lock
 /api-keys.json
 /caches
 /optimize_results
-!/historical_data/ohlcvs_hyperliquid/
-!/configs/
-/configs/*
-!/configs/config_hype.json
-!/configs/hype_top.json
-.claude/
-CLAUDE.md
-AGENTS.md
 
-# Security / Credential files
-*.pem
-deploy_passivbot.py
+# Git worktrees
+.worktrees/
+
+# Claude Code local settings
+.claude/

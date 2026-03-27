@@ -20,6 +20,7 @@ from utils import (
     get_file_mod_ms,
     date_to_ts,
     get_first_ohlcv_iteratively,
+    load_ccxt_instance,
 )
 import sys
 import passivbot_rust as pbr
@@ -40,13 +41,9 @@ except:
 
 from pure_funcs import (
     numpyize,
-    candidate_to_live_config,
     ts_to_date,
-    get_dummy_settings,
     config_pretty_str,
     sort_dict_keys,
-    make_compatible,
-    determine_passivbot_mode,
     flatten,
 )
 
@@ -151,6 +148,11 @@ def ensure_parent_directory(
 
 
 def load_user_info(user: str, api_keys_path="api-keys.json") -> dict:
+    """Load user credentials from api-keys.json.
+
+    Returns all fields from the user's entry, plus empty string defaults
+    for legacy fields to maintain backwards compatibility with existing bots.
+    """
     if api_keys_path is None:
         api_keys_path = "api-keys.json"
     try:
@@ -159,21 +161,14 @@ def load_user_info(user: str, api_keys_path="api-keys.json") -> dict:
         raise Exception(f"error loading api keys file {api_keys_path} {e}")
     if user not in api_keys:
         raise Exception(f"user {user} not found in {api_keys_path}")
-    # Start with standard keys (defaulted to "")
-    result = {
-        k: api_keys[user].get(k, "")
-        for k in [
-            "exchange",
-            "key",
-            "secret",
-            "passphrase",
-            "wallet_address",
-            "private_key",
-            "is_vault",
-        ]
-    }
-    # Merge in all actual keys from JSON (preserves exchange-specific extras)
+
+    # Start with empty string defaults for legacy fields (backwards compatibility)
+    legacy_fields = ["exchange", "key", "secret", "passphrase", "wallet_address", "private_key", "is_vault"]
+    result = {k: "" for k in legacy_fields}
+
+    # Overlay all fields from the user's entry (passthrough for CCXTBot)
     result.update(api_keys[user])
+
     return result
 
 
@@ -201,7 +196,7 @@ def load_exchange_key_secret_passphrase(
 
 def load_broker_code(exchange: str) -> str:
     try:
-        return hjson.load(open("broker_codes.hjson"))[exchange]
+        return hjson.load(open("broker_codes.hjson")).get(exchange, "")
     except Exception as e:
         print(f"failed to load broker code", e)
         traceback.print_exc()
@@ -356,8 +351,7 @@ async def get_first_timestamps_unified(coins: List[str], exchange: str = None):
     ccxt_clients = {}
     for ex_name in sorted(exchange_map):
         try:
-            ccxt_clients[ex_name] = getattr(ccxta, ex_name)()
-            ccxt_clients[ex_name].options["defaultType"] = "swap"
+            ccxt_clients[ex_name] = load_ccxt_instance(ex_name)
         except Exception as e:
             print(f"Error loading {ex_name} from ccxt. Skipping. {e}")
             del exchange_map[ex_name]
@@ -498,6 +492,8 @@ async def get_first_timestamps_unified(coins: List[str], exchange: str = None):
 
 
 def assert_correct_ccxt_version(version=None, ccxt=None):
+    if os.environ.get("SKIP_CCXT_ASSERT", "").lower() in ("1", "true", "yes"):
+        return
     if version is None:
         version = load_ccxt_version()
     if ccxt is None:

@@ -7,11 +7,48 @@ This document provides an overview of the parameters found in `config/template.j
 - **base_dir**: Location to save backtest results.
 - **compress_cache**: Set to `true` to save disk space. Set to `false` for faster loading.
 - **end_date**: End date of backtest, e.g., `2024-06-23`. Set to `'now'` to use today's date as the end date.
-- **exchanges**: Exchanges from which to fetch 1m OHLCV data for backtesting and optimizing. Options: `[binance, bybit, gateio, bitget]`.
+- **exchanges**: Exchanges from which to fetch 1m OHLCV data for backtesting and optimizing. The template ships with `['binance', 'bybit']`; additional exchanges can be wired up manually if you maintain your own archives.
+- **combine_ohlcvs**: When `true`, build a single “combined” dataset by taking the best-quality feed for each coin across all configured exchanges. When `false`, the backtester/optimizer runs each exchange independently.
+- **coin_sources**: Optional mapping of `coin -> exchange` used to override the automatic selection performed when `combine_ohlcvs` is `true`. Scenarios may add more overrides; conflicting assignments raise an error.
 - **start_date**: Start date of backtest.
 - **starting_balance**: Starting balance in USD at the beginning of the backtest.
-- **use_btc_collateral**: `true`/`false`. Set to `true` to backtest with BTC as collateral, simulating starting with 100% BTC and buying BTC with all USD profits, but not selling BTC when taking losses (instead go into USD debt).
-  - Example: Given BTC/USD price of `$100,000`, if BTC balance is `1.0` and backtester makes `$10` profit, BTC balance becomes `1.0001` and USD balance is `0`. If backtester loses `$20`, BTC balance remains `1.0001` and USD balance becomes `-20`. If backtester then makes `$15` profit, USD debt is paid off first: BTC balance remains `1.0001`, USD balance becomes `-5`. If the backtester then makes `$10` profit: BTC balance becomes `1.00015`, USD balance is `0`.
+- **filter_by_min_effective_cost**: When `true`, skip coins whose projected initial entry
+  (balance × wallet_exposure_limit × entry_initial_qty_pct, including WE excess allowance)
+  would fall below the exchange’s effective minimum cost.
+- **maker_fee_override**: Optional maker fee override (part-per-one; use `0.0002` for 0.02%). Leave `null` to use the exchange-derived maker fees.
+- **balance_sample_divider**: Minutes per bucket when sampling balances/equity for
+  `balance_and_equity.csv` and related plots. `1` keeps full per-minute resolution; higher values
+  thin out the series (e.g., `15` stores one point every 15 minutes) to reduce file sizes.
+- **btc_collateral_cap**: Target (and ceiling) share of account equity to hold in BTC collateral. `0` keeps the account fully in USD; `1.0` mirrors the legacy 100% BTC mode; values `>1` allow leveraged BTC collateral, accepting negative USD balances.
+- **btc_collateral_ltv_cap**: Optional loan-to-value ceiling (`USD debt ÷ equity`) enforced when topping up BTC. Leave `null` (default) to allow unlimited debt, or set to a float (e.g., `0.6`) to stop buying BTC once leverage exceeds that threshold.
+### Suite Scenarios
+
+- **backtest.suite.enabled**: Master switch for suite runs (`--suite [y/n]` overrides it at runtime).
+- **backtest.suite.include_base_scenario** / **base_label**: Optionally prepend a scenario that mirrors the base config.
+- **backtest.suite.aggregate**: Dict of metric-specific aggregation modes (default `mean`). Keys fall back to the `default` entry if unspecified.
+- **backtest.suite.scenarios**: List of scenario dicts. Supported per-scenario keys:
+  - `label`: Directory name under `backtests/suite_runs/<timestamp>/`.
+  - `start_date`, `end_date`: Override the global date window.
+  - `coins`, `ignored_coins`: Restrict or skip symbols.
+  - `exchanges`: Limit which exchanges can contribute data to this scenario.
+  - `coin_sources`: Scenario-specific overrides for `coin_sources`.
+
+Refer to `configs/examples/suite_example.json` for a practical template.
+
+Example per-metric aggregation:
+
+```json
+"backtest": {
+  "suite": {
+    "aggregate": {
+      "default": "mean",
+      "mdg_usd": "median",
+      "sharpe_ratio": "std",
+      "drawdown_worst_usd": "max"
+    }
+  }
+}
+```
 
 ## Logging
 
@@ -19,6 +56,8 @@ This document provides an overview of the parameters found in `config/template.j
   - Accepted values: `0` (warnings), `1` (info), `2` (debug), `3` (trace).
   - The CLI flag `--debug-level`/`--log-level` on `src/passivbot.py` and `src/backtest.py` overrides the configured value for a single run.
   - Components such as the CandlestickManager inherit this level, so EMA warm-up and candle maintenance logs follow the same verbosity.
+- **memory_snapshot_interval_minutes**: Interval between `_log_memory_snapshot` telemetry entries (RSS, cache footprint, asyncio task counts). Default `30`; lower values surface leaks sooner, higher values reduce noise.
+- **volume_refresh_info_threshold_seconds**: Minimum duration a bulk volume-EMA refresh must take before it is promoted to an INFO log. Runs that finish faster emit only DEBUG output (when debug logging is enabled). Set `0` to keep the previous always-INFO behaviour.
 
 ## Bot Settings
 
@@ -56,17 +95,25 @@ Passivbot can be configured to create a grid of entry orders, with prices and qu
     - `next_reentry_price_short = pos_price * (1 + entry_grid_spacing_pct * multiplier)`
   - `multiplier = 1 + (wallet_exposure / wallet_exposure_limit) * entry_grid_spacing_we_weight + log_component`
   - Setting `entry_grid_spacing_we_weight` > 0 widens spacing as the position approaches the wallet exposure limit; negative values tighten spacing when exposure is small.
-- **entry_grid_spacing_log_weight**, **entry_grid_spacing_log_span_hours**:
+- **entry_grid_spacing_volatility_weight**, **entry_volatility_ema_span_hours**:
   - The `log_component` in the multiplier above is derived from the EMA of the per-candle log range `ln(high/low)`.
-  - `entry_grid_spacing_log_weight` controls how strongly the recent log range widens or narrows spacing. A value of `0` disables the log-based adjustment.
-  - `entry_grid_spacing_log_span_hours` sets the EMA span (in hours) used when smoothing the log-range signal before applying the weight.
+  - `entry_grid_spacing_volatility_weight` controls how strongly the recent log range widens or narrows spacing. A value of `0` disables the log-based adjustment.
+  - `entry_volatility_ema_span_hours` sets the EMA span (in hours) used when smoothing the volatility (log-range) signal before applying the weight. The same volatility EMA also powers the multipliers for `entry_trailing_threshold_volatility_weight` and `entry_trailing_retracement_volatility_weight`.
 - **entry_initial_ema_dist**:
   - Offset from lower/upper EMA band.
   - Long initial entry/short unstuck close prices are lower EMA band minus offset.
   - Short initial entry/long unstuck close prices are upper EMA band plus offset.
   - See `ema_span_0`/`ema_span_1`.
 - **entry_initial_qty_pct**:
-  - `initial_entry_cost = balance * wallet_exposure_limit * initial_qty_pct`
+  - `initial_entry_cost = balance * wallet_exposure_limit * entry_initial_qty_pct`
+- **entry_trailing_double_down_factor**:
+  - Multiplier controlling how aggressively trailing re-entries ramp up. As with the grid equivalent, any positive value increases the size of successive fills (higher values grow them faster).
+- **entry_trailing_threshold_pct**, **entry_trailing_retracement_pct**:
+  - Same semantics as the trailing-close parameters below, but applied to trailing entries. The bot waits for a favorable move (`threshold_pct`) and subsequent pullback (`retracement_pct`) before firing a trailing re-entry.
+- **entry_trailing_threshold_we_weight**, **entry_trailing_retracement_we_weight**:
+  - Extra scaling based on wallet exposure. As exposure approaches the per-symbol limit, positive weights widen the trailing bands to slow additional entries. Set to `0.0` to disable the adjustment.
+- **entry_trailing_threshold_volatility_weight**, **entry_trailing_retracement_volatility_weight**:
+  - Adds sensitivity to recent volatility using the shared `entry_volatility_ema_span_hours` EMA. Positive weights increase the thresholds in choppy markets; `0.0` removes the volatility modulation.
 
 ### Trailing Parameters
 
@@ -145,7 +192,8 @@ Coins selected for trading are filtered by volume and log range. First, filter c
 
 - **filter_volume_drop_pct**: Volume filter. Disapproves the lowest relative volume coins.
   - Example: `filter_volume_drop_pct = 0.1` drops the 10% lowest volume coins. Set to `0` to allow all.
-- **filter_log_range_rolling_window/filter_volume_rolling_window**: Number of minutes to look into the past to compute volume and log range, used for dynamic coin selection in forager mode.
+- **filter_volatility_ema_span / filter_volume_ema_span**: Number of minutes to look into the past to compute the volatility (log-range) and volume EMAs used for dynamic coin selection in forager mode.
+- **filter_volatility_drop_pct**: Volatility clip. Drops the highest-volatility fraction after volume filtering. Example: `0.2` drops the top 20% most volatile coins, forcing the selector to choose among the calmer 80%.
   - Log range is computed from 1m OHLCVs as `mean(ln(high / low))`.
   - In forager mode, the bot selects coins with the highest log-range values for opening positions.
 
@@ -160,9 +208,9 @@ Coins selected for trading are filtered by volume and log range. First, filter c
       ```
       [
         close_grid_markup_end, close_grid_markup_start, close_grid_qty_pct, close_trailing_grid_ratio, close_trailing_qty_pct,
-        close_trailing_retracement_pct, close_trailing_threshold_pct, ema_span_0, ema_span_1, enforce_exposure_limit,
+    close_trailing_retracement_pct, close_trailing_threshold_pct, ema_span_0, ema_span_1,
         entry_grid_double_down_factor, entry_grid_spacing_pct, entry_grid_spacing_we_weight,
-        entry_grid_spacing_log_weight, entry_grid_spacing_log_span_hours, entry_initial_ema_dist,
+        entry_grid_spacing_volatility_weight, entry_volatility_ema_span_hours, entry_initial_ema_dist,
         entry_initial_qty_pct, entry_trailing_double_down_factor, entry_trailing_grid_ratio, entry_trailing_retracement_pct,
         entry_trailing_threshold_pct, unstuck_close_pct, unstuck_ema_dist, unstuck_threshold, wallet_exposure_limit
       ]
@@ -200,7 +248,8 @@ Coins selected for trading are filtered by volume and log range. First, filter c
 - **execution_delay_seconds**: Wait `x` seconds after executing to exchange.
 - **max_memory_candles_per_symbol**: Maximum number of 1m candles retained in RAM per symbol. Older entries are trimmed once this cap is exceeded. Default (`20_000`) balances memory footprint with trailing-history visibility.
 - **max_disk_candles_per_symbol_per_tf**: Maximum number of candles persisted on disk per symbol and timeframe. Oldest shards are pruned once the limit is hit (default `2_000_000`).
-- **filter_by_min_effective_cost**: If `true`, disallows coins where `balance * WE_limit * initial_qty_pct < min_effective_cost`.
+- **candle_lock_timeout_seconds**: Seconds to wait when another process holds the CandlestickManager per-symbol candle fetch lock (default `10`). Increase when running many bots sharing the same cache directory to avoid spurious timeouts during slow API calls.
+- **filter_by_min_effective_cost**: If `true`, disallows coins where `balance * WE_limit * entry_initial_qty_pct < min_effective_cost`.
   - Example: If the exchange's effective minimum cost for a coin is `$5`, but the bot wants to make an order of `$2`, disallow that coin.
 - **forced_mode_long**, **forced_mode_short**: Force all coins long/short to a given mode.
   - Choices: `[m (manual), gs (graceful_stop), p (panic), t (take_profit_only)]`.
@@ -211,14 +260,20 @@ Coins selected for trading are filtered by volume and log range. First, filter c
     - Example: `{"long": ["COIN1", "COIN2"], "short": ["COIN2", "COIN3"]}`
 - **leverage**: Leverage set on the exchange. Default is `10`.
 - **market_orders_allowed**: If `true`, allows Passivbot to place market orders when the order price is very close to the current market price. If `false`, only places limit orders. Default is `true`.
+- **order_match_tolerance_pct**: Percentage tolerance (in %) used to match near-identical cancel/create pairs and avoid order churn. When a newly proposed order is within this tolerance of an existing open order, Passivbot may keep the existing order instead of cancelling/replacing it.
 - **max_n_cancellations_per_batch**: Cancels `n` open orders per execution.
 - **max_n_creations_per_batch**: Creates `n` new orders per execution.
 - **max_n_restarts_per_day**: If the bot crashes, restart up to `n` times per day before stopping completely.
 - **minimum_coin_age_days**: Disallows coins younger than a given number of days.
+- **balance_override**: Optional numeric override for wallet balance used by the live bot (useful for dry-runs and debugging). When set, the bot will not fetch balance from the exchange. Can also be useful when using BTC collateral and you want to keep an effectively “fixed USD balance” for sizing, instead of having the USD-denominated balance fluctuate with the BTC/USD price.
+- **balance_hysteresis_snap_pct**: Hysteresis snap percentage applied to balance updates to reduce noise. Set `0.0` to disable hysteresis.
+- **recv_window_ms**: Millisecond tolerance for authenticated REST calls (default `5000`). Increase if your exchange intermittently rejects requests with `invalid request ... recv_window` errors due to clock drift.
 - Candlestick management is handled by the CandlestickManager with on-disk caching and TTL-based refresh. Legacy settings `ohlcvs_1m_rolling_window_days` and `ohlcvs_1m_update_after_minutes` are no longer used. Use `inactive_coin_candle_ttl_minutes` to control how long 1m candles for inactive symbols are kept in RAM before being refreshed.
 - **pnls_max_lookback_days**: How far into the past to fetch PnL history.
 - **price_distance_threshold**: Minimum distance to current price action required for EMA-based limit orders.
-- **memory_snapshot_interval_minutes**: Interval between `_log_memory_snapshot` telemetry entries (RSS, CandlestickManager cache stats, task counts). Default is `30`; lower values surface leaks sooner at the cost of noisier logs.
+- **risk_wel_enforcer_threshold**: Per-symbol multiplier that triggers the WEL enforcer. When a position’s exposure exceeds `wallet_exposure_limit * (1 + risk_we_excess_allowance_pct) * risk_wel_enforcer_threshold` the bot emits a reduce-only order to bring it back under control. Set <1.0 for continual trimming, `1.0` for a hard cap, or ≤0 to disable.
+- **risk_twel_enforcer_threshold**: Fraction of the configured `total_wallet_exposure_limit` that triggers the TWEL enforcer. When aggregate exposure exceeds this threshold the bot queues reduction orders instead of new entries. Set >1.0 to allow a grace margin, `1.0` for strict enforcement, or ≤0 to disable.
+- **risk_we_excess_allowance_pct**: Per-symbol allowance above the configured wallet exposure limit that the enforcer tolerates before trimming. Useful for smoothing reductions; leave at `0.0` for a hard cap.
 - **max_warmup_minutes**: Hard ceiling applied to the historical warm-up window for both backtests and live warm-ups. Use `0` to disable the cap; otherwise values above `0` clamp the per-symbol warmup calculated from EMA spans.
 - **warmup_ratio**: Multiplier applied to the longest EMA or log-range span (in minutes) across long/short settings to decide how much 1m history to prefetch before trading. A value of `0.2`, for example, warmups ~20% of the deepest lookback, capped by `max_warmup_minutes`.
 - **warmup_minutes**: Per-coin warm-up window (in minutes) derived from `warmup_ratio`, indicator spans, and the optional `max_warmup_minutes` ceiling. This value is used by the backtester and CandlestickManager to skip the earliest candles until indicators are fully primed; adjust `warmup_ratio` or the spans themselves to change it.
@@ -229,12 +284,61 @@ Coins selected for trading are filtered by volume and log range. First, filter c
 
 ### Bounds
 
-When optimizing, parameter values are within the lower and upper bounds.
+When optimizing, parameter values are constrained within the lower and upper bounds. Bounds support an optional third element specifying a discrete step size for grid-based optimization.
+
+**Bounds Formats:**
+
+- `[low, high]` - Continuous optimization between `low` and `high` (current behavior, unchanged)
+- `[low, high, step]` - Discrete optimization with values constrained to the grid: `low`, `low + step`, `low + 2*step`, ..., `high`
+- `[low, high, 0]` or `[low, high, null]` - Treated as continuous (equivalent to `[low, high]`)
+- Single value (e.g., `0.5`) - Fixed parameter (not optimized)
+
+**Step Behavior:**
+
+When a step is defined, the optimizer only explores values on the discrete grid. The genetic algorithm performs crossover and mutation in *index space* (i.e., the indices of valid grid values) to ensure offspring values always land on the grid.
+
+For example, with bounds `[0.01, 0.10, 0.02]`:
+- Valid values are: 0.01, 0.03, 0.05, 0.07, 0.09
+- The optimizer will never produce values like 0.02 or 0.04
+
+**When to Use Stepped Bounds:**
+
+- **Integer parameters**: Use step `1` for parameters that should be integers (e.g., `n_positions`)
+- **Coarse search**: Use larger steps to reduce search space and speed up optimization
+- **Known granularity**: When you know the parameter only makes sense at certain intervals
+
+**Example Configuration:**
+
+```json
+"optimize": {
+    "bounds": {
+        "long_n_positions": [1, 20, 1],
+        "long_total_wallet_exposure_limit": [0.1, 2.0, 0.1],
+        "long_entry_grid_spacing_pct": [0.005, 0.05, 0.005],
+        "long_ema_span_0": [100, 10000],
+        "long_ema_span_1": [200, 20000]
+    }
+}
+```
+
+In this example:
+- `n_positions`: Integers from 1 to 20
+- `total_wallet_exposure_limit`: Values 0.1, 0.2, 0.3, ..., 2.0
+- `entry_grid_spacing_pct`: Values 0.005, 0.01, 0.015, ..., 0.05
+- `ema_span_0` and `ema_span_1`: Continuous optimization (no step defined)
+
+**Validation:**
+
+- Step must be positive; negative or zero steps are treated as continuous
+- Step must not exceed the range (`high - low`); if it does, a warning is logged and the parameter is treated as continuous
 
 ### Other Optimization Parameters
 
 - **compress_results_file**: If `true`, compresses optimize output results file to save space.
-- **enable_overrides**: List of custom optimizer overrides to enable. Use `optimizer_overrides.py` for overrides. Defaults to none.
+- **enable_overrides**: List of constraint overrides applied during optimization to enforce specific parameter relationships. The optimizer evaluator checks these conditions and apply the overrides before running each backtest (defaults to none):
+  - **"lossless_close_trailing"**: Ensures trailing stops are profitable by enforcing `close_trailing_threshold_pct` > `close_trailing_retracement_pct`. This prevents the retracement from triggering before reaching the minimum profit threshold.
+  - **"forward_tp_grid"**: Creates an ascending take-profit grid where `close_grid_markup_start` < `close_grid_markup_end`
+  - **"backward_tp_grid"**: Creates a descending take-profit grid where `close_grid_markup_start` > `close_grid_markup_end`.
 - **crossover_probability**: Probability of performing crossover between two individuals in the genetic algorithm. Determines how often parents exchange genetic information to create offspring.
 - **crossover_eta**: Crowding factor (η) for simulated-binary crossover. Lower values (<20) allow offspring to move farther away from their parents; higher values keep them closer. Default is `20.0`.
 - **iters**: Number of backtests per optimize session.
@@ -243,6 +347,7 @@ When optimizing, parameter values are within the lower and upper bounds.
 - **mutation_indpb**: Probability that each attribute mutates when a mutation is triggered. Set to `0` (default) to auto-scale to `1 / number_of_parameters`, or supply an explicit probability between `0` and `1`.
 - **n_cpus**: Number of CPU cores utilized in parallel.
 - **offspring_multiplier**: Multiplier applied to `population_size` to determine how many offspring (`λ`) are produced each generation in the μ+λ evolution strategy. Values >1.0 increase exploration by sampling more children per generation. Default is `1.0`.
+- **pareto_max_size**: Maximum number of Pareto-optimal configs kept on disk under `optimize_results/.../pareto/`. Members are pruned by crowding (least diverse removed first, while per-objective extremes are preserved), not by age.
 - **population_size**: Size of population for genetic optimization algorithm.
 - **scoring**:
   - The optimizer uses two objectives and finds the Pareto front.
@@ -250,32 +355,66 @@ When optimizing, parameter values are within the lower and upper bounds.
   - Default values are median daily gain and Sharpe ratio.
   - Uses the NSGA-II algorithm (Non-dominated Sorting Genetic Algorithm II) for multi-objective optimization.
   - The fitness function minimizes both objectives (converted to negative values internally).
-  - Full list of options: `[adg, adg_w, calmar_ratio, calmar_ratio_w, drawdown_worst, drawdown_worst_mean_1pct, equity_balance_diff_neg_max, equity_balance_diff_neg_mean, equity_balance_diff_pos_max, equity_balance_diff_pos_mean, expected_shortfall_1pct, flat_btc_balance_hours, gain, loss_profit_ratio, loss_profit_ratio_w, mdg, mdg_w, omega_ratio, omega_ratio_w, position_held_hours_max, position_held_hours_mean, position_held_hours_median, position_unchanged_hours_max, positions_held_per_day, sharpe_ratio, sharpe_ratio_w, sortino_ratio, sortino_ratio_w, sterling_ratio, sterling_ratio_w]`
+  - Full list of options: `[adg, adg_w, calmar_ratio, calmar_ratio_w, drawdown_worst, drawdown_worst_mean_1pct, equity_balance_diff_neg_max, equity_balance_diff_neg_mean, equity_balance_diff_pos_max, equity_balance_diff_pos_mean, expected_shortfall_1pct, gain, loss_profit_ratio, loss_profit_ratio_w, mdg, mdg_w, omega_ratio, omega_ratio_w, peak_recovery_hours_equity, peak_recovery_hours_pnl, position_held_hours_max, position_held_hours_mean, position_held_hours_median, position_unchanged_hours_max, positions_held_per_day, sharpe_ratio, sharpe_ratio_w, sortino_ratio, sortino_ratio_w, sterling_ratio, sterling_ratio_w]`
   - Suffix `_w` indicates mean across 10 temporal subsets (whole, last_half, last_third, ..., last_tenth) to weigh recent data more heavily.
   - Examples: `["mdg", "sharpe_ratio", "loss_profit_ratio"]`, `["adg", "sortino_ratio", "drawdown_worst"]`, `["sortino_ratio", "omega_ratio", "adg_w", "position_unchanged_hours_max"]`
-    - Note: if config.backtest.use_btc_collateral=True, add prefix "btc_" to use btc denominated metrics, e.g. btc_adg or btc_drawdown_worst.
+    - Note: metrics may be suffixed with `_usd` or `_btc` to select denomination. If `config.backtest.btc_collateral_cap` is `0`, BTC values still represent the USD equity translated into BTC terms.
+
+### Optimizer Suites
+
+The optimizer uses `backtest.suite` as its canonical suite configuration when `--suite [y/n]` is enabled.
+
+- **backtest.suite.enabled**: Can be toggled for optimizer runs via `--suite [y/n]` on `src/optimize.py`.
+- **backtest.suite.include_base_scenario** / **base_label**: Include the base scenario alongside the configured scenarios.
+- **backtest.suite.aggregate**: Per-metric aggregation rules applied to scenario results before feeding into `optimize.scoring` and `optimize.limits`.
+- **backtest.suite.scenarios**: Scenario dictionaries. Each one may override `coins`, `ignored_coins`, `start_date`, `end_date`, `exchanges`, and `coin_sources`.
+
+Use `--suite-config path/to/file.json` to layer a different `backtest.suite` definition at runtime.
 
 ### Optimization Limits
 
 The optimizer penalizes backtests whose metric values exceed or fall short of specified thresholds. Penalties are added to the fitness score to discourage undesirable configurations but do not disqualify the config.
 
-Any metric listed above (and its `btc_` prefixed counterpart when `backtest.use_btc_collateral=True`) can be used with `penalize_if_greater_than_*` / `penalize_if_lower_than_*`. Metrics present only in `analysis.json` but not in the scoring list are not currently available as limits.
+Any metric listed above (and its `btc_` prefixed counterpart when `backtest.use_btc_collateral=True`) can be used when defining limits. Each limit entry is a dictionary with:
+
+- `metric`: canonical metric name (`drawdown_worst_btc`, `loss_profit_ratio`, `peak_recovery_hours_pnl`, etc.).
+- `penalize_if`: one of `<`, `>`, `outside_range`, or `inside_range` (aliases like `less_than`, `greater_than`, `auto`, etc. are also accepted). Use `outside_range` to keep a metric within `[low, high]`, and `inside_range` to forbid a specific band.
+- `value`: numeric threshold for `<`/`>` modes.
+- `range`: two-value list `[low, high]` for the range modes.
+- Optional `stat`: when you want to compare against a specific statistic (`min`, `max`, `mean`, `std`). Defaults mirror the legacy behaviour (`>` checks use `_max`, `<` checks use `_min`, range checks use `_mean`).
 
 #### Format
 
-Limits can be set in the config file under `optimize.limits` or passed via CLI using `--limits`.
-
-##### Config Example
+Define limits in `optimize.limits` as a list:
 
 ```json
-"limits": {
-  "penalize_if_greater_than_drawdown_worst": 0.3,
-  "penalize_if_lower_than_adg": 0.001
-}
+"limits": [
+  {"metric": "drawdown_worst_btc", "penalize_if": ">", "value": 0.3},
+  {"metric": "loss_profit_ratio", "penalize_if": "outside_range", "range": [0.05, 0.7]},
+  {"metric": "adg_btc", "penalize_if": "<", "value": 0.0005, "stat": "mean"}
+]
 ```
 
-##### CLI arg Example:
+For quick CLI overrides you can pass the JSON/HJSON string directly:
 
 ```
-python3 src/optimize.py --limits "--penalize_if_lower_than_btc_omega_ratio 3.0 --penalize_if_greater_than_loss_profit_ratio 0.5"
+python3 src/optimize.py --limits '[{"metric":"drawdown_worst","penalize_if":">","value":0.35}]'
 ```
+
+The legacy syntax (`--penalize_if_greater_than_*`) is still accepted for backwards compatibility; it is normalized into the list form at runtime.
+
+## Configuration Internals
+
+Passivbot stores a few metadata keys alongside the normalized config:
+
+- `_raw` retains the exact user input as it appeared on disk before formatting/normalization. It is
+  meant for inspection and diffing—callers should treat it as read-only.
+- `_coins_sources` records where approved/ignored coin lists originated (inline strings, external
+  files, CLI overrides). Future overrides update both the normalized lists and their
+  `_coins_sources` entries so live reloads honour the latest intent.
+- `_transform_log` captures a chronological record of high-level configuration mutations (load,
+  formatting, CLI overrides, etc.). Each entry stores a `step`, optional `details`, and a timestamp,
+  making it easier to audit how the runtime config diverged from `_raw`.
+
+Additional reserved keys may appear in future releases; all keys beginning with an underscore are
+ignored by persistence helpers to keep user configs tidy.
