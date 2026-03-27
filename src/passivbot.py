@@ -1690,6 +1690,11 @@ class Passivbot(ExchangeInterface):
             return
         if failures and len(failures) >= checked:
             worst = max(failures, key=lambda f: f["required_balance"])
+            has_open_positions = any(
+                self.positions.get(s, {}).get(p, {}).get("size", 0.0) != 0.0
+                for s in self.positions
+                for p in ["long", "short"]
+            )
             for f in failures:
                 logging.error(
                     f"Insufficient balance for {f['symbol']} {f['pside']}: "
@@ -1697,11 +1702,18 @@ class Passivbot(ExchangeInterface):
                     f"(min_cost=${f['effective_min_cost']:.2f}, "
                     f"affordable=${f['affordable']:.4f})"
                 )
-            raise SystemExit(
-                f"Balance too low: ${self.balance:.2f} < "
-                f"${worst['required_balance']:.2f} minimum required. "
-                f"Increase balance or adjust strategy parameters."
-            )
+            if has_open_positions:
+                logging.warning(
+                    f"Balance too low for new entries (${self.balance:.2f} < "
+                    f"${worst['required_balance']:.2f}), but continuing to "
+                    f"manage existing positions."
+                )
+            else:
+                raise SystemExit(
+                    f"Balance too low: ${self.balance:.2f} < "
+                    f"${worst['required_balance']:.2f} minimum required. "
+                    f"Increase balance or adjust strategy parameters."
+                )
         elif failures:
             for f in failures:
                 logging.warning(
