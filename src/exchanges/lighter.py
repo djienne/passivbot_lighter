@@ -388,6 +388,7 @@ class LighterBot(Passivbot):
         self._ws_positions_cache_ts = 0.0     # monotonic timestamp of last update
         self._ws_balance_cache = None         # float balance from WS, or None
         self._ws_balance_cache_ts = 0.0
+        self._last_fetched_balance = None    # consume-once cache for fetch_balance()
         self._ws_open_orders_cache = None     # list of order dicts, or None
         self._ws_open_orders_cache_ts = 0.0
         self._ws_cache_max_age = 30.0         # seconds before cache is considered stale
@@ -1437,7 +1438,7 @@ class LighterBot(Passivbot):
     async def fetch_balance(self):
         """Fetch balance from Lighter (v7.8.4 contract: returns float)."""
         # If we have a recently cached balance from fetch_positions, use it
-        if hasattr(self, "_last_fetched_balance") and self._last_fetched_balance is not None:
+        if self._last_fetched_balance is not None:
             bal = self._last_fetched_balance
             self._last_fetched_balance = None  # consume once
             return bal
