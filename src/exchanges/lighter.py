@@ -61,7 +61,8 @@ def _is_quota_error(exc_or_msg) -> bool:
 
 
 def _is_transient_error(exc) -> bool:
-    """Return True for rate-limit (429), server errors (5xx), and nonce errors — temporary, not fatal.
+    """Return True for rate-limit (429), server errors (5xx), nonce errors,
+    and network/DNS errors — temporary, not fatal.
 
     Note: quota errors are intentionally excluded; use ``_is_quota_error`` for those.
     """
@@ -70,6 +71,9 @@ def _is_transient_error(exc) -> bool:
         return True
     # Detect 5xx server errors (502 Bad Gateway, 503 Service Unavailable, etc.)
     if "bad gateway" in msg or "service unavailable" in msg or "gateway timeout" in msg:
+        return True
+    # Detect transient network/DNS errors
+    if "dns" in msg or "timeout" in msg or "connect" in msg or "reset by peer" in msg:
         return True
     s = str(exc)
     if any(f"({code})" in s for code in (500, 502, 503, 504)):
@@ -1418,7 +1422,7 @@ class LighterBot(Passivbot):
             return positions, balance
         except Exception as e:
             if _is_transient_error(e):
-                logging.warning(f"transient error fetching positions and balance: {type(e).__name__}")
+                logging.warning(f"transient error fetching positions and balance ({type(e).__name__}); will retry automatically")
                 self._trigger_global_backoff()
             else:
                 logging.error(f"error fetching positions and balance: {e}")
@@ -1577,7 +1581,7 @@ class LighterBot(Passivbot):
             return sorted(all_orders, key=lambda x: x["timestamp"])
         except Exception as e:
             if _is_transient_error(e):
-                logging.warning(f"transient error fetching open orders: {type(e).__name__}")
+                logging.warning(f"transient error fetching open orders ({type(e).__name__}); will retry automatically")
             else:
                 logging.error(f"error fetching open orders: {e}")
                 traceback.print_exc()
@@ -1628,7 +1632,7 @@ class LighterBot(Passivbot):
             return tickers
         except Exception as e:
             if _is_transient_error(e):
-                logging.warning(f"transient error fetching tickers: {type(e).__name__}")
+                logging.warning(f"transient error fetching tickers ({type(e).__name__}); will retry automatically")
                 self._trigger_global_backoff()
             else:
                 logging.error(f"error fetching tickers: {e}")
