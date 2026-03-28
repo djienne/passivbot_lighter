@@ -561,13 +561,17 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
             om,
         )
 
-        om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
-        btc_df = await om.get_ohlcvs("BTC")
-        if btc_df.empty:
-            raise ValueError(f"Failed to fetch BTC/USD prices from {exchange}")
-
-        btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").ffill().bfill().reset_index()
-        btc_usd_prices = btc_df["close"].values
+        btc_collateral_cap = float(config.get("backtest", {}).get("btc_collateral_cap", 0.0))
+        if btc_collateral_cap > 0.0:
+            om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
+            btc_df = await om.get_ohlcvs("BTC")
+            if btc_df.empty:
+                raise ValueError(f"Failed to fetch BTC/USD prices from {exchange}")
+            btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").ffill().bfill().reset_index()
+            btc_usd_prices = btc_df["close"].values
+        else:
+            logging.info("BTC collateral disabled (cap=0); using dummy BTC prices")
+            btc_usd_prices = np.ones(len(timestamps), dtype=np.float64)
 
         warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // minute_ms))
         mss["__meta__"] = {
@@ -836,21 +840,25 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
             normalized_forced_sources,
         )
 
-        btc_exchange = exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
-        btc_om = HLCVManager(
-            btc_exchange,
-            effective_start_date,
-            end_date,
-            gap_tolerance_ohlcvs_minutes=require_config_value(config, "backtest.gap_tolerance_ohlcvs_minutes"),
-        )
-        # Align BTC date range to actual timestamps (mirrors single-exchange case)
-        btc_om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
-        btc_df = await btc_om.get_ohlcvs("BTC")
-        if btc_df.empty:
-            raise ValueError(f"Failed to fetch BTC/USD prices from {btc_exchange}")
-
-        btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").ffill().bfill().reset_index()
-        btc_usd_prices = btc_df["close"].values
+        btc_collateral_cap = float(config.get("backtest", {}).get("btc_collateral_cap", 0.0))
+        if btc_collateral_cap > 0.0:
+            btc_exchange = exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
+            btc_om = HLCVManager(
+                btc_exchange,
+                effective_start_date,
+                end_date,
+                gap_tolerance_ohlcvs_minutes=require_config_value(config, "backtest.gap_tolerance_ohlcvs_minutes"),
+            )
+            # Align BTC date range to actual timestamps (mirrors single-exchange case)
+            btc_om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
+            btc_df = await btc_om.get_ohlcvs("BTC")
+            if btc_df.empty:
+                raise ValueError(f"Failed to fetch BTC/USD prices from {btc_exchange}")
+            btc_df = btc_df.set_index("timestamp").reindex(timestamps, method="ffill").ffill().bfill().reset_index()
+            btc_usd_prices = btc_df["close"].values
+        else:
+            logging.info("BTC collateral disabled (cap=0); using dummy BTC prices")
+            btc_usd_prices = np.ones(len(timestamps), dtype=np.float64)
 
         warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // minute_ms))
         mss["__meta__"] = {

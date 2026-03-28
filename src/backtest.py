@@ -717,10 +717,15 @@ def load_coins_hlcvs_from_cache(config, exchange):
                 with gzip.open(btc_fname, "rb") as f:
                     btc_usd_prices = np.load(f)
             else:
-                logging.info(
-                    f"{exchange} No BTC/USD prices in cache; cache invalid for fractional collateral"
-                )
-                return None
+                btc_collateral_cap = float(config.get("backtest", {}).get("btc_collateral_cap", 0.0))
+                if btc_collateral_cap > 0.0:
+                    logging.info(
+                        f"{exchange} No BTC/USD prices in cache; cache invalid for fractional collateral"
+                    )
+                    return None
+                else:
+                    logging.info(f"{exchange} No BTC/USD prices in cache; using dummy (collateral disabled)")
+                    btc_usd_prices = np.ones(hlcvs.shape[0], dtype=np.float64)
         else:
             fname = cache_dir / "hlcvs.npy"
             logging.info(f"{exchange} Attempting to load hlcvs data from cache {fname}...")
@@ -739,10 +744,15 @@ def load_coins_hlcvs_from_cache(config, exchange):
                 )
                 btc_usd_prices = np.load(btc_fname)
             else:
-                logging.info(
-                    f"{exchange} No BTC/USD prices in cache; cache invalid for fractional collateral"
-                )
-                return None
+                btc_collateral_cap = float(config.get("backtest", {}).get("btc_collateral_cap", 0.0))
+                if btc_collateral_cap > 0.0:
+                    logging.info(
+                        f"{exchange} No BTC/USD prices in cache; cache invalid for fractional collateral"
+                    )
+                    return None
+                else:
+                    logging.info(f"{exchange} No BTC/USD prices in cache; using dummy (collateral disabled)")
+                    btc_usd_prices = np.ones(hlcvs.shape[0], dtype=np.float64)
         results_path = oj(require_config_value(config, "backtest.base_dir"), exchange, "")
         return cache_dir, coins, hlcvs, mss, results_path, btc_usd_prices, timestamps
     return None
@@ -761,11 +771,13 @@ def save_coins_hlcvs_to_cache(
     cache_dir = Path("caches") / "hlcvs_data" / cache_hash[:16]
     cache_dir.mkdir(parents=True, exist_ok=True)
     is_compressed = bool(require_config_value(config, "backtest.compress_cache"))
+    btc_is_dummy = np.all(btc_usd_prices == 1.0) if btc_usd_prices is not None else True
     expected_files = [
         "coins.json",
         "hlcvs.npy.gz" if is_compressed else "hlcvs.npy",
-        "btc_usd_prices.npy.gz" if is_compressed else "btc_usd_prices.npy",
     ]
+    if not btc_is_dummy:
+        expected_files.append("btc_usd_prices.npy.gz" if is_compressed else "btc_usd_prices.npy")
     if timestamps is not None:
         expected_files.append("timestamps.npy.gz" if is_compressed else "timestamps.npy")
     if all((cache_dir / fname).exists() for fname in expected_files):
@@ -785,17 +797,24 @@ def save_coins_hlcvs_to_cache(
             logging.info(f"Attempting to save timestamps to cache {ts_fpath}...")
             with gzip.open(ts_fpath, "wb", compresslevel=1) as f:
                 np.save(f, timestamps)
-        btc_fpath = cache_dir / "btc_usd_prices.npy.gz"
-        logging.info(f"Attempting to save BTC/USD prices to cache {btc_fpath}...")
-        with gzip.open(btc_fpath, "wb", compresslevel=1) as f:
-            np.save(f, btc_usd_prices)
         compressed_size = (cache_dir / "hlcvs.npy.gz").stat().st_size
-        btc_compressed_size = (cache_dir / "btc_usd_prices.npy.gz").stat().st_size
-        line = (
-            f"{compressed_size/(1024**3):.2f} GB compressed HLCVs "
-            f"({compressed_size/uncompressed_size*100:.1f}%), "
-            f"{btc_compressed_size/(1024**3):.2f} GB compressed BTC/USD prices"
-        )
+        if not btc_is_dummy:
+            btc_fpath = cache_dir / "btc_usd_prices.npy.gz"
+            logging.info(f"Attempting to save BTC/USD prices to cache {btc_fpath}...")
+            with gzip.open(btc_fpath, "wb", compresslevel=1) as f:
+                np.save(f, btc_usd_prices)
+            btc_compressed_size = (cache_dir / "btc_usd_prices.npy.gz").stat().st_size
+            line = (
+                f"{compressed_size/(1024**3):.2f} GB compressed HLCVs "
+                f"({compressed_size/uncompressed_size*100:.1f}%), "
+                f"{btc_compressed_size/(1024**3):.2f} GB compressed BTC/USD prices"
+            )
+        else:
+            line = (
+                f"{compressed_size/(1024**3):.2f} GB compressed HLCVs "
+                f"({compressed_size/uncompressed_size*100:.1f}%), "
+                f"BTC prices skipped (collateral disabled)"
+            )
     else:
         fpath = cache_dir / "hlcvs.npy"
         logging.info(f"Attempting to save hlcvs data to cache {fpath}...")
@@ -804,9 +823,10 @@ def save_coins_hlcvs_to_cache(
             ts_fpath = cache_dir / "timestamps.npy"
             logging.info(f"Attempting to save timestamps to cache {ts_fpath}...")
             np.save(ts_fpath, timestamps)
-        btc_fpath = cache_dir / "btc_usd_prices.npy"
-        logging.info(f"Attempting to save BTC/USD prices to cache {btc_fpath}...")
-        np.save(btc_fpath, btc_usd_prices)
+        if not btc_is_dummy:
+            btc_fpath = cache_dir / "btc_usd_prices.npy"
+            logging.info(f"Attempting to save BTC/USD prices to cache {btc_fpath}...")
+            np.save(btc_fpath, btc_usd_prices)
         line = ""
     logging.info(
         f"Successfully dumped hlcvs cache {fpath}: "
