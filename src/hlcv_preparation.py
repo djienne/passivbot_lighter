@@ -514,6 +514,181 @@ class HLCVManager:
         return df.reset_index(drop=True)
 
 
+async def _prepare_hlcvs_lighter(config, coins, effective_start_ts, requested_start_ts, end_ts):
+    """Load pre-downloaded Lighter daily .npy files into backtest format.
+
+    Reads from ohlcvs_lighter/{COIN}/YYYY-MM-DD.npy (shape 1440x6: ts,o,h,l,c,v).
+    Returns (mss, timestamps, unified_array, btc_usd_prices).
+    """
+    data_dir = Path(config.get("backtest", {}).get("lighter_data_dir", "ohlcvs_lighter"))
+    interval_ms = 60_000
+    per_coin_warmups = compute_per_coin_warmup_minutes(config)
+    default_warm = int(per_coin_warmups.get("__default__", 0))
+
+    # Lighter market defaults
+    LIGHTER_MARKETS = {
+        "HYPE": {"qty_step": 0.01, "price_step": 0.0001, "min_qty": 0.01, "min_cost": 1.0,
+                 "c_mult": 1.0, "maker": 0.0002, "taker": 0.00055},
+        "BTC": {"qty_step": 0.00001, "price_step": 0.1, "min_qty": 0.00001, "min_cost": 1.0,
+                "c_mult": 1.0, "maker": 0.0002, "taker": 0.00055},
+        "ETH": {"qty_step": 0.0001, "price_step": 0.01, "min_qty": 0.0001, "min_cost": 1.0,
+                "c_mult": 1.0, "maker": 0.0002, "taker": 0.00055},
+    }
+    # Try to load precise settings from market metadata cache
+    meta_path = Path("caches/lighter/market_metadata.json")
+    if meta_path.exists():
+        try:
+            import json as _json
+            meta = _json.load(open(meta_path))
+            for coin, info in meta.items():
+                if coin in LIGHTER_MARKETS:
+                    mi = info.get("info", {})
+                    if "price_decimals" in mi:
+                        LIGHTER_MARKETS[coin]["price_step"] = 10 ** -int(mi["price_decimals"])
+                    if "size_decimals" in mi:
+                        LIGHTER_MARKETS[coin]["qty_step"] = 10 ** -int(mi["size_decimals"])
+                        LIGHTER_MARKETS[coin]["min_qty"] = 10 ** -int(mi["size_decimals"])
+        except Exception as e:
+            logging.warning(f"Could not load lighter market metadata: {e}")
+
+    valid_coins = {}
+    global_start_time = float("inf")
+    global_end_time = float("-inf")
+
+    for coin in coins:
+        coin_dir = data_dir / coin
+        if not coin_dir.exists():
+            logging.warning(f"lighter: no data directory for {coin} at {coin_dir}")
+            continue
+
+        frames = []
+        current_ms = effective_start_ts
+        while current_ms <= end_ts:
+            dt = datetime.fromtimestamp(current_ms / 1000, tz=timezone.utc)
+            date_str = dt.strftime("%Y-%m-%d")
+            fpath = coin_dir / f"{date_str}.npy"
+            if fpath.exists():
+                arr = np.load(str(fpath), allow_pickle=False)
+                # Filter to requested range
+                mask = (arr[:, 0] >= effective_start_ts) & (arr[:, 0] <= end_ts)
+                if mask.any():
+                    frames.append(arr[mask])
+            current_ms += 86_400_000
+
+        if not frames:
+            logging.warning(f"lighter: no candle data found for {coin}")
+            continue
+
+        data = np.concatenate(frames)
+        # Remove duplicate timestamps and sort
+        _, unique_idx = np.unique(data[:, 0], return_index=True)
+        data = data[unique_idx]
+
+        # Convert from [ts, o, h, l, c, v] to [ts, h, l, c, v] (backtest format)
+        hlcv_data = data[:, [0, 2, 3, 4, 5]]
+
+        # Check for gaps
+        diffs = np.diff(hlcv_data[:, 0])
+        gap_count = np.sum(diffs != interval_ms)
+        if gap_count > 0:
+            logging.info(f"lighter: {coin} has {gap_count} gaps in candle data, filling...")
+            # Fill gaps with forward-fill
+            full_ts = np.arange(hlcv_data[0, 0], hlcv_data[-1, 0] + interval_ms, interval_ms)
+            full_data = np.full((len(full_ts), 5), np.nan, dtype=np.float64)
+            full_data[:, 0] = full_ts
+            # Map existing data
+            for row in hlcv_data:
+                idx = int((row[0] - full_ts[0]) / interval_ms)
+                if 0 <= idx < len(full_data):
+                    full_data[idx, 1:] = row[1:]
+            # Forward fill
+            for i in range(1, len(full_data)):
+                if np.isnan(full_data[i, 1]):
+                    full_data[i, 1:4] = full_data[i - 1, 3]  # h=l=c=prev_close
+                    full_data[i, 4] = 0.0  # volume=0
+            # Backward fill leading NaN
+            for i in range(len(full_data)):
+                if not np.isnan(full_data[i, 1]):
+                    if i > 0:
+                        full_data[:i, 1:4] = full_data[i, 1]
+                        full_data[:i, 4] = 0.0
+                    break
+            hlcv_data = full_data
+
+        valid_coins[coin] = hlcv_data
+        global_start_time = min(global_start_time, hlcv_data[0, 0])
+        global_end_time = max(global_end_time, hlcv_data[-1, 0])
+        logging.info(f"lighter: loaded {coin} — {len(hlcv_data)} candles "
+                     f"({ts_to_date(int(hlcv_data[0, 0]))} to {ts_to_date(int(hlcv_data[-1, 0]))})")
+
+    if not valid_coins:
+        raise ValueError("No valid coins found in lighter data")
+
+    n_timesteps = int((global_end_time - global_start_time) / interval_ms) + 1
+    n_coins = len(valid_coins)
+    timestamps = np.arange(global_start_time, global_end_time + interval_ms, interval_ms)
+    unified_array = np.full((n_timesteps, n_coins, 4), np.nan, dtype=np.float64)
+
+    mss = {}
+    for i, coin in enumerate(sorted(valid_coins)):
+        hlcv_data = valid_coins[coin]
+        start_idx = int((hlcv_data[0, 0] - global_start_time) / interval_ms)
+        end_idx = start_idx + len(hlcv_data)
+        unified_array[start_idx:end_idx, i, :] = hlcv_data[:, 1:]  # h, l, c, v
+
+        first_idx = start_idx
+        last_idx = end_idx - 1
+        warm_minutes = int(per_coin_warmups.get(coin, default_warm))
+        trade_start_idx = first_idx + warm_minutes
+        if trade_start_idx > last_idx:
+            trade_start_idx = last_idx
+
+        defaults = LIGHTER_MARKETS.get(coin, {
+            "qty_step": 0.01, "price_step": 0.0001, "min_qty": 0.01,
+            "min_cost": 1.0, "c_mult": 1.0, "maker": 0.0002, "taker": 0.00055,
+        })
+        mss[coin] = {
+            **defaults,
+            "maker_fee": defaults["maker"],
+            "taker_fee": defaults["taker"],
+            "hedge_mode": True,
+            "feeSide": "get",
+            "first_valid_index": first_idx,
+            "last_valid_index": last_idx,
+            "warmup_minutes": warm_minutes,
+            "trade_start_index": trade_start_idx,
+        }
+
+    warmup_minutes = compute_backtest_warmup_minutes(config)
+    warmup_provided = max(0, int(max(0, requested_start_ts - int(timestamps[0])) // interval_ms))
+    mss["__meta__"] = {
+        "requested_start_ts": int(requested_start_ts),
+        "requested_start_date": ts_to_date(requested_start_ts),
+        "effective_start_ts": int(timestamps[0]),
+        "effective_start_date": ts_to_date(int(timestamps[0])),
+        "warmup_minutes_requested": int(warmup_minutes),
+        "warmup_minutes_provided": int(warmup_provided),
+    }
+
+    # BTC prices
+    btc_collateral_cap = float(config.get("backtest", {}).get("btc_collateral_cap", 0.0))
+    if btc_collateral_cap > 0.0 and "BTC" in valid_coins:
+        btc_data = valid_coins["BTC"]
+        btc_close = btc_data[:, 3]  # close prices
+        btc_usd_prices = np.ones(len(timestamps), dtype=np.float64)
+        start_idx = int((btc_data[0, 0] - global_start_time) / interval_ms)
+        btc_usd_prices[start_idx:start_idx + len(btc_close)] = btc_close
+        # Forward/backward fill
+        for i in range(1, len(btc_usd_prices)):
+            if btc_usd_prices[i] == 1.0 and btc_usd_prices[i - 1] != 1.0:
+                btc_usd_prices[i] = btc_usd_prices[i - 1]
+    else:
+        btc_usd_prices = np.ones(len(timestamps), dtype=np.float64)
+
+    logging.info(f"lighter: prepared {n_coins} coin(s), {n_timesteps} timesteps")
+    return mss, timestamps, unified_array, btc_usd_prices
+
+
 async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool = False):
     approved = require_live_value(config, "approved_coins")
     coins = sorted(
@@ -530,6 +705,11 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
     warmup_ms = warmup_minutes * minute_ms
     effective_start_ts = max(0, requested_start_ts - warmup_ms)
     effective_start_ts = (effective_start_ts // minute_ms) * minute_ms
+
+    # Lighter: load directly from pre-downloaded .npy files
+    if exchange == "lighter":
+        return await _prepare_hlcvs_lighter(config, coins, effective_start_ts, requested_start_ts, end_ts)
+
     effective_start_date = ts_to_date(effective_start_ts)
 
     if warmup_minutes > 0:
