@@ -3697,13 +3697,16 @@ class Passivbot:
             return
 
         # Pre-calculate total WE per side for TWEL% display
+        # Use a meaningful balance threshold to avoid nonsensical WE values
+        # when balance hasn't been fetched yet (initialized to 1e-12)
+        balance_valid = self.balance > 1e-6
         total_we_by_pside = {"long": 0.0, "short": 0.0}
         for pos in positions_new:
             sym = pos["symbol"]
             ps = pos["position_side"]
             sz = pos.get("size", 0.0)
             px = pos.get("price", 0.0)
-            if sz != 0 and self.balance > 0 and sym in self.c_mults:
+            if sz != 0 and balance_valid and sym in self.c_mults:
                 total_we_by_pside[ps] += pbr.qty_to_cost(sz, px, self.c_mults[sym]) / self.balance
 
         # Create PrettyTable for aligned output
@@ -3731,7 +3734,7 @@ class Passivbot:
             # Compute metrics for new pos
             wallet_exposure = (
                 pbr.qty_to_cost(new["size"], new["price"], self.c_mults[symbol]) / self.balance
-                if new["size"] != 0 and self.balance > 0
+                if new["size"] != 0 and balance_valid
                 else 0.0
             )
             wel = float(self.bp(pside, "wallet_exposure_limit", symbol))

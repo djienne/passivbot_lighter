@@ -1164,6 +1164,10 @@ class LighterBot(Passivbot):
             base = self.markets_dict[symbol]["base"]
             self.coin_to_symbol_map[base] = symbol
             self.symbol_to_coin_map[symbol] = base
+        # Also populate the global symbol_to_coin cache so that
+        # utility functions (format_approved_ignored_coins, etc.) can resolve coins
+        from utils import create_coin_symbol_map_cache
+        create_coin_symbol_map_cache("lighter", self.markets_dict, verbose=False)
 
     def _load_market_metadata_cache(self):
         """Load market metadata from disk cache. Returns True if successful."""
