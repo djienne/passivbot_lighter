@@ -163,10 +163,12 @@ def load_user_info(user: str, api_keys_path="api-keys.json") -> dict:
     try:
         mode = os.stat(api_keys_path).st_mode & 0o777
         if mode & 0o077:
-            logging.warning(
-                f"{api_keys_path} is accessible by group/others (mode {oct(mode)}). "
-                f"Consider running: chmod 600 {api_keys_path}"
-            )
+            if not getattr(load_user_info, "_perms_warned", False):
+                logging.warning(
+                    f"{api_keys_path} is accessible by group/others (mode {oct(mode)}). "
+                    f"Consider running: chmod 600 {api_keys_path}"
+                )
+                load_user_info._perms_warned = True
     except OSError:
         pass
     if user not in api_keys:
