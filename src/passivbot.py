@@ -2991,8 +2991,7 @@ class Passivbot:
 
         if "fees" in raw and raw["fees"] is not None:
             try:
-                if "fees" in result:
-                    result["fees"] = eval(raw["fees"])
+                result["fees"] = json.loads(raw["fees"]) if isinstance(raw["fees"], str) else raw["fees"]
             except Exception:
                 logging.warning(f"failed to parse fees for fill {event_id}; dropping field. {result}")
         if "pb_order_type" in raw and raw["pb_order_type"] is not None:

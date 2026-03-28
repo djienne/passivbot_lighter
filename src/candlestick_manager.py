@@ -1012,16 +1012,7 @@ class CandlestickManager:
                 except Exception:
                     pass
                 if not removed:
-                    try:
-                        import subprocess
-                        result = subprocess.run(
-                            ["sudo", "rm", "-f", lock_path],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        removed = result.returncode == 0
-                    except Exception:
-                        pass
+                    pass
                 if removed:
                     self._log(
                         "info",

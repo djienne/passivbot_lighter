@@ -1,5 +1,6 @@
 import glob
 import json
+import logging
 import os
 import traceback
 import asyncio
@@ -159,6 +160,15 @@ def load_user_info(user: str, api_keys_path="api-keys.json") -> dict:
         api_keys = json.load(open(api_keys_path))
     except Exception as e:
         raise Exception(f"error loading api keys file {api_keys_path} {e}")
+    try:
+        mode = os.stat(api_keys_path).st_mode & 0o777
+        if mode & 0o077:
+            logging.warning(
+                f"{api_keys_path} is accessible by group/others (mode {oct(mode)}). "
+                f"Consider running: chmod 600 {api_keys_path}"
+            )
+    except OSError:
+        pass
     if user not in api_keys:
         raise Exception(f"user {user} not found in {api_keys_path}")
 
