@@ -1052,7 +1052,7 @@ def serve_dash(accounts: Dict[str, Dict[str, Any]], default_days: int = 30, port
     signal.signal(signal.SIGTERM, shutdown_handler)
 
     try:
-        app.run_server(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+        app.run_server(host="127.0.0.1", port=port, debug=False, use_reloader=False)
     except SystemExit:
         pass
     except KeyboardInterrupt:

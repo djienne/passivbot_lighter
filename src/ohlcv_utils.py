@@ -144,7 +144,7 @@ def dump_daily_ohlcv_data(data, filepath: str, start_ts: int, interval_ms: int =
 
 
 def load_ohlcv_data(filepath: str) -> pd.DataFrame:
-    arr = np.load(filepath, allow_pickle=True)
+    arr = np.load(filepath, allow_pickle=False)
     columns = ["timestamp", "open", "high", "low", "close", "volume"]
     arr_deduplicated = deduplicate_rows(arr)
     if len(arr) != len(arr_deduplicated):
