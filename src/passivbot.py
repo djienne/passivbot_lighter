@@ -1310,6 +1310,33 @@ class Passivbot:
             return max(0.0, (matching["execution_timestamp"] + max_age_ms) - utc_ms())
         return 0.0
 
+    def _check_minimum_balance(self):
+        """Check whether balance can afford the minimum entry cost for at least one symbol.
+
+        Returns True if orders can proceed, False if balance is too low for all symbols.
+        Logs a warning and returns False instead of raising SystemExit so the bot
+        stays alive and can recover when funds are deposited.
+        """
+        if not hasattr(self, "effective_min_cost") or not self.effective_min_cost:
+            return True
+        if self.balance <= 0.0:
+            logging.warning(
+                "[balance] zero or negative balance (%.2f %s); skipping order creation",
+                self.balance,
+                self.quote,
+            )
+            return False
+        for symbol, min_cost in self.effective_min_cost.items():
+            if min_cost > 0.0 and self.balance >= min_cost:
+                return True
+        logging.warning(
+            "[balance] %.2f %s is below the minimum entry cost for all configured symbols; "
+            "skipping order creation. Deposit funds or reduce position count to resume trading.",
+            self.balance,
+            self.quote,
+        )
+        return False
+
     async def execute_to_exchange(self):
         """Run one execution cycle including config sync and order placement/cancellation."""
         await self.execution_cycle()
@@ -1340,8 +1367,9 @@ class Passivbot:
         if self.debug_mode:
             if to_create:
                 print(f"would create {len(to_create)} order{'s' if len(to_create) > 1 else ''}")
-        elif self.balance < self.balance_threshold:
-            logging.info("[balance] too low: %.2f %s; not creating orders", self.balance, self.quote)
+        elif self.balance < self.balance_threshold or not self._check_minimum_balance():
+            if self.balance < self.balance_threshold:
+                logging.info("[balance] too low: %.2f %s; not creating orders", self.balance, self.quote)
         else:
             # to_create_mod = [x for x in to_create if not order_has_match(x, to_cancel)]
             to_create_mod = []

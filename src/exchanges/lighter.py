@@ -1314,7 +1314,7 @@ class LighterBot(Passivbot):
             # Use a lightweight REST call to measure offset
             root_api = lighter.RootApi(self.api_client)
             status = await root_api.status()
-            server_time = float(status.timestamp) if hasattr(status, "timestamp") else utc_ms()
+            server_time = float(status.timestamp) * 1000 if hasattr(status, "timestamp") else utc_ms()
             self.utc_offset = round((server_time - utc_ms()) / (1000 * 60 * 60)) * (
                 1000 * 60 * 60
             )
