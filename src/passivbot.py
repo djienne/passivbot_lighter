@@ -2002,6 +2002,10 @@ class Passivbot:
                     self.PB_modes[pside][symbol] = forced_mode
                 else:
                     if symbol in self.ineligible_symbols:
+                        logging.warning(
+                            f"[mode] {symbol} {pside} marked ineligible: "
+                            f"{self.ineligible_symbols[symbol]}"
+                        )
                         if self.ineligible_symbols[symbol] == "not active":
                             self.PB_modes[pside][symbol] = "tp_only"
                         else:
