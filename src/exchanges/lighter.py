@@ -1142,7 +1142,7 @@ class LighterBot(Passivbot):
         await self.determine_utc_offset(verbose)
 
         from utils import filter_markets
-        eligible, _, reasons = filter_markets(self.markets_dict, self.exchange, verbose)
+        eligible, _, reasons = filter_markets(self.markets_dict, self.exchange, verbose=verbose)
         self.eligible_symbols = set(eligible)
         self.ineligible_symbols = reasons
 
