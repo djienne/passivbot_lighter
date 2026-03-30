@@ -183,6 +183,8 @@ class _TxWebSocket:
                 try:
                     raw = await asyncio.wait_for(self._ws.recv(), timeout=120)
                     data = _json_loads(raw)
+                    if not isinstance(data, dict):
+                        continue
                     msg_type = data.get("type", "")
 
                     if msg_type == "ping":
@@ -2576,6 +2578,8 @@ class LighterBot(Passivbot):
                             # to avoid spurious reconnections that waste auth tokens.
                             raw = await asyncio.wait_for(ws.recv(), timeout=300)
                             data = _json_loads(raw)
+                            if not isinstance(data, dict):
+                                continue
                             self._ws_last_message_ms = utc_ms()
                             msg_type = data.get("type", "")
 
