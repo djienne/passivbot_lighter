@@ -396,6 +396,31 @@ class Passivbot(ExchangeInterface):
             "short": "graceful_stop" if auto_gs else "manual",
         }
 
+        # FillEventsManager shadow mode: runs in parallel with legacy pnls, logs comparison
+        self._pnls_shadow_mode = bool(
+            get_optional_live_value(self.config, "pnls_manager_shadow_mode", False)
+        )
+        self._pnls_manager: Optional[FillEventsManager] = None
+        self._pnls_shadow_initialized = False
+        self._pnls_shadow_last_comparison_ts = 0
+        self._pnls_shadow_comparison_interval_ms = 60_000  # compare every 60 seconds
+
+        # Health tracking for periodic summary
+        self._health_start_ms = utc_ms()
+        self._health_orders_placed = 0
+        self._health_orders_cancelled = 0
+        self._health_fills = 0
+        self._health_pnl = 0.0  # sum of realized PnL from fills
+        self._health_errors = 0
+        self._health_ws_reconnects = 0
+        self._ws_last_message_ms = 0.0
+        self._ws_reconnect_failures = []
+        self._ws_watchdog_backoff = 120_000  # initial staleness threshold in ms
+        self._ws_watchdog_backoff_max = 600_000  # 10 min cap
+        self._health_rate_limits = 0
+        self._health_last_summary_ms = 0
+        self._health_summary_interval_ms = 15 * 60 * 1000  # 15 minutes
+
     def live_value(self, key: str):
         return require_live_value(self.config, key)
 
@@ -903,6 +928,50 @@ class Passivbot(ExchangeInterface):
                     if self.execution_scheduled:
                         break
                     await asyncio.sleep(0.1)
+                # WS liveness watchdog with exponential backoff
+                if (
+                    hasattr(self, "maintainers")
+                    and "watch_orders" in self.maintainers
+                    and self._ws_last_message_ms > 0
+                    and utc_ms() - self._ws_last_message_ms > self._ws_watchdog_backoff
+                ):
+                    logging.warning(
+                        "WS stale: no message for %.0fs (threshold %.0fs) — forcing reconnect",
+                        (utc_ms() - self._ws_last_message_ms) / 1000,
+                        self._ws_watchdog_backoff / 1000,
+                    )
+                    self._health_ws_reconnects += 1
+                    try:
+                        self.maintainers["watch_orders"].cancel()
+                        await asyncio.sleep(0.5)
+                        self.maintainers["watch_orders"] = asyncio.create_task(
+                            self.watch_orders()
+                        )
+                        self._ws_last_message_ms = utc_ms()
+                    except Exception as e:
+                        logging.error("WS reconnect failed: %s", e)
+                        self._ws_reconnect_failures.append(utc_ms())
+                    # Exponential backoff: double threshold on each attempt, cap at max
+                    self._ws_watchdog_backoff = min(
+                        self._ws_watchdog_backoff * 2,
+                        self._ws_watchdog_backoff_max,
+                    )
+                    cutoff = utc_ms() - 3_600_000
+                    self._ws_reconnect_failures = [
+                        t for t in self._ws_reconnect_failures if t > cutoff
+                    ]
+                    if len(self._ws_reconnect_failures) >= 3:
+                        logging.error(
+                            "3+ WS reconnect failures in 1h — restarting bot"
+                        )
+                        await self.restart_bot()
+                elif (
+                    self._ws_last_message_ms > 0
+                    and utc_ms() - self._ws_last_message_ms <= 120_000
+                    and self._ws_watchdog_backoff > 120_000
+                ):
+                    # WS is healthy again — reset backoff
+                    self._ws_watchdog_backoff = 120_000
             except Exception as e:
                 logging.error(f"error with {get_function_name()} {e}")
                 traceback.print_exc()
@@ -1272,6 +1341,12 @@ class Passivbot(ExchangeInterface):
         last_position_changes = self.get_last_position_changes()
         symbols = set(self.trailing_prices) | set(last_position_changes) | set(self.active_symbols)
 
+        # Save previous trailing values so we can restore them on fetch failure
+        saved_trailing = {
+            sym: {ps: dict(b) for ps, b in sides.items()}
+            for sym, sides in self.trailing_prices.items()
+        }
+
         # Initialize containers for all symbols first
         for symbol in symbols:
             # Initialize containers
@@ -1312,7 +1387,7 @@ class Passivbot(ExchangeInterface):
             try:
                 results[sym] = await task
             except Exception as e:
-                logging.info(f"debug: failed to fetch candles for trailing {sym}: {e}")
+                logging.warning("failed to fetch candles for trailing %s: %s", sym, e)
                 results[sym] = None
 
         # Compute trailing metrics per symbol/side
@@ -1342,6 +1417,17 @@ class Passivbot(ExchangeInterface):
                         self.trailing_prices[symbol][pside]["max_since_min"] = max(
                             self.trailing_prices[symbol][pside]["max_since_min"], high
                         )
+
+        # Restore saved trailing values for any symbol/side still at defaults
+        for symbol in symbols:
+            if symbol not in saved_trailing:
+                continue
+            for pside in ("long", "short"):
+                current = self.trailing_prices[symbol][pside]
+                if current["min_since_open"] > 1e300:  # still at f64::MAX default
+                    saved = saved_trailing[symbol].get(pside)
+                    if saved and saved["min_since_open"] <= 1e300:
+                        self.trailing_prices[symbol][pside] = saved
 
     def symbol_is_eligible(self, symbol):
         """Return True when the symbol passes exchange-specific eligibility rules."""
@@ -1709,10 +1795,10 @@ class Passivbot(ExchangeInterface):
                     f"manage existing positions."
                 )
             else:
-                raise SystemExit(
-                    f"Balance too low: ${self.balance:.2f} < "
+                logging.warning(
+                    f"Balance too low for any entries: ${self.balance:.2f} < "
                     f"${worst['required_balance']:.2f} minimum required. "
-                    f"Increase balance or adjust strategy parameters."
+                    f"Will skip order creation until balance increases."
                 )
         elif failures:
             for f in failures:

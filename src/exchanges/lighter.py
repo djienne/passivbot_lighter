@@ -1313,7 +1313,7 @@ class LighterBot(Passivbot):
             # Use a lightweight REST call to measure offset
             root_api = lighter.RootApi(self.api_client)
             status = await root_api.status()
-            server_time = float(status.timestamp) if hasattr(status, "timestamp") else utc_ms()
+            server_time = float(status.timestamp) * 1000 if hasattr(status, "timestamp") else utc_ms()
             self.utc_offset = round((server_time - utc_ms()) / (1000 * 60 * 60)) * (
                 1000 * 60 * 60
             )
@@ -2502,6 +2502,7 @@ class LighterBot(Passivbot):
                 active_market_ids.add(self.market_id_map[sym])
         if not active_market_ids:
             active_market_ids = set(self.market_index_to_symbol.keys())
+        success_count = 0
 
         for mid in active_market_ids:
             try:
@@ -2511,6 +2512,7 @@ class LighterBot(Passivbot):
                     "auth": auth,
                 })
                 await ws.send(sub_msg)
+                success_count += 1
             except Exception as e:
                 logging.error(f"WS subscription failed for account_orders/{mid}: {e}")
 
@@ -2520,6 +2522,7 @@ class LighterBot(Passivbot):
                 "channel": f"account_all/{self.account_index}",
                 "auth": auth,
             }))
+            success_count += 1
         except Exception as e:
             logging.error(f"WS subscription failed for account_all: {e}")
 
@@ -2529,6 +2532,7 @@ class LighterBot(Passivbot):
                 "channel": f"user_stats/{self.account_index}",
                 "auth": auth,
             }))
+            success_count += 1
         except Exception as e:
             logging.error(f"WS subscription failed for user_stats: {e}")
 
@@ -2539,8 +2543,13 @@ class LighterBot(Passivbot):
                     "type": "subscribe",
                     "channel": f"ticker/{mid}",
                 }))
+                success_count += 1
             except Exception as e:
                 logging.error(f"WS subscription failed for ticker/{mid}: {e}")
+
+        if success_count == 0:
+            raise ConnectionError("All WS subscription sends failed — triggering reconnect")
+        logging.info("WS subscriptions sent: %d succeeded", success_count)
 
     async def _unsubscribe_ws_channels(self, ws):
         """Unsubscribe from all active market channels before re-subscribing."""
@@ -2646,6 +2655,7 @@ class LighterBot(Passivbot):
                             # to avoid spurious reconnections that waste auth tokens.
                             raw = await asyncio.wait_for(ws.recv(), timeout=300)
                             data = _json_loads(raw)
+                            self._ws_last_message_ms = utc_ms()
                             msg_type = data.get("type", "")
 
                             if msg_type == "ping":
@@ -2676,6 +2686,7 @@ class LighterBot(Passivbot):
                             break
 
             except Exception as e:
+                self._health_ws_reconnects += 1
                 logging.error(f"websocket connection error: {e}")
                 traceback.print_exc()
                 if self.stop_websocket:
