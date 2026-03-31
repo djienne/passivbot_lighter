@@ -357,32 +357,24 @@ class CandlestickManager:
     # ----- Retention helpers -----
 
     def _cleanup_stale_locks(self) -> None:
-        """Remove leftover lock files that are clearly stale."""
+        """Remove all lock files on startup — no other process holds them."""
         try:
-            base = Path(self.cache_dir) / self.exchange_name
+            base = Path(self.cache_dir)
         except Exception:
             return
         if not base.exists():
             return
-        now = time.time()
-        threshold = self._lock_stale_seconds
-        for lock_path in base.glob("*/locks/*.lock"):
+        removed = 0
+        for lock_path in base.rglob("*.lock"):
             try:
-                stat = lock_path.stat()
+                lock_path.unlink()
+                removed += 1
             except FileNotFoundError:
                 continue
             except Exception as exc:
-                self.log.warning("failed to stat lock %s during cleanup: %s", lock_path, exc)
-                continue
-            age = now - stat.st_mtime
-            if age > threshold:
-                try:
-                    lock_path.unlink()
-                    self.log.warning("removed stale candle lock %s (age %.1fs)", lock_path, age)
-                except FileNotFoundError:
-                    continue
-                except Exception as exc:
-                    self.log.error("failed to remove stale lock %s: %s", lock_path, exc)
+                self.log.error("failed to remove lock %s: %s", lock_path, exc)
+        if removed:
+            self.log.warning("removed %d stale lock files on startup", removed)
 
     async def _release_lock(
         self, lock: portalocker.Lock, path: str, symbol: str, timeframe: str

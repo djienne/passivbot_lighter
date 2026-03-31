@@ -916,10 +916,23 @@ class Passivbot(ExchangeInterface):
             try:
                 self.execution_scheduled = False
                 self.state_change_detected_by_symbol = set()
-                if not await self.update_pos_oos_pnls_ohlcvs():
+                try:
+                    update_ok = await asyncio.wait_for(
+                        self.update_pos_oos_pnls_ohlcvs(), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning("update_pos_oos_pnls_ohlcvs timed out after 60s")
+                    update_ok = False
+                if not update_ok:
                     await asyncio.sleep(0.5)
                     continue
-                res = await self.execute_to_exchange()
+                try:
+                    res = await asyncio.wait_for(
+                        self.execute_to_exchange(), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning("execute_to_exchange timed out after 60s")
+                    res = None
                 if self.debug_mode:
                     return res
                 await asyncio.sleep(float(self.live_value("execution_delay_seconds")))
