@@ -659,7 +659,8 @@ class LighterBot(Passivbot):
     async def _get_aiohttp_session(self):
         """Return a persistent aiohttp session, creating one if needed."""
         if self._aiohttp_session is None or self._aiohttp_session.closed:
-            self._aiohttp_session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+            self._aiohttp_session = aiohttp.ClientSession(timeout=timeout)
         return self._aiohttp_session
 
     # --- Auth token management ---
@@ -1353,8 +1354,11 @@ class LighterBot(Passivbot):
 
         info = None
         try:
-            info = await self.account_api.account(
-                by="index", value=str(self.account_index),
+            info = await asyncio.wait_for(
+                self.account_api.account(
+                    by="index", value=str(self.account_index),
+                ),
+                timeout=30.0,
             )
             if not info or not hasattr(info, "accounts") or not info.accounts:
                 logging.error("empty account response from Lighter")
@@ -1611,7 +1615,7 @@ class LighterBot(Passivbot):
 
         fetched = None
         try:
-            fetched = await self.order_api.order_books()
+            fetched = await asyncio.wait_for(self.order_api.order_books(), timeout=30.0)
             tickers = {}
             for ob in fetched.order_books:
                 symbol_base = ob.symbol.upper()
@@ -1846,15 +1850,18 @@ class LighterBot(Passivbot):
             reduce_only = bool(order.get("reduce_only", False))
 
             async with self._sdk_write_lock:
-                tx, tx_hash, err = await self.lighter_client.create_order(
-                    market_index=market_index,
-                    client_order_index=client_order_id,
-                    base_amount=raw_amount,
-                    price=raw_price,
-                    is_ask=is_ask,
-                    order_type=order_type,
-                    time_in_force=tif,
-                    reduce_only=reduce_only,
+                tx, tx_hash, err = await asyncio.wait_for(
+                    self.lighter_client.create_order(
+                        market_index=market_index,
+                        client_order_index=client_order_id,
+                        base_amount=raw_amount,
+                        price=raw_price,
+                        is_ask=is_ask,
+                        order_type=order_type,
+                        time_in_force=tif,
+                        reduce_only=reduce_only,
+                    ),
+                    timeout=30.0,
                 )
 
             if err:
@@ -1973,8 +1980,11 @@ class LighterBot(Passivbot):
                 self._order_cancel_events[exchange_order_id] = evt
 
                 try:
-                    resp = await self.lighter_client.send_tx(
-                        tx_type=tx_type, tx_info=tx_info
+                    resp = await asyncio.wait_for(
+                        self.lighter_client.send_tx(
+                            tx_type=tx_type, tx_info=tx_info
+                        ),
+                        timeout=30.0,
                     )
                     # Nonce consumed by successful send — don't roll back on later errors
                     nonce_acquired = False
@@ -2237,19 +2247,28 @@ class LighterBot(Passivbot):
             try:
                 if free_slot_mode and len(tx_types) == 1:
                     # Free-slot mode: single REST send_tx (0 quota cost)
-                    resp = await self.lighter_client.send_tx(
-                        tx_type=tx_types[0], tx_info=tx_infos[0]
+                    resp = await asyncio.wait_for(
+                        self.lighter_client.send_tx(
+                            tx_type=tx_types[0], tx_info=tx_infos[0]
+                        ),
+                        timeout=30.0,
                     )
                 else:
                     # Try WS first (bypasses 200 msg/min REST rate limit)
                     ws_resp = None
                     if self._tx_ws is not None and self._tx_ws.is_connected:
-                        ws_resp = await self._tx_ws.send_batch(tx_types, tx_infos)
+                        ws_resp = await asyncio.wait_for(
+                            self._tx_ws.send_batch(tx_types, tx_infos),
+                            timeout=30.0,
+                        )
 
                     if ws_resp is not None:
                         resp = _WsBatchResponse(ws_resp)
                     else:
-                        resp = await self.lighter_client.send_tx_batch(tx_types, tx_infos)
+                        resp = await asyncio.wait_for(
+                            self.lighter_client.send_tx_batch(tx_types, tx_infos),
+                            timeout=30.0,
+                        )
             except Exception as send_err:
                 logging.error(f"batch send error: {send_err}")
                 # Acknowledge all signed nonces before hard-refresh to keep
@@ -2418,13 +2437,19 @@ class LighterBot(Passivbot):
     # --- WebSocket ---
 
     async def _subscribe_ws_channels(self, ws, auth):
-        """Subscribe to all active market channels with the given auth token."""
+        """Subscribe to active market channels with the given auth token."""
         active_market_ids = set()
         for sym in self.active_symbols:
             if sym in self.market_id_map:
                 active_market_ids.add(self.market_id_map[sym])
+        # Fallback: use approved coins from config, not all 168 markets
+        if not active_market_ids and hasattr(self, "approved_coins_minus_ignored_coins"):
+            for pside_coins in self.approved_coins_minus_ignored_coins.values():
+                for sym in pside_coins:
+                    if sym in self.market_id_map:
+                        active_market_ids.add(self.market_id_map[sym])
         if not active_market_ids:
-            active_market_ids = set(self.market_index_to_symbol.keys())
+            logging.warning("WS subscribe: no active symbols or approved coins — skipping market channels")
         success_count = 0
 
         for mid in active_market_ids:
@@ -2475,13 +2500,16 @@ class LighterBot(Passivbot):
         logging.info("WS subscriptions sent: %d succeeded", success_count)
 
     async def _unsubscribe_ws_channels(self, ws):
-        """Unsubscribe from all active market channels before re-subscribing."""
+        """Unsubscribe from active market channels before re-subscribing."""
         active_market_ids = set()
         for sym in self.active_symbols:
             if sym in self.market_id_map:
                 active_market_ids.add(self.market_id_map[sym])
-        if not active_market_ids:
-            active_market_ids = set(self.market_index_to_symbol.keys())
+        if not active_market_ids and hasattr(self, "approved_coins_minus_ignored_coins"):
+            for pside_coins in self.approved_coins_minus_ignored_coins.values():
+                for sym in pside_coins:
+                    if sym in self.market_id_map:
+                        active_market_ids.add(self.market_id_map[sym])
 
         for mid in active_market_ids:
             try:

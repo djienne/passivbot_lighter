@@ -1197,7 +1197,14 @@ class Passivbot:
             try:
                 self.execution_scheduled = False
                 self.state_change_detected_by_symbol = set()
-                if not await self.update_pos_oos_pnls_ohlcvs():
+                try:
+                    update_ok = await asyncio.wait_for(
+                        self.update_pos_oos_pnls_ohlcvs(), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning("update_pos_oos_pnls_ohlcvs timed out after 60s")
+                    update_ok = False
+                if not update_ok:
                     await asyncio.sleep(0.5)
                     failed_update_pos_oos_pnls_ohlcvs_count += 1
                     if failed_update_pos_oos_pnls_ohlcvs_count > max_n_fails:
