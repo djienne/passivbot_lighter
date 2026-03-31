@@ -1211,7 +1211,13 @@ class Passivbot:
                         await self.restart_bot_on_too_many_errors()
                     continue
                 failed_update_pos_oos_pnls_ohlcvs_count = 0
-                res = await self.execute_to_exchange()
+                try:
+                    res = await asyncio.wait_for(
+                        self.execute_to_exchange(), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning("execute_to_exchange timed out after 60s")
+                    res = None
                 if self.debug_mode:
                     return res
                 # Periodic health summary
