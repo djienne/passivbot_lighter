@@ -22,11 +22,11 @@ Passivbot is a high-frequency market-making bot that places and cancels large nu
   <img src="account.png" alt="Lighter account type selection showing that Simple Trading Account should be used instead of Unified Trading Account (UTA)" width="900" />
 </p>
 
-v7.4.4
+v7.8.4
 
 ## Fork Overview
 
-> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (v7.4.4). It has been substantially reworked to run exclusively on [Lighter](https://lighter.xyz). It is **not a drop-in replacement** for upstream passivbot and is not compatible with the exchanges supported there (Binance, Bybit, Hyperliquid, etc.). If you want multi-exchange support, use the [upstream project](https://github.com/enarjord/passivbot).
+> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (v7.8.4). It has been substantially reworked to run exclusively on [Lighter](https://lighter.xyz). It is **not a drop-in replacement** for upstream passivbot and is not compatible with the exchanges supported there (Binance, Bybit, Hyperliquid, etc.). If you want multi-exchange support, use the [upstream project](https://github.com/enarjord/passivbot).
 
 Key changes from upstream:
 
