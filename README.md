@@ -56,7 +56,7 @@ For trailing entries, the bot waits for the price to move beyond a specified thr
 Grid and trailing orders may be combined, such that the robot enters or closes a whole or a part of the position as grid orders and/or as trailing orders.
 
 ### Forager
-The Forager feature dynamically chooses the most volatile markets on which to open positions. Volatility is defined as the mean of the normalized relative range for the most recent 1m candles, i.e. `mean((ohlcv.high - ohlcv.low) / ohlcv.close)`.
+The Forager feature dynamically chooses the most volatile markets on which to open positions. Volatility is defined as the EMA of the log range for the most recent 1m candles, i.e. `EMA(ln(high / low))`.
 
 ### Unstucking Mechanism
 Passivbot manages underperforming, or "stuck", positions by realizing small losses over time. If multiple positions are stuck, the bot prioritizes positions with the smallest gap between the entry price and current market price for "unstucking". Losses are limited by ensuring that the account balance does not fall under a set percentage below the past peak balance.
@@ -65,7 +65,8 @@ Passivbot manages underperforming, or "stuck", positions by realizing small loss
 
 ### Prerequisites
 - Linux (the `lighter` SDK requires Linux for signing; Windows users can use WSL)
-- Python 3.10
+- Python 3.12
+- Rust >= 1.90 (only needed when running without Docker; Docker builds Rust automatically)
 - Docker & Docker Compose (for containerized deployment)
 - A [Lighter](https://lighter.xyz) account with a private key
 
@@ -139,7 +140,7 @@ python src/main.py configs/hype_top.json
 ### Logging
 
 Passivbot uses Python's logging module throughout the bot, backtester, and supporting tools.
-- Use `--debug-level {0-3}` (alias `--log-level`) on `src/main.py` or `src/backtest.py` to adjust verbosity at runtime: `0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`.
+- Use `--log-level` on `src/main.py` or `src/backtest.py` to adjust verbosity at runtime. Accepts `warning`, `info`, `debug`, `trace` or numeric `0-3` (`0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`). You can also use `-v` / `--verbose` as a shorthand for `--log-level debug`.
 - Persist a default by adding a top-level section to your config: `"logging": {"level": 2}`. The CLI flag always overrides the config value for that run.
 - CandlestickManager and other subsystems inherit the chosen level so EMA warm-up, data fetching, and cache behaviour can be inspected consistently.
 
@@ -147,46 +148,10 @@ Passivbot uses Python's logging module throughout the bot, backtester, and suppo
 
 Running several Passivbot instances against the same exchange on one machine is supported. Each process shares the same on-disk OHLCV cache, and the candlestick manager now uses short-lived, self-healing locks with automatic stale cleanup so that one stalled process cannot block the rest. No manual deletion of lock files is required; the bot removes stale locks on startup and logs whenever a lock acquisition times out.
 
-## Dry-Run (Paper Trading) Mode
-
-Passivbot supports a dry-run mode that simulates trading in-memory against live market data, without placing real orders. This is useful for testing configs before committing real funds.
-
-### Enabling Dry-Run Mode
-
-Add these two keys to the `live` section of your config JSON:
-
-```json
-"live": {
-    "dry_run": true,
-    "dry_run_wallet": 10000.0,
-    ...
-}
-```
-
-- `dry_run` — set to `true` to activate paper trading.
-- `dry_run_wallet` — starting simulated balance (default: 10000.0 USDC).
-- Dry-run reserves margin across existing positions and pending entry orders, so impossible overlapping entries are rejected before or at fill time.
-- Dry-run uses mark-to-market equity for margin availability with entry-price fallback when fresh marks are unavailable.
-- Market orders use taker fees, validate against the fetched execution price, and are rejected if no fresh price is available.
-
-Then run normally:
-
-```bash
-python src/main.py configs/your_config.json
-```
-
-You should see `[DRY RUN] Paper trading mode active` and `[DRY RUN] paper wallet initialised at 10000.0 USDC` in the logs. No real API credentials are required in dry-run mode.
-
-### Switching to Real Trading
-
-1. Edit `api-keys.json` with your real Lighter credentials (private key, account index, and API key index from your Lighter account).
-2. Set `"dry_run": false` (or remove the key entirely) in your config.
-3. Restart the bot.
-
 ## Requirements
 
-- Python 3.10
-- Rust >= 1.90 (for building the high-performance backtesting extension)
+- Python 3.12
+- Rust >= 1.90 (for building the backtesting extension; handled automatically when using Docker)
 - [requirements-live.txt](requirements-live.txt) dependencies
 
 ## Pre-optimized configurations
