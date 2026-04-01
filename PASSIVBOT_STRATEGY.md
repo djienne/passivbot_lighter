@@ -33,7 +33,7 @@ Passivbot is an automated cryptocurrency trading bot designed for perpetual futu
 
 ### Supported Exchanges
 
-Binance, Bybit, Bitget, OKX, GateIO, Hyperliquid.
+Lighter.
 
 ### Architecture
 
@@ -110,7 +110,7 @@ alpha = 2 / (span + 1)
 next_EMA = prev_EMA * (1 - alpha) + new_value * alpha
 ```
 
-Passivbot uses a bias-corrected variant internally (adjusted EMA) to handle warm-up periods correctly. See `update_adjusted_ema` in `passivbot-rust/src/backtest.rs:127`.
+Passivbot uses a bias-corrected variant internally (adjusted EMA) to handle warm-up periods correctly. See `update_adjusted_ema` in `passivbot-rust/src/backtest.rs`.
 
 ### EMA Bands
 
@@ -121,7 +121,7 @@ ema_band_upper = max(ema_0, ema_1, ema_2)
 ema_band_lower = min(ema_0, ema_1, ema_2)
 ```
 
-These bands are computed separately for long and short sides (each side has its own `ema_span_0`/`ema_span_1`). See `EMAs::compute_bands` in `passivbot-rust/src/backtest.rs:94`.
+These bands are computed separately for long and short sides (each side has its own `ema_span_0`/`ema_span_1`). See `EMAs::compute_bands` in `passivbot-rust/src/backtest.rs`.
 
 ### Usage
 
@@ -136,7 +136,7 @@ Note: `entry_initial_ema_dist` is typically negative, placing the initial entry 
 
 ## 4. Entry Logic
 
-Entry orders are managed by `calc_next_entry_long` / `calc_next_entry_short` in `passivbot-rust/src/entries.rs:342` / `entries.rs:898`.
+Entry orders are managed by `calc_next_entry_long` / `calc_next_entry_short` in `passivbot-rust/src/entries.rs`.
 
 ### 4.1 Initial Entry
 
@@ -156,7 +156,7 @@ initial_entry_qty = max(
 )
 ```
 
-See `calc_initial_entry_qty` in `entries.rs:9` and `calc_ema_price_bid`/`calc_ema_price_ask` in `utils.rs:235`/`utils.rs:247`.
+See `calc_initial_entry_qty` in `entries.rs` and `calc_ema_price_bid`/`calc_ema_price_ask` in `utils.rs`.
 
 ### 4.2 Grid Re-entries
 
@@ -186,9 +186,9 @@ reentry_qty = max(
 )
 ```
 
-The re-entry qty is always at least as large as the initial entry qty. See `calc_reentry_price_bid` at `entries.rs:112` and `calc_reentry_qty` at `entries.rs:87`.
+The re-entry qty is always at least as large as the initial entry qty. See `calc_reentry_price_bid` and `calc_reentry_qty` in `entries.rs`.
 
-**Cropping and inflation**: If a re-entry would exceed the wallet exposure limit, it is cropped. If the *next* re-entry after the current one would be too small (< 25% of the double-down factor), the current re-entry is inflated to fill the remaining exposure budget. See `calc_grid_entry_long` at `entries.rs:180`.
+**Cropping and inflation**: If a re-entry would exceed the wallet exposure limit, it is cropped. If the *next* re-entry after the current one would be too small (< 25% of the double-down factor), the current re-entry is inflated to fill the remaining exposure budget. See `calc_grid_entry_long` in `entries.rs`.
 
 ### 4.3 Trailing Entries
 
@@ -202,7 +202,7 @@ Trailing entries use a two-condition trigger system based on price tracking sinc
 | `threshold > 0, retracement <= 0` | Always placed as limit | N/A | `min(bid, pos_price * (1 - threshold_pct))` |
 | `threshold > 0, retracement > 0` | `min_since_open < pos_price * (1 - threshold_pct)` | `max_since_min > min_since_open * (1 + retracement_pct)` | `min(bid, pos_price * (1 - threshold + retracement))` |
 
-The trailing price tracker resets on every position change (entry or partial close). Tracking is based on 1-minute OHLCV candles. See `calc_trailing_entry_long` at `entries.rs:442`.
+The trailing price tracker resets on every position change (entry or partial close). Tracking is based on 1-minute OHLCV candles. See `calc_trailing_entry_long` in `entries.rs`.
 
 The trailing entry uses `entry_trailing_double_down_factor` instead of `entry_grid_double_down_factor` for sizing.
 
@@ -217,17 +217,17 @@ The `entry_trailing_grid_ratio` controls how the position is built:
 | `> 0` (e.g. `0.3`) | Trailing first until 30% of exposure filled, then grid for the rest |
 | `< 0` (e.g. `-0.9`) | Grid first until (1 - 0.9) = 10% of exposure filled, then trailing for the rest |
 
-See `calc_next_entry_long` at `entries.rs:342` for the branching logic.
+See `calc_next_entry_long` in `entries.rs` for the branching logic.
 
 ---
 
 ## 5. Exit Logic
 
-Close orders are managed by `calc_next_close_long` / `calc_next_close_short` in `passivbot-rust/src/closes.rs:220` / `closes.rs:534`.
+Close orders are managed by `calc_next_close_long` / `calc_next_close_short` in `passivbot-rust/src/closes.rs`.
 
 ### 5.1 Auto-Reduce (Enforce Exposure Limit)
 
-Before any grid/trailing close logic, if `enforce_exposure_limit = true` and the position's wallet exposure exceeds the limit by more than 1%, the bot places a market-price close order to reduce the position back to within limits. This protects against balance withdrawals or config changes. See `closes.rs:242`.
+Before any grid/trailing close logic, if `enforce_exposure_limit = true` and the position's wallet exposure exceeds the limit by more than 1%, the bot places a market-price close order to reduce the position back to within limits. This protects against balance withdrawals or config changes. See `calc_next_close_long` in `closes.rs`.
 
 ### 5.2 Grid Close (Take Profit)
 
@@ -255,7 +255,7 @@ close_qty = min(position_size, max(min_entry_qty, round_up(full_psize * close_gr
 Where `full_psize = cost_to_qty(balance * wallet_exposure_limit, pos_price, c_mult)` and `leftover = max(0, position_size - full_psize)`.
 
 **Price selection based on exposure ratio:**
-The active close price walks from `markup_start` toward `markup_end` proportionally to `wallet_exposure / wallet_exposure_limit`. If the position exceeds full size, closing begins at the price closest to the position price (minimum markup). See `calc_grid_close_long` at `closes.rs:43`.
+The active close price walks from `markup_start` toward `markup_end` proportionally to `wallet_exposure / wallet_exposure_limit`. If the position exceeds full size, closing begins at the price closest to the position price (minimum markup). See `calc_grid_close_long` in `closes.rs`.
 
 ### 5.3 Trailing Close
 
@@ -269,7 +269,7 @@ Trailing closes mirror the entry trailing logic but in the profitable direction:
 | `threshold > 0, retracement <= 0` | Always placed as limit | N/A | `max(ask, pos_price * (1 + threshold_pct))` |
 | `threshold > 0, retracement > 0` | `max_since_open > pos_price * (1 + threshold_pct)` | `min_since_max < max_since_open * (1 - retracement_pct)` | `max(ask, pos_price * (1 + threshold - retracement))` |
 
-See `calc_trailing_close_long` at `closes.rs:121`.
+See `calc_trailing_close_long` in `closes.rs`.
 
 ### 5.4 Grid/Trailing Close Blending (`close_trailing_grid_ratio`)
 
@@ -282,7 +282,7 @@ Works identically to entry blending:
 | `> 0` (e.g. `0.3`) | Trailing close for first 30% of position, then grid close for the rest |
 | `< 0` (e.g. `-0.8`) | Grid close for first 20% of position, then trailing close for the rest |
 
-When blending, the non-active portion of the position is reserved. For example, with `close_trailing_grid_ratio = 0.3`, the grid close only sees 70% of the position size, leaving 30% for trailing close. See `calc_next_close_long` at `closes.rs:220`.
+When blending, the non-active portion of the position is reserved. For example, with `close_trailing_grid_ratio = 0.3`, the grid close only sees 70% of the position size, leaving 30% for trailing close. See `calc_next_close_long` in `closes.rs`.
 
 ### 5.5 Unstuck Mechanism
 
@@ -301,7 +301,7 @@ drop_since_peak_pct = balance / balance_peak - 1
 allowance = max(0, balance_peak * (loss_allowance_pct * total_wallet_exposure_limit + drop_since_peak_pct))
 ```
 
-See `calc_auto_unstuck_allowance` in `utils.rs:222`.
+See `calc_auto_unstuck_allowance` in `utils.rs`.
 
 **Unstuck close price:**
 ```
@@ -311,7 +311,7 @@ short: round_dn(ema_band_lower * (1 - unstuck_ema_dist), price_step)
 
 **Close quantity:** Based on `unstuck_close_pct * wallet_exposure_limit * balance`, capped by the allowance.
 
-**Priority:** When multiple positions are stuck, the position with the smallest price-action distance (closest to being profitable) is unstucked first. See `calc_unstucking_close` in `backtest.rs:1469`.
+**Priority:** When multiple positions are stuck, the position with the smallest price-action distance (closest to being profitable) is unstucked first.
 
 ### 5.6 Panic Close
 
@@ -330,7 +330,7 @@ Located under `config.backtest`.
 | `base_dir` | string | Directory to save backtest results |
 | `compress_cache` | bool | `true` saves disk space; `false` enables faster loading |
 | `end_date` | string | End date of backtest (e.g. `"2024-06-23"` or `"now"`) |
-| `exchanges` | list | Exchanges for OHLCV data: `binance`, `bybit`, `gateio`, `bitget`, `hyperliquid` |
+| `exchanges` | list | Exchanges for OHLCV data: `binance`, `bybit`, `gateio`, `bitget` |
 | `start_date` | string | Start date of backtest |
 | `starting_balance` | float | Starting balance in USD (backtest only, not used in live) |
 | `use_btc_collateral` | bool | Simulate BTC-denominated accounting (buy BTC with profits, go into USD debt on losses) |
@@ -417,9 +417,9 @@ If `close_grid_qty_pct >= 1.0` or `< 0`, a single TP order is placed at `markup_
 
 | Parameter | Type | Range | Description |
 |-----------|------|-------|-------------|
-| `filter_volume_drop_pct` | float | [0.5, 1] | Drop this % of lowest-volume coins. `0` = allow all. |
-| `filter_volume_ema_span` | float | [360, 2880] | EMA span (minutes) for smoothing volume ranking. |
-| `filter_log_range_ema_span` | float | [10, 360] | EMA span (minutes) for smoothing log-range volatility ranking. |
+| `filter_volume_drop_pct` | float | [0, 1] | Drop this % of lowest-volume coins. `0` = allow all. |
+| `filter_volume_ema_span` | float | [10, 1440] | EMA span (minutes) for smoothing volume ranking. |
+| `filter_log_range_ema_span` | float | [10, 1440] | EMA span (minutes) for smoothing log-range volatility ranking. |
 
 ### 6.11 Live Trading Settings
 
@@ -439,12 +439,12 @@ Located under `config.live`.
 | `max_n_cancellations_per_batch` | int | `5` | Max order cancellations per execution cycle. |
 | `max_n_creations_per_batch` | int | `3` | Max new orders per execution cycle. |
 | `max_n_restarts_per_day` | int | `10` | Auto-restart limit on crashes. |
-| `minimum_coin_age_days` | int | `180` | Ignore coins listed less than N days. |
+| `minimum_coin_age_days` | int | `7` | Ignore coins listed less than N days. |
 | `pnls_max_lookback_days` | int | `30` | PnL history fetch window. |
 | `price_distance_threshold` | float | `0.002` | Min distance to market for EMA-based limit orders. |
 | `time_in_force` | string | `"good_till_cancelled"` | Order TIF policy. |
 | `user` | string | - | API key identifier from `api-keys.json`. |
-| `max_memory_candles_per_symbol` | int | `200000` | Max 1m candles retained in RAM per symbol. |
+| `max_memory_candles_per_symbol` | int | `20000` | Max 1m candles retained in RAM per symbol. |
 | `max_disk_candles_per_symbol_per_tf` | int | `2000000` | Max candles persisted on disk per symbol/timeframe. |
 | `memory_snapshot_interval_minutes` | int | `30` | Interval between memory telemetry snapshots. |
 | `max_warmup_minutes` | int | `0` | Hard ceiling on warmup window. `0` = uncapped. |
@@ -459,7 +459,7 @@ Allows per-coin configuration overrides. Format: `{"COIN": {overrides}}`.
 **Eligible override parameters:**
 
 Bot parameters (per long/short):
-`close_grid_markup_end`, `close_grid_markup_start`, `close_grid_qty_pct`, `close_trailing_grid_ratio`, `close_trailing_qty_pct`, `close_trailing_retracement_pct`, `close_trailing_threshold_pct`, `ema_span_0`, `ema_span_1`, `enforce_exposure_limit`, `entry_grid_double_down_factor`, `entry_grid_spacing_pct`, `entry_grid_spacing_we_weight`, `entry_grid_spacing_log_weight`, `entry_grid_spacing_log_span_hours`, `entry_initial_ema_dist`, `entry_initial_qty_pct`, `entry_trailing_double_down_factor`, `entry_trailing_grid_ratio`, `entry_trailing_retracement_pct`, `entry_trailing_threshold_pct`, `unstuck_close_pct`, `unstuck_ema_dist`, `unstuck_threshold`, `wallet_exposure_limit`
+`close_grid_markup_end`, `close_grid_markup_start`, `close_grid_qty_pct`, `close_trailing_grid_ratio`, `close_trailing_qty_pct`, `close_trailing_retracement_pct`, `close_trailing_threshold_pct`, `ema_span_0`, `ema_span_1`, `entry_grid_double_down_factor`, `entry_grid_spacing_pct`, `entry_grid_spacing_we_weight`, `entry_grid_spacing_volatility_weight`, `entry_initial_ema_dist`, `entry_initial_qty_pct`, `entry_trailing_double_down_factor`, `entry_trailing_grid_ratio`, `entry_trailing_retracement_pct`, `entry_trailing_retracement_volatility_weight`, `entry_trailing_retracement_we_weight`, `entry_trailing_threshold_pct`, `entry_trailing_threshold_volatility_weight`, `entry_trailing_threshold_we_weight`, `entry_volatility_ema_span_hours`, `unstuck_close_pct`, `unstuck_ema_dist`, `unstuck_threshold`, `wallet_exposure_limit`
 
 Live parameters:
 `forced_mode_long`, `forced_mode_short`, `leverage`
@@ -483,14 +483,14 @@ Located under `config.optimize`.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `bounds` | object | - | Min/max ranges for each optimizable parameter. Format: `{param_name: [min, max]}`. |
-| `iters` | int | `300000` | Number of backtests per optimization run. |
-| `n_cpus` | int | `2` | Parallel CPU cores. |
-| `population_size` | int | `300` | GA population size. |
-| `scoring` | list | `["mdg", "sharpe_ratio"]` | Objective metrics for multi-objective optimization. |
+| `iters` | int | `30000` | Number of backtests per optimization run. |
+| `n_cpus` | int | `5` | Parallel CPU cores. |
+| `population_size` | int | `1000` | GA population size. |
+| `scoring` | list | `["adg", "sharpe_ratio"]` | Objective metrics for multi-objective optimization. |
 | `limits` | object | `{}` | Penalty thresholds. Format: `{penalize_if_greater_than_X: val}`. |
-| `crossover_probability` | float | `0.64` | Probability of crossover between two individuals. |
+| `crossover_probability` | float | `0.7` | Probability of crossover between two individuals. |
 | `crossover_eta` | float | `20.0` | SBX crowding factor. Lower = more exploration. |
-| `mutation_probability` | float | `0.34` | Probability of mutating an individual. |
+| `mutation_probability` | float | `0.45` | Probability of mutating an individual. |
 | `mutation_eta` | float | `20.0` | Polynomial mutation crowding factor. |
 | `mutation_indpb` | float | `0` | Per-attribute mutation probability. `0` = auto-scale to `1/n_params`. |
 | `offspring_multiplier` | float | `1.0` | Offspring count = `population_size * multiplier`. |
@@ -549,7 +549,7 @@ effective_n_positions = min(n_positions, eligible_coins)
 dynamic_WEL = total_wallet_exposure_limit / effective_n_positions
 ```
 
-See `update_n_positions_and_wallet_exposure_limits` in `backtest.rs:542`.
+See `update_n_positions_and_wallet_exposure_limits` in `backtest.rs`.
 
 ### 7.6 Minimum Balance
 
@@ -574,7 +574,7 @@ When `n_positions` is set and `approved_coins` allows multiple coins, passivbot 
 
 3. **Active set**: Currently held positions are always included in the active set (never dropped mid-trade). Remaining slots are filled from the ranked candidates.
 
-See `calc_preferred_coins`, `filter_by_relative_volume`, and `rank_by_log_range` in `backtest.rs:645`.
+See `select_coins`, `select_by_volume`, and `select_by_volatility` in `coin_selection.rs`.
 
 ### EMA-Based Indicators
 
@@ -645,7 +645,7 @@ The full list of available scoring metrics:
 | `equity_jerkiness`, `equity_jerkiness_w` | Normalized mean absolute second derivative |
 | `exponential_fit_error`, `exponential_fit_error_w` | MSE from log-linear equity fit |
 
-**Suffix `_w`:** Mean across 10 overlapping temporal subsets (full, last 1/2, last 1/3, ..., last 1/10), biasing toward recent performance. See `analyze_backtest` in `analysis.rs:367`.
+**Suffix `_w`:** Mean across 10 overlapping temporal subsets (full, last 1/2, last 1/3, ..., last 1/10), biasing toward recent performance. See `analyze_backtest` in `analysis.rs`.
 
 **Prefix `btc_`:** BTC-denominated variants when `use_btc_collateral = true`.
 
@@ -750,7 +750,7 @@ alpha = 2 / (span + 1)
 EMA_new = EMA_prev * (1 - alpha) + value * alpha
 ```
 
-Source: `passivbot-rust/src/backtest.rs:127` (bias-corrected variant)
+Source: `update_adjusted_ema` in `passivbot-rust/src/backtest.rs` (bias-corrected variant)
 
 ### Wallet Exposure
 
@@ -758,7 +758,7 @@ Source: `passivbot-rust/src/backtest.rs:127` (bias-corrected variant)
 wallet_exposure = (position_size * position_price * c_mult) / balance
 ```
 
-Source: `passivbot-rust/src/utils.rs:112`
+Source: `calc_wallet_exposure` in `passivbot-rust/src/utils.rs`
 
 ### Initial Entry Quantity
 
@@ -766,7 +766,7 @@ Source: `passivbot-rust/src/utils.rs:112`
 qty = max(min_entry_qty, round(balance * WEL * entry_initial_qty_pct / price, qty_step))
 ```
 
-Source: `passivbot-rust/src/entries.rs:9`
+Source: `calc_initial_entry_qty` in `passivbot-rust/src/entries.rs`
 
 ### Grid Re-entry Price (Long)
 
@@ -775,7 +775,7 @@ multiplier = 1 + (WE / WEL) * we_weight + grid_log_range * log_weight
 price = min(round_dn(pos_price * (1 - spacing_pct * max(0, multiplier)), price_step), bid)
 ```
 
-Source: `passivbot-rust/src/entries.rs:112`
+Source: `calc_reentry_price_bid` in `passivbot-rust/src/entries.rs`
 
 ### Grid Re-entry Quantity
 
@@ -783,7 +783,7 @@ Source: `passivbot-rust/src/entries.rs:112`
 qty = max(min_entry_qty, round(max(pos_size * ddf, balance * WEL * initial_qty_pct / price), qty_step))
 ```
 
-Source: `passivbot-rust/src/entries.rs:87`
+Source: `calc_reentry_qty` in `passivbot-rust/src/entries.rs`
 
 ### New Position Price (Weighted Average)
 
@@ -792,7 +792,7 @@ new_psize = round(old_psize + entry_qty, qty_step)
 new_pprice = old_pprice * (old_psize / new_psize) + entry_price * (entry_qty / new_psize)
 ```
 
-Source: `passivbot-rust/src/utils.rs:140`
+Source: `calc_new_psize_pprice` in `passivbot-rust/src/utils.rs`
 
 ### Close Quantity
 

@@ -32,5 +32,10 @@ All parameters live under `config.bot.long` / `config.bot.short` (each side is c
 | 26 | Unstuck | `unstuck_ema_dist` | float | −0.1 – 0.01 | Distance from EMA band for the unstuck close price. For longs: `ema_band_upper × (1 + unstuck_ema_dist)`. Near zero = closes around current "fair value." |
 | 27 | Unstuck | `unstuck_loss_allowance_pct` | float | 0.001 – 0.05 | Maximum cumulative loss the unstuck system may realize, as a fraction of peak balance scaled by TWEL. Acts as a budget for loss-taking across all stuck positions. |
 | 28 | Filter | `filter_volume_drop_pct` | float | 0 – 1.0 | Drop this fraction of lowest-volume coins from trading. `0` = no filter. E.g. `0.3` = exclude bottom 30% by volume. |
-| 29 | Filter | `filter_volume_ema_span` | float | 360 – 2880 | EMA span in minutes for smoothing the volume ranking signal. Longer = more stable ranking, shorter = more reactive to recent volume changes. |
-| 30 | Filter | `filter_log_range_ema_span` | float | 10 – 360 | EMA span in minutes for smoothing the log-range volatility ranking. After volume filtering, the top `n_positions` most volatile coins are selected. |
+| 29 | Filter | `filter_volume_ema_span` | float | 10 – 1440 | EMA span in minutes for smoothing the volume ranking signal. Longer = more stable ranking, shorter = more reactive to recent volume changes. |
+| 30 | Filter | `filter_log_range_ema_span` | float | 10 – 1440 | EMA span in minutes for smoothing the log-range volatility ranking. After volume filtering, the top `n_positions` most volatile coins are selected. |
+| 31 | Filter | `filter_volatility_drop_pct` | float | 0 – 1.0 | Drop this fraction of lowest-volatility coins from trading. `0` = no filter. Complements volume filtering. |
+| 32 | Trailing Entry | `entry_trailing_retracement_volatility_weight` | float | 0 – 400 | How much market volatility scales the trailing entry retracement distance. `0` = disabled. |
+| 33 | Trailing Entry | `entry_trailing_retracement_we_weight` | float | 0 – 20 | How much current wallet exposure scales the trailing entry retracement distance. |
+| 34 | Trailing Entry | `entry_trailing_threshold_volatility_weight` | float | 0 – 400 | How much market volatility scales the trailing entry threshold distance. `0` = disabled. |
+| 35 | Trailing Entry | `entry_trailing_threshold_we_weight` | float | 0 – 20 | How much current wallet exposure scales the trailing entry threshold distance. |
