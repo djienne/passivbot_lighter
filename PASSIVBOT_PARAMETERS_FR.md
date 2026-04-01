@@ -32,5 +32,10 @@ Tous les paramètres se trouvent sous `config.bot.long` / `config.bot.short` (ch
 | 26 | Unstuck | `unstuck_ema_dist` | float | −0.1 – 0.01 | Distance depuis la bande EMA pour le prix de clôture unstuck. Pour les longs : `ema_band_upper × (1 + unstuck_ema_dist)`. Proche de zéro = clôtures autour de la « juste valeur ». |
 | 27 | Unstuck | `unstuck_loss_allowance_pct` | float | 0.001 – 0.05 | Perte cumulée maximale que le système unstuck peut réaliser, en fraction du solde pic pondérée par TWEL. Budget de perte pour toutes les positions coincées. |
 | 28 | Filtre | `filter_volume_drop_pct` | float | 0 – 1.0 | Exclure cette fraction des coins à plus faible volume. `0` = aucun filtre. Ex. `0.3` = exclure les 30% les moins échangés. |
-| 29 | Filtre | `filter_volume_ema_span` | float | 360 – 2880 | Période EMA en minutes pour lisser le classement par volume. Plus long = classement plus stable, plus court = plus réactif aux changements récents. |
-| 30 | Filtre | `filter_log_range_ema_span` | float | 10 – 360 | Période EMA en minutes pour lisser le classement par volatilité log-range. Après filtrage par volume, les `n_positions` coins les plus volatils sont sélectionnés. |
+| 29 | Filtre | `filter_volume_ema_span` | float | 10 – 1440 | Période EMA en minutes pour lisser le classement par volume. Plus long = classement plus stable, plus court = plus réactif aux changements récents. |
+| 30 | Filtre | `filter_log_range_ema_span` | float | 10 – 1440 | Période EMA en minutes pour lisser le classement par volatilité log-range. Après filtrage par volume, les `n_positions` coins les plus volatils sont sélectionnés. |
+| 31 | Filtre | `filter_volatility_drop_pct` | float | 0 – 1.0 | Exclure cette fraction des coins les moins volatils. `0` = aucun filtre. Complète le filtrage par volume. |
+| 32 | Entrée Trailing | `entry_trailing_retracement_volatility_weight` | float | 0 – 400 | Influence de la volatilité du marché sur la distance de retracement d'entrée trailing. `0` = désactivé. |
+| 33 | Entrée Trailing | `entry_trailing_retracement_we_weight` | float | 0 – 20 | Influence de l'exposition courante sur la distance de retracement d'entrée trailing. |
+| 34 | Entrée Trailing | `entry_trailing_threshold_volatility_weight` | float | 0 – 400 | Influence de la volatilité du marché sur la distance du seuil d'entrée trailing. `0` = désactivé. |
+| 35 | Entrée Trailing | `entry_trailing_threshold_we_weight` | float | 0 – 20 | Influence de l'exposition courante sur la distance du seuil d'entrée trailing. |
