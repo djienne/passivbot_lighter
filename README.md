@@ -90,6 +90,38 @@ Edit `api-keys.json` — find the `lighter_01` entry and set:
 - `account_index` — your Lighter account index (visible in the Lighter UI)
 - `api_key_index` — your API key index (from Lighter key management)
 
+#### Finding your account index
+
+To find the `account_index` for your main account or sub-accounts, query the Lighter REST API with your L1 (wallet) address:
+
+```
+GET https://mainnet.zklighter.elliot.ai/api/v1/account?by=l1_address&value=<YOUR_L1_ADDRESS>
+```
+
+The response contains an `accounts` array listing every account tied to that address. Here is what to look for:
+
+```json
+{
+  "accounts": [
+    {
+      "account_type": 0,
+      "account_index": 107607,
+      "collateral": "0.002856",
+      ...
+    },
+    {
+      "account_type": 1,
+      "account_index": 281474976687926,
+      "collateral": "719.860000",
+      ...
+    }
+  ]
+}
+```
+
+- **`account_type`** — `0` = main account, `1` = sub-account (Simple Trading Account).
+- **`account_index`** — the value to put in `api-keys.json`. Pick the sub-account (`account_type: 1`) that holds your trading funds (check `collateral` > 0).
+
 ### 3. Run with Docker (recommended)
 
 ```bash
