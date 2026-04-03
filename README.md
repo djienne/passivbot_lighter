@@ -89,7 +89,7 @@ cp api-keys.json.example api-keys.json
 Edit `api-keys.json` — find the `lighter_01` entry and set:
 - `private_key` — your Lighter wallet private key
 - `account_index` — your Lighter account index (visible in the Lighter UI)
-- `api_key_index` — your API key index (from Lighter key management)
+- `api_key_index` — your API key index (from Lighter key management). **Use a value above 10** to avoid conflicts with indices reserved by the Lighter system.
 
 #### Finding your account index
 
