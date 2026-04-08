@@ -5738,7 +5738,11 @@ async def main():
     user_info = load_user_info(require_live_value(config, "user"))
     # Reconfigure logging with exchange prefix now that we know the exchange
     exchange_prefix = user_info["exchange"]
-    configure_logging(debug=effective_log_level, prefix=exchange_prefix)
+    configure_logging(
+        debug=effective_log_level,
+        prefix=exchange_prefix,
+        debug_log_file="logs/passivbot_debug.log",
+    )
     await load_markets(user_info["exchange"], verbose=True)
 
     config = parse_overrides(config, verbose=True)
