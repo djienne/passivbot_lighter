@@ -66,6 +66,9 @@ def _is_transient_error(exc) -> bool:
 
     Note: quota errors are intentionally excluded; use ``_is_quota_error`` for those.
     """
+    # Catch asyncio/builtin TimeoutError by type (str() is often empty)
+    if isinstance(exc, (TimeoutError, OSError)):
+        return True
     msg = str(exc).lower()
     if "429" in msg or "too many" in msg or "invalid nonce" in msg:
         return True
