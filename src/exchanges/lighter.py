@@ -753,6 +753,7 @@ class LighterBot(Passivbot):
 
     def _record_api_failure(self, exc, context=""):
         """Track consecutive API failures with throttled logging."""
+        logging.debug("API failure traceback (%s):\n%s", context, traceback.format_exc())
         now = time.monotonic()
         self._api_consecutive_failures += 1
         if self._api_consecutive_failures == 1:
@@ -1486,7 +1487,7 @@ class LighterBot(Passivbot):
                     self._trigger_global_backoff()
                 if info:
                     print_async_exception(info)
-                traceback.print_exc()
+                logging.debug(traceback.format_exc())
             return False
 
     async def fetch_positions(self):
@@ -1643,7 +1644,7 @@ class LighterBot(Passivbot):
                 logging.warning(f"transient error fetching open orders ({type(e).__name__}); will retry automatically")
             else:
                 logging.error(f"error fetching open orders: {e}")
-                traceback.print_exc()
+                logging.debug(traceback.format_exc())
             return False
 
     async def fetch_tickers(self):
@@ -1700,7 +1701,7 @@ class LighterBot(Passivbot):
                     self._trigger_global_backoff()
                 if fetched:
                     print_async_exception(fetched)
-                traceback.print_exc()
+                logging.debug(traceback.format_exc())
             return False
 
     async def update_tickers(self):
@@ -1794,7 +1795,7 @@ class LighterBot(Passivbot):
                 self._record_api_failure(e, f"fetch_ohlcv({symbol})")
             else:
                 logging.error(f"error fetching ohlcv for {symbol}: {e}")
-                traceback.print_exc()
+                logging.debug(traceback.format_exc())
             return []
 
     async def fetch_ohlcvs_1m(self, symbol, since=None, limit=None, **kwargs):
@@ -1816,7 +1817,7 @@ class LighterBot(Passivbot):
                 self._record_api_failure(e, f"fetch_ohlcvs_1m({symbol})")
             else:
                 logging.error(f"error fetching ohlcvs_1m for {symbol}: {e}")
-                traceback.print_exc()
+                logging.debug(traceback.format_exc())
             return []
 
     async def fetch_pnls(self, start_time=None, end_time=None, limit=None):
@@ -1991,7 +1992,7 @@ class LighterBot(Passivbot):
                 self._record_api_failure(e, "fetch_pnls")
             else:
                 logging.error(f"error fetching pnls: {e}")
-                traceback.print_exc()
+                logging.debug(traceback.format_exc())
             return []
 
     # --- Order execution ---
@@ -2080,7 +2081,7 @@ class LighterBot(Passivbot):
         except Exception as e:
             logging.error(f"error executing order {order}: {e}")
             self._handle_nonce_error(e)
-            traceback.print_exc()
+            logging.debug(traceback.format_exc())
             return {}
 
     async def execute_cancellation(self, order: dict) -> dict:
@@ -2227,7 +2228,7 @@ class LighterBot(Passivbot):
             if nonce_acquired:
                 self._acknowledge_nonce_failure(api_key_idx)
             self._handle_nonce_error(e, api_key_idx)
-            traceback.print_exc()
+            logging.debug(traceback.format_exc())
             return {}
 
     def did_create_order(self, executed) -> bool:
@@ -2819,7 +2820,7 @@ class LighterBot(Passivbot):
             except Exception as e:
                 self._health_ws_reconnects += 1
                 logging.error(f"websocket connection error: {e}")
-                traceback.print_exc()
+                logging.debug(traceback.format_exc())
                 if self.stop_websocket:
                     break
                 jitter = ws_backoff * random.uniform(-0.2, 0.2)
@@ -2928,7 +2929,7 @@ class LighterBot(Passivbot):
                 self.handle_order_update(parsed)
         except Exception as e:
             logging.error(f"error handling ws order update: {e}")
-            traceback.print_exc()
+            logging.debug(traceback.format_exc())
 
     def _handle_ws_account_update(self, data):
         """Parse WS account_all update for positions and cache them."""

@@ -113,6 +113,7 @@ def configure_logging(
     fmt: Optional[str] = None,
     datefmt: str = DEFAULT_DATEFMT,
     prefix: Optional[str] = None,
+    debug_log_file: Optional[str] = None,
 ) -> None:
     """Initialise the root logger based on Passivbot's debug settings.
 
@@ -126,6 +127,8 @@ def configure_logging(
         fmt: Custom log format (defaults based on prefix)
         datefmt: Date format string
         prefix: Optional prefix to add to all log messages (e.g., exchange name)
+        debug_log_file: Optional path to a DEBUG-level log file (rotated, captures
+            all output including tracebacks suppressed from the console).
     """
     _ensure_trace_level()
     debug_level = _normalize_debug(debug)
@@ -162,8 +165,21 @@ def configure_logging(
             file_handler.addFilter(prefix_filter)
         handlers.append(file_handler)
 
+    if debug_log_file:
+        dbg_path = Path(debug_log_file).expanduser()
+        dbg_path.parent.mkdir(parents=True, exist_ok=True)
+        dbg_handler = RotatingFileHandler(
+            dbg_path, maxBytes=max_bytes, backupCount=3,
+        )
+        dbg_handler.setFormatter(formatter)
+        dbg_handler.setLevel(logging.DEBUG)
+        if prefix_filter:
+            dbg_handler.addFilter(prefix_filter)
+        handlers.append(dbg_handler)
+
     root = logging.getLogger()
-    root.setLevel(numeric_level)
+    # Set root to DEBUG if we have a debug file, so messages reach it
+    root.setLevel(logging.DEBUG if debug_log_file else numeric_level)
 
     for existing in list(root.handlers):
         root.removeHandler(existing)
