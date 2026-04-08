@@ -101,7 +101,7 @@
             "filter_volume_drop_pct": 0,
             "filter_volume_ema_span": 331.54,
             "n_positions": 1,
-            "total_wallet_exposure_limit": 1.2,
+            "total_wallet_exposure_limit": 1.4,
             "unstuck_close_pct": 0.0050246,
             "unstuck_ema_dist": 0.0069327,
             "unstuck_loss_allowance_pct": 0.18987,
