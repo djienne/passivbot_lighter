@@ -210,6 +210,7 @@ class _TxWebSocket:
                     raise
                 except Exception as e:
                     logging.warning("TxWebSocket recv loop error: %s", e)
+                    logging.debug(traceback.format_exc())
                     break
         except asyncio.CancelledError:
             pass
@@ -687,6 +688,7 @@ class LighterBot(Passivbot):
             return auth
         except Exception as e:
             logging.error(f"error creating auth token: {e}")
+            logging.debug(traceback.format_exc())
             return self._auth_token
 
     # --- Rate limiting ---
@@ -1132,6 +1134,7 @@ class LighterBot(Passivbot):
                 except Exception as e:
                     if attempt == 2 or not _detect_429(e):
                         logging.error(f"error fetching order_books from Lighter: {e}")
+                        logging.debug(traceback.format_exc())
                         raise
                     delay = 15 * (2 ** attempt)  # 15s, 30s
                     logging.warning(f"429 on order_books, retry in {delay}s (attempt {attempt+1}/3)")
@@ -1472,6 +1475,7 @@ class LighterBot(Passivbot):
                         })
                     except Exception as e:
                         logging.error(f"error parsing position {key}: {e}")
+                        logging.debug(traceback.format_exc())
                         continue
 
             self._reset_global_backoff()
@@ -1480,6 +1484,7 @@ class LighterBot(Passivbot):
         except Exception as e:
             if _is_transient_error(e):
                 logging.warning(f"transient error fetching positions and balance ({type(e).__name__}); will retry automatically")
+                logging.debug(traceback.format_exc())
                 self._trigger_global_backoff()
             else:
                 logging.error(f"error fetching positions and balance: {e}")
@@ -1604,6 +1609,7 @@ class LighterBot(Passivbot):
                         self._record_api_failure(e, f"fetch_open_orders({sym})")
                     else:
                         logging.error(f"error fetching open orders for {sym}: {e}")
+                        logging.debug(traceback.format_exc())
                 return orders_out
 
             results = await asyncio.wait_for(
@@ -1642,6 +1648,7 @@ class LighterBot(Passivbot):
         except Exception as e:
             if _is_transient_error(e):
                 logging.warning(f"transient error fetching open orders ({type(e).__name__}); will retry automatically")
+                logging.debug(traceback.format_exc())
             else:
                 logging.error(f"error fetching open orders: {e}")
                 logging.debug(traceback.format_exc())
@@ -1694,6 +1701,7 @@ class LighterBot(Passivbot):
         except Exception as e:
             if _is_transient_error(e):
                 logging.warning(f"transient error fetching tickers ({type(e).__name__}); will retry automatically")
+                logging.debug(traceback.format_exc())
                 self._trigger_global_backoff()
             else:
                 logging.error(f"error fetching tickers: {e}")
@@ -1788,6 +1796,7 @@ class LighterBot(Passivbot):
                     return candles
             except Exception as direct_error:
                 logging.warning(f"direct candle fetch failed for {symbol}: {direct_error}")
+                logging.debug(traceback.format_exc())
 
             return await self._fetch_candles_via_sdk(symbol, timeframe, n_candles, since)
         except Exception as e:
@@ -1810,6 +1819,7 @@ class LighterBot(Passivbot):
                     return candles
             except Exception as direct_error:
                 logging.warning(f"direct 1m candle fetch failed for {symbol}: {direct_error}")
+                logging.debug(traceback.format_exc())
 
             return await self._fetch_candles_via_sdk(symbol, "1m", n_candles, since)
         except Exception as e:
@@ -2120,6 +2130,7 @@ class LighterBot(Passivbot):
                         return {}
                 except (ValueError, TypeError):
                     logging.error(f"cannot cancel order with non-numeric id: {order_id}")
+                    logging.debug(traceback.format_exc())
                     return {}
 
             # Rate limiting gate (cancel-only uses shorter interval)
@@ -2169,6 +2180,7 @@ class LighterBot(Passivbot):
                     nonce_acquired = False
                 except Exception as send_err:
                     logging.error(f"error sending cancel tx: {send_err}")
+                    logging.debug(traceback.format_exc())
                     self._acknowledge_nonce_failure(api_key_idx)
                     self._handle_nonce_error(send_err, api_key_idx)
                     self._order_cancel_events.pop(exchange_order_id, None)
@@ -2380,6 +2392,7 @@ class LighterBot(Passivbot):
                                 logging.error(
                                     f"batch: cannot cancel non-numeric order id: {order_id}"
                                 )
+                                logging.debug(traceback.format_exc())
                                 self._acknowledge_nonce_failure(api_key_idx)
                                 continue
 
@@ -2410,6 +2423,7 @@ class LighterBot(Passivbot):
 
                 if err:
                     logging.warning(f"batch sign error for {action}: {err}")
+                    logging.debug(traceback.format_exc())
                     self._acknowledge_nonce_failure(api_key_idx)
                     continue
 
@@ -2450,6 +2464,7 @@ class LighterBot(Passivbot):
                         )
             except Exception as send_err:
                 logging.error(f"batch send error: {send_err}")
+                logging.debug(traceback.format_exc())
                 # Acknowledge all signed nonces before hard-refresh to keep
                 # nonce manager's internal counter consistent.
                 if hasattr(self.lighter_client, "nonce_manager"):
@@ -2610,6 +2625,7 @@ class LighterBot(Passivbot):
                     logging.info(f"{symbol}: set leverage to {leverage}x cross")
             except Exception as e:
                 logging.error(f"{symbol}: error setting leverage: {e}")
+                logging.debug(traceback.format_exc())
                 if _detect_429(e):
                     self._trigger_global_backoff()
 
@@ -2642,6 +2658,7 @@ class LighterBot(Passivbot):
                 success_count += 1
             except Exception as e:
                 logging.error(f"WS subscription failed for account_orders/{mid}: {e}")
+                logging.debug(traceback.format_exc())
 
         try:
             await ws.send(_json_dumps({
@@ -2652,6 +2669,7 @@ class LighterBot(Passivbot):
             success_count += 1
         except Exception as e:
             logging.error(f"WS subscription failed for account_all: {e}")
+            logging.debug(traceback.format_exc())
 
         try:
             await ws.send(_json_dumps({
@@ -2662,6 +2680,7 @@ class LighterBot(Passivbot):
             success_count += 1
         except Exception as e:
             logging.error(f"WS subscription failed for user_stats: {e}")
+            logging.debug(traceback.format_exc())
 
         # Subscribe to ticker channels for real-time BBO (public, no auth needed)
         for mid in active_market_ids:
@@ -2673,6 +2692,7 @@ class LighterBot(Passivbot):
                 success_count += 1
             except Exception as e:
                 logging.error(f"WS subscription failed for ticker/{mid}: {e}")
+                logging.debug(traceback.format_exc())
 
         if success_count == 0:
             raise ConnectionError("All WS subscription sends failed — triggering reconnect")
@@ -2698,6 +2718,7 @@ class LighterBot(Passivbot):
                 }))
             except Exception as e:
                 logging.error(f"WS unsubscribe failed for account_orders/{mid}: {e}")
+                logging.debug(traceback.format_exc())
 
         for channel in [
             f"account_all/{self.account_index}",
@@ -2707,6 +2728,7 @@ class LighterBot(Passivbot):
                 await ws.send(_json_dumps({"type": "unsubscribe", "channel": channel}))
             except Exception as e:
                 logging.error(f"WS unsubscribe failed for {channel}: {e}")
+                logging.debug(traceback.format_exc())
 
         for mid in active_market_ids:
             try:
@@ -2716,6 +2738,7 @@ class LighterBot(Passivbot):
                 }))
             except Exception as e:
                 logging.error(f"WS unsubscribe failed for ticker/{mid}: {e}")
+                logging.debug(traceback.format_exc())
 
     async def _start_ws_early(self):
         """Start WS listener early during init_markets so caches populate before REST calls."""
@@ -2778,6 +2801,7 @@ class LighterBot(Passivbot):
                                     logging.info("WS auth token refreshed — re-subscribed on same connection")
                                 except Exception as refresh_err:
                                     logging.error(f"WS auth re-subscribe failed, triggering reconnect: {refresh_err}")
+                                    logging.debug(traceback.format_exc())
                                     break
 
                             # Account channels (account_orders, account_all) are event-driven;
@@ -2815,6 +2839,7 @@ class LighterBot(Passivbot):
                                 break
                         except Exception as e:
                             logging.error(f"error in ws recv loop: {e}")
+                            logging.debug(traceback.format_exc())
                             break
 
             except Exception as e:
@@ -2961,11 +2986,13 @@ class LighterBot(Passivbot):
                     })
                 except Exception as e:
                     logging.error(f"error parsing WS position {key}: {e}")
+                    logging.debug(traceback.format_exc())
             self._ws_positions_cache = positions
             self._ws_positions_cache_ts = time.monotonic()
             self.execution_scheduled = True
         except Exception as e:
             logging.error(f"error handling ws account update: {e}")
+            logging.debug(traceback.format_exc())
 
     def _handle_ws_user_stats(self, data):
         """Parse WS user_stats update for real-time balance."""
@@ -3036,6 +3063,7 @@ class LighterBot(Passivbot):
             self._ws_tickers_cache_ts = time.monotonic()
         except Exception as e:
             logging.error(f"error handling ws ticker update: {e}")
+            logging.debug(traceback.format_exc())
 
     def determine_pos_side(self, order):
         """Determine position side for net-position mode (same as Hyperliquid)."""
