@@ -1192,7 +1192,7 @@ class Passivbot:
     async def run_execution_loop(self):
         """Main execution loop coordinating order generation and exchange interaction."""
         failed_update_pos_oos_pnls_ohlcvs_count = 0
-        max_n_fails = 10
+        max_n_fails = 30
         while not self.stop_signal_received:
             try:
                 self.execution_scheduled = False
@@ -1205,7 +1205,8 @@ class Passivbot:
                     logging.warning("update_pos_oos_pnls_ohlcvs timed out after 60s")
                     update_ok = False
                 if not update_ok:
-                    await asyncio.sleep(0.5)
+                    backoff_s = min(1.0 * (2 ** min(failed_update_pos_oos_pnls_ohlcvs_count, 5)), 30.0)
+                    await asyncio.sleep(backoff_s)
                     failed_update_pos_oos_pnls_ohlcvs_count += 1
                     if failed_update_pos_oos_pnls_ohlcvs_count > max_n_fails:
                         await self.restart_bot_on_too_many_errors()
