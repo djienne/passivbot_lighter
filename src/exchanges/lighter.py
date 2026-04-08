@@ -342,6 +342,11 @@ class LighterBot(Passivbot):
         self._auth_token_ts = 0
         self._aiohttp_session = None  # persistent session for REST calls
 
+        # API outage tracking
+        self._api_consecutive_failures = 0
+        self._api_down_since = 0.0        # time.monotonic() when outage started
+        self._api_last_status_log = 0.0   # throttle "still down" messages
+
         # Rate limiting state (40 ops / 60s sliding window)
         self._rl_ops_per_window = 40
         self._rl_window_seconds = 60.0
@@ -740,6 +745,47 @@ class LighterBot(Passivbot):
             if self._consecutive_successes >= self._rl_backoff_reset_after:
                 self._global_backoff_consecutive = 0
                 self._consecutive_successes = 0
+
+    # --- API outage tracking ---
+
+    def _record_api_failure(self, exc, context=""):
+        """Track consecutive API failures with throttled logging."""
+        now = time.monotonic()
+        self._api_consecutive_failures += 1
+        if self._api_consecutive_failures == 1:
+            self._api_down_since = now
+            self._api_last_status_log = now
+            logging.warning("API error (%s): %s: %s", context, type(exc).__name__, exc)
+        elif self._api_consecutive_failures == 3:
+            logging.warning(
+                "Lighter API appears down (%d consecutive failures) "
+                "-- retrying with exponential backoff",
+                self._api_consecutive_failures,
+            )
+            self._api_last_status_log = now
+        elif now - self._api_last_status_log >= 300:
+            down_s = now - self._api_down_since
+            logging.info(
+                "API still unreachable (%.0fm%02.0fs, %d failures) -- continuing to retry",
+                down_s // 60, down_s % 60, self._api_consecutive_failures,
+            )
+            self._api_last_status_log = now
+
+    def _record_api_success(self):
+        """Reset outage tracking; log recovery if was in outage."""
+        if self._api_consecutive_failures >= 3:
+            down_s = time.monotonic() - self._api_down_since
+            logging.info(
+                "API recovered after %.0fm%02.0fs (%d failures) -- resuming normal operation",
+                down_s // 60, down_s % 60, self._api_consecutive_failures,
+            )
+        self._api_consecutive_failures = 0
+        self._api_down_since = 0.0
+        self._api_last_status_log = 0.0
+
+    @property
+    def api_is_down(self):
+        return self._api_consecutive_failures >= 3
 
     # --- Volume quota ---
 
@@ -1425,6 +1471,7 @@ class LighterBot(Passivbot):
                         continue
 
             self._reset_global_backoff()
+            self._record_api_success()
             return positions, balance
         except Exception as e:
             if _is_transient_error(e):
@@ -1547,9 +1594,12 @@ class LighterBot(Passivbot):
                             self._client_to_exchange_order_id[int(client_idx)] = int(exchange_idx)
                         orders_out.append(order_dict)
                 except Exception as e:
-                    logging.error(f"error fetching open orders for {sym}: {e}")
                     if _detect_429(e):
                         self._trigger_global_backoff()
+                    if _is_transient_error(e):
+                        self._record_api_failure(e, f"fetch_open_orders({sym})")
+                    else:
+                        logging.error(f"error fetching open orders for {sym}: {e}")
                 return orders_out
 
             results = await asyncio.wait_for(
@@ -1635,6 +1685,7 @@ class LighterBot(Passivbot):
             self._tickers_cache = tickers
             self._tickers_cache_ts = now
             self._reset_global_backoff()
+            self._record_api_success()
             return tickers
         except Exception as e:
             if _is_transient_error(e):
@@ -1736,8 +1787,11 @@ class LighterBot(Passivbot):
 
             return await self._fetch_candles_via_sdk(symbol, timeframe, n_candles, since)
         except Exception as e:
-            logging.error(f"error fetching ohlcv for {symbol}: {e}")
-            traceback.print_exc()
+            if _is_transient_error(e):
+                self._record_api_failure(e, f"fetch_ohlcv({symbol})")
+            else:
+                logging.error(f"error fetching ohlcv for {symbol}: {e}")
+                traceback.print_exc()
             return []
 
     async def fetch_ohlcvs_1m(self, symbol, since=None, limit=None, **kwargs):
@@ -1755,8 +1809,11 @@ class LighterBot(Passivbot):
 
             return await self._fetch_candles_via_sdk(symbol, "1m", n_candles, since)
         except Exception as e:
-            logging.error(f"error fetching ohlcvs_1m for {symbol}: {e}")
-            traceback.print_exc()
+            if _is_transient_error(e):
+                self._record_api_failure(e, f"fetch_ohlcvs_1m({symbol})")
+            else:
+                logging.error(f"error fetching ohlcvs_1m for {symbol}: {e}")
+                traceback.print_exc()
             return []
 
     async def fetch_pnls(self, start_time=None, end_time=None, limit=None):
@@ -1925,10 +1982,13 @@ class LighterBot(Passivbot):
 
             return pnls
         except Exception as e:
-            logging.error(f"error fetching pnls: {e}")
             if _detect_429(e):
                 self._trigger_global_backoff()
-            traceback.print_exc()
+            if _is_transient_error(e):
+                self._record_api_failure(e, "fetch_pnls")
+            else:
+                logging.error(f"error fetching pnls: {e}")
+                traceback.print_exc()
             return []
 
     # --- Order execution ---
