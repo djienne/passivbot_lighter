@@ -2549,13 +2549,18 @@ class LighterBot(Passivbot):
         return results
 
     async def execute_orders(self, orders):
-        """Override base: batch multiple creates into one send_tx_batch call."""
+        """Execute order creates individually (not batched) for independent failure handling."""
         if not orders:
             return []
         if len(orders) == 1:
             return [await self.execute_order(orders[0])]
-        ops = [{**o, "action": "create"} for o in orders]
-        return await self._sign_and_send_batch(ops)
+        sem = asyncio.Semaphore(3)
+
+        async def _create_with_sem(order):
+            async with sem:
+                return await self.execute_order(order)
+
+        return list(await asyncio.gather(*[_create_with_sem(o) for o in orders]))
 
     async def execute_cancellations(self, orders):
         """Override base: cancel individually via send_tx (free, 0 quota cost).

@@ -1256,14 +1256,14 @@ class TestMultipleWsUpdates:
 # Batch Orders (Phase 4.1)
 # ===========================================================================
 
-class TestBatchOrders:
+class TestIndividualOrders:
     @pytest.fixture
     def lighter_bot(self):
         return _create_bot()
 
     @pytest.mark.asyncio
-    async def test_batch_creates_two_orders(self, lighter_bot):
-        """Two create orders should be batched via send_tx_batch."""
+    async def test_multiple_orders_execute_individually(self, lighter_bot):
+        """Multiple orders should each call create_order individually, not batch."""
         orders = [
             {"symbol": "HYPE/USDC:USDC", "side": "buy", "qty": 5.0,
              "price": 14.80, "custom_id": "b1"},
@@ -1274,12 +1274,12 @@ class TestBatchOrders:
         assert len(results) == 2
         assert lighter_bot.did_create_order(results[0])
         assert lighter_bot.did_create_order(results[1])
-        lighter_bot.lighter_client.send_tx_batch.assert_called_once()
-        assert lighter_bot.lighter_client.sign_create_order.call_count == 2
+        assert lighter_bot.lighter_client.create_order.call_count == 2
+        lighter_bot.lighter_client.send_tx_batch.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_batch_single_order_delegates(self, lighter_bot):
-        """Single order should use execute_order (high-level create_order), not batch."""
+    async def test_single_order_delegates(self, lighter_bot):
+        """Single order should use execute_order (high-level create_order)."""
         orders = [
             {"symbol": "HYPE/USDC:USDC", "side": "buy", "qty": 5.0,
              "price": 14.80, "custom_id": "b1"},
@@ -1291,18 +1291,19 @@ class TestBatchOrders:
         lighter_bot.lighter_client.send_tx_batch.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_batch_partial_sign_failure(self, lighter_bot):
-        """If one of three ops fails signing, the other two should still be sent."""
+    async def test_one_failure_doesnt_block_others(self, lighter_bot):
+        """If one order fails, others should still succeed independently."""
         call_count = 0
+        original_create = lighter_bot.lighter_client.create_order
 
-        def sign_side_effect(**kwargs):
+        async def create_side_effect(**kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 2:
-                return (14, None, None, "nonce error")
-            return (14, {"info": "create"}, "0xhash", None)
+                return (None, None, "nonce error")
+            return await original_create(**kwargs)
 
-        lighter_bot.lighter_client.sign_create_order.side_effect = sign_side_effect
+        lighter_bot.lighter_client.create_order = AsyncMock(side_effect=create_side_effect)
 
         orders = [
             {"symbol": "HYPE/USDC:USDC", "side": "buy", "qty": 5.0,
@@ -1314,54 +1315,7 @@ class TestBatchOrders:
         ]
         results = await lighter_bot.execute_orders(orders)
         assert len(results) == 3
-        assert lighter_bot.did_create_order(results[0])
-        assert not lighter_bot.did_create_order(results[1])  # failed signing
-        assert lighter_bot.did_create_order(results[2])
-        lighter_bot.lighter_client.send_tx_batch.assert_called_once()
-        # Verify batch had 2 ops (not 3)
-        call_args = lighter_bot.lighter_client.send_tx_batch.call_args
-        assert len(call_args[0][0]) == 2  # tx_types has 2 elements
-
-    @pytest.mark.asyncio
-    async def test_batch_send_error_hard_refreshes_nonce(self, lighter_bot):
-        """If send_tx_batch raises, acknowledge_failure should be called for all
-        signed nonces, then hard_refresh_nonce (matching reference impl)."""
-        lighter_bot.lighter_client.send_tx_batch = AsyncMock(
-            side_effect=Exception("network error")
-        )
-
-        orders = [
-            {"symbol": "HYPE/USDC:USDC", "side": "buy", "qty": 5.0,
-             "price": 14.80, "custom_id": "b1"},
-            {"symbol": "HYPE/USDC:USDC", "side": "sell", "qty": 3.0,
-             "price": 15.50, "custom_id": "s1"},
-        ]
-        results = await lighter_bot.execute_orders(orders)
-        assert all(r == {} for r in results)
-        # acknowledge_failure called for each signed nonce before hard_refresh
-        assert lighter_bot.lighter_client.nonce_manager.acknowledge_failure.call_count == 2
-        lighter_bot.lighter_client.nonce_manager.hard_refresh_nonce.assert_called()
-        # Should flag for reconciliation
-        assert lighter_bot.execution_scheduled is True
-
-    @pytest.mark.asyncio
-    async def test_batch_free_slot_mode(self, lighter_bot):
-        """When quota=0, only 1 op should be sent via single REST send_tx."""
-        lighter_bot._volume_quota_remaining = 0
-
-        orders = [
-            {"symbol": "HYPE/USDC:USDC", "side": "buy", "qty": 5.0,
-             "price": 14.80, "custom_id": "b1"},
-            {"symbol": "HYPE/USDC:USDC", "side": "sell", "qty": 3.0,
-             "price": 15.50, "custom_id": "s1"},
-        ]
-        results = await lighter_bot.execute_orders(orders)
-        # Only first op processed; second gets empty dict
-        assert len(results) == 2
-        assert lighter_bot.did_create_order(results[0])
-        assert not lighter_bot.did_create_order(results[1])
-        lighter_bot.lighter_client.send_tx.assert_called_once()
-        lighter_bot.lighter_client.send_tx_batch.assert_not_called()
+        assert lighter_bot.lighter_client.create_order.call_count == 3
 
 
 # ===========================================================================
