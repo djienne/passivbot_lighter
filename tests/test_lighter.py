@@ -25,6 +25,7 @@ from fixtures.lighter_responses import (
     MOCK_ACTIVE_ORDERS,
     MOCK_CANDLES,
     MOCK_INACTIVE_ORDERS,
+    MOCK_TRADES_RESPONSE,
 )
 
 
@@ -607,7 +608,7 @@ class TestFetchPnls:
     async def test_fetch_pnls(self, lighter_bot):
         mock_resp = MagicMock()
         mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value=MOCK_INACTIVE_ORDERS)
+        mock_resp.json = AsyncMock(return_value=MOCK_TRADES_RESPONSE)
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
 
@@ -621,7 +622,7 @@ class TestFetchPnls:
         assert pnls[0]["symbol"] == "HYPE/USDC:USDC"
         assert pnls[0]["pnl"] == 1.50
         assert pnls[0]["side"] == "sell"
-        assert pnls[1]["pnl"] == -0.30
+        assert pnls[1]["pnl"] == pytest.approx(-0.30, abs=1e-6)
 
 
 # ===========================================================================
@@ -1796,8 +1797,8 @@ class TestWsUserStats:
         lighter_bot._handle_ws_user_stats(data)
         assert lighter_bot.balance == 5500.0
 
-    def test_ws_user_stats_collateral_fallback(self, lighter_bot):
-        """Should fall back to collateral field if available_balance missing."""
+    def test_ws_user_stats_collateral_primary(self, lighter_bot):
+        """Should use collateral field as primary balance source."""
         lighter_bot.balance = 5000.0
         data = {"stats": {"collateral": 6000.0}}
         lighter_bot._handle_ws_user_stats(data)
@@ -2690,17 +2691,18 @@ class TestFetchPnlsStringMarketId:
     async def test_fetch_pnls_string_market_id(self, lighter_bot):
         """market_id from JSON may be string '5' — should resolve correctly."""
         orders_with_string_ids = {
-            "orders": [
+            "trades": [
                 {
-                    "order_index": 100001,
-                    "client_order_index": 200001,
+                    "trade_id": 60001,
                     "market_id": "5",  # string, not int
-                    "is_ask": True,
-                    "status": "filled",
+                    "ask_account_id": 0,
+                    "bid_account_id": 999,
+                    "is_maker_ask": True,
                     "price": 15.50,
                     "size": 2.0,
                     "timestamp": 1709400000000,
-                    "realized_pnl": 1.50,
+                    "maker_position_size_before": 10.0,
+                    "maker_entry_quote_before": 147.5,
                 },
             ]
         }
@@ -2724,16 +2726,15 @@ class TestFetchPnlsStringMarketId:
     async def test_fetch_pnls_missing_market_id(self, lighter_bot):
         """If market_id is missing, symbol should be empty string."""
         orders_no_market_id = {
-            "orders": [
+            "trades": [
                 {
-                    "order_index": 100001,
-                    "client_order_index": 200001,
-                    "is_ask": False,
-                    "status": "filled",
+                    "trade_id": 70001,
+                    "bid_account_id": 0,
+                    "ask_account_id": 999,
+                    "is_maker_ask": True,
                     "price": 14.80,
                     "size": 1.0,
                     "timestamp": 1709400000000,
-                    "realized_pnl": 0.50,
                 },
             ]
         }
@@ -3986,48 +3987,58 @@ class TestWsBatchResponseNestedError:
 
 
 # ===========================================================================
-# Review fix: _handle_ws_user_stats portfolio_value validation
+# Review fix: _handle_ws_user_stats collateral validation
 # ===========================================================================
 
-class TestWsUserStatsPortfolioValue:
-    def test_negative_portfolio_value_rejects_update(self, lighter_bot):
-        """Negative portfolio_value should reject the entire update."""
+class TestWsUserStatsCollateralValidation:
+    def test_negative_collateral_rejects_update(self, lighter_bot):
+        """Negative collateral should reject the entire update."""
         lighter_bot.balance = 5000.0
-        data = {"stats": {"available_balance": 6000.0, "portfolio_value": -100.0}}
+        data = {"stats": {"available_balance": 6000.0, "collateral": -100.0}}
         lighter_bot._handle_ws_user_stats(data)
         assert lighter_bot.balance == 5000.0  # unchanged
 
-    def test_valid_portfolio_value_allows_update(self, lighter_bot):
-        """Positive portfolio_value should allow balance update."""
+    def test_valid_collateral_allows_update(self, lighter_bot):
+        """Positive collateral should allow balance update."""
         lighter_bot.balance = 5000.0
-        data = {"stats": {"available_balance": 6000.0, "portfolio_value": 10000.0}}
+        data = {"stats": {"available_balance": 6000.0, "collateral": 10000.0}}
         lighter_bot._handle_ws_user_stats(data)
         assert lighter_bot.balance == 10000.0
 
-    def test_zero_portfolio_value_allows_update(self, lighter_bot):
-        """Zero portfolio_value should be accepted (not negative)."""
+    def test_zero_collateral_allows_update(self, lighter_bot):
+        """Zero collateral should be accepted (not negative)."""
         lighter_bot.balance = 5000.0
-        data = {"stats": {"available_balance": 3000.0, "portfolio_value": 0.0}}
+        data = {"stats": {"available_balance": 3000.0, "collateral": 0.0}}
         lighter_bot._handle_ws_user_stats(data)
         assert lighter_bot.balance == 0.0
 
-    def test_missing_portfolio_value_allows_update(self, lighter_bot):
-        """Missing portfolio_value should not block update."""
+    def test_missing_collateral_allows_update(self, lighter_bot):
+        """Missing collateral should not block update; falls back to available_balance."""
         lighter_bot.balance = 5000.0
         data = {"stats": {"available_balance": 7000.0}}
         lighter_bot._handle_ws_user_stats(data)
         assert lighter_bot.balance == 7000.0
 
-    def test_invalid_portfolio_value_string_rejects(self, lighter_bot):
-        """Non-numeric portfolio_value should reject update."""
+    def test_invalid_collateral_string_rejects(self, lighter_bot):
+        """Non-numeric collateral should reject update; NaN falls through to available_balance."""
         lighter_bot.balance = 5000.0
-        data = {"stats": {"available_balance": 6000.0, "portfolio_value": "NaN"}}
+        # "NaN" passes float() but fails isfinite(), so collateral is skipped
+        # and available_balance is used as fallback
+        data = {"stats": {"available_balance": 6000.0, "collateral": "NaN"}}
         lighter_bot._handle_ws_user_stats(data)
         assert lighter_bot.balance == 6000.0
         lighter_bot.balance = 5000.0
-        data2 = {"stats": {"available_balance": 6000.0, "portfolio_value": "not_a_number"}}
+        # "not_a_number" raises ValueError in validation → entire update rejected
+        data2 = {"stats": {"available_balance": 6000.0, "collateral": "not_a_number"}}
         lighter_bot._handle_ws_user_stats(data2)
         assert lighter_bot.balance == 5000.0
+
+    def test_collateral_preferred_over_portfolio_value(self, lighter_bot):
+        """Balance should use collateral (wallet balance), not portfolio_value (equity)."""
+        lighter_bot.balance = 5000.0
+        data = {"stats": {"collateral": 8000.0, "portfolio_value": 9500.0, "available_balance": 6000.0}}
+        lighter_bot._handle_ws_user_stats(data)
+        assert lighter_bot.balance == 8000.0  # collateral, not portfolio_value
 
 
 # ===========================================================================
@@ -4035,7 +4046,7 @@ class TestWsUserStatsPortfolioValue:
 # ===========================================================================
 
 class TestLighterLiveParitySync:
-    def test_fetch_positions_prefers_account_value_balance(self):
+    def test_fetch_positions_prefers_collateral_balance(self):
         lighter_bot = _create_bot()
         lighter_bot.account_api.account = AsyncMock(
             return_value=_build_account_response(MOCK_ACCOUNT_RESPONSE)

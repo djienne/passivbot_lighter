@@ -520,18 +520,18 @@ class LighterBot(Passivbot):
 
     def _get_balance_value_from_account_data(self, account_data):
         balance = self._extract_lighter_balance(
-            account_data, ["total_asset_value", "collateral", "available_balance"]
+            account_data, ["collateral", "available_balance"]
         )
         if balance is None:
             logging.warning(
-                "no balance field found in account data (total_asset_value, collateral, available_balance all None)"
+                "no balance field found in account data (collateral, available_balance all None)"
             )
             return 0.0
         return balance
 
     def _get_balance_value_from_user_stats(self, stats):
         return self._extract_lighter_balance(
-            stats, ["portfolio_value", "collateral", "available_balance"]
+            stats, ["collateral", "available_balance"]
         )
 
     def _normalize_market_order_for_lighter(self, order: dict):
@@ -1859,7 +1859,6 @@ class LighterBot(Passivbot):
                     "sort_by": "timestamp",
                     "sort_dir": "desc",
                     "limit": min(100, limit - len(all_trades)),
-                    "market_id": 24,
                 }
                 if cursor:
                     params["cursor"] = cursor
@@ -2999,16 +2998,16 @@ class LighterBot(Passivbot):
         stats = data.get("stats", data)
         if not stats:
             return
-        # Validate portfolio_value if present
-        pv = stats.get("portfolio_value")
+        # Validate collateral if present
+        pv = stats.get("collateral")
         if pv is not None:
             try:
                 pv_float = float(pv)
                 if pv_float < 0:
-                    logging.warning(f"WS user_stats: rejecting negative portfolio_value {pv_float}")
+                    logging.warning(f"WS user_stats: rejecting negative collateral {pv_float}")
                     return
             except (ValueError, TypeError):
-                logging.warning(f"WS user_stats: invalid portfolio_value {pv!r}")
+                logging.warning(f"WS user_stats: invalid collateral {pv!r}")
                 return
         bal = self._get_balance_value_from_user_stats(stats)
         if bal is not None:
