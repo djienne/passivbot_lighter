@@ -165,6 +165,39 @@ MOCK_INACTIVE_ORDERS = {
     ]
 }
 
+# Simulates /api/v1/trades response for fetch_pnls
+# Bot account_index=0. Both trades are sells (we are ask).
+# Trade 1: sell 2.0 @ 15.50, pos_before=10 avg_entry=14.75 → pnl=2*(15.50-14.75)=1.50
+# Trade 2: sell 3.0 @ 14.80, pos_before=8 avg_entry=14.90 → pnl=3*(14.80-14.90)=-0.30
+MOCK_TRADES_RESPONSE = {
+    "trades": [
+        {
+            "trade_id": 50001,
+            "market_id": 5,
+            "ask_account_id": 0,
+            "bid_account_id": 999,
+            "is_maker_ask": True,
+            "price": 15.50,
+            "size": 2.0,
+            "timestamp": 1709400000000,
+            "maker_position_size_before": 10.0,
+            "maker_entry_quote_before": 147.5,
+        },
+        {
+            "trade_id": 50002,
+            "market_id": 5,
+            "ask_account_id": 0,
+            "bid_account_id": 999,
+            "is_maker_ask": True,
+            "price": 14.80,
+            "size": 3.0,
+            "timestamp": 1709400100000,
+            "maker_position_size_before": 8.0,
+            "maker_entry_quote_before": 119.2,
+        },
+    ]
+}
+
 # Simulates cancel order response
 MOCK_CANCEL_RESPONSE = {
     "code": 0,
