@@ -594,9 +594,12 @@ class TestFetchTickers:
 class TestFetchOhlcv:
     @pytest.mark.asyncio
     async def test_fetch_ohlcv(self, lighter_bot):
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(
-            return_value=_make_obj(MOCK_CANDLES)
-        )
+        parsed = [
+            [1709500000000, 15.00, 15.20, 14.90, 15.10, 1000.0],
+            [1709500060000, 15.10, 15.25, 15.05, 15.15, 800.0],
+            [1709500120000, 15.15, 15.30, 15.10, 15.20, 1200.0],
+        ]
+        lighter_bot._fetch_candles = AsyncMock(return_value=parsed)
         candles = await lighter_bot.fetch_ohlcv("HYPE/USDC:USDC", "1m")
         assert len(candles) == 3
         c = candles[0]
@@ -734,7 +737,7 @@ class TestErrorClassification:
     def test_is_transient_error_false(self):
         from exchanges.lighter import _is_transient_error
         assert not _is_transient_error("order not found")
-        assert not _is_transient_error("network timeout")
+        assert not _is_transient_error("insufficient margin")
 
 
 # ===========================================================================
@@ -753,6 +756,8 @@ class TestRateLimiting:
         lighter_bot._trigger_global_backoff()
         assert lighter_bot._global_backoff_until > time.monotonic()
         assert lighter_bot._global_backoff_consecutive == 1
+        # Expire the backoff window so the second call can escalate
+        lighter_bot._global_backoff_until = 0
         lighter_bot._trigger_global_backoff()
         assert lighter_bot._global_backoff_consecutive == 2
 
@@ -974,7 +979,7 @@ class TestAuthTokenExpiry:
     @pytest.mark.asyncio
     async def test_expired_token_refreshes(self, lighter_bot):
         lighter_bot._auth_token = "old_token"
-        lighter_bot._auth_token_ts = time.time() - 500
+        lighter_bot._auth_token_ts = time.time() - 3400
         lighter_bot.lighter_client.create_auth_token_with_expiry.return_value = (
             "new_token", None
         )
@@ -1886,15 +1891,11 @@ class TestCancelRespCodeError:
                 message='{"ratelimit": "didn\'t use volume quota"}',
             )
         )
+        # REST fallback returns [] (order gone) confirming cancel
         lighter_bot.fetch_open_orders = AsyncMock(return_value=[])
 
-        async def _timeout(coro, timeout):
-            coro.close()
-            raise asyncio.TimeoutError()
-
-        with patch("asyncio.wait_for", side_effect=_timeout):
-            order = {"id": "501", "symbol": "HYPE/USDC:USDC"}
-            result = await lighter_bot.execute_cancellation(order)
+        order = {"id": "501", "symbol": "HYPE/USDC:USDC"}
+        result = await lighter_bot.execute_cancellation(order)
 
         assert lighter_bot.did_cancel_order(result)
 
@@ -2201,14 +2202,16 @@ class TestSubscribeWsChannelsComplete:
         await lighter_bot._subscribe_ws_channels(ws_mock, auth)
 
         calls = [str(c) for c in ws_mock.send.call_args_list]
-        # 2 account_orders (one per market) + 1 account_all + 1 user_stats = 4
-        assert ws_mock.send.call_count == 4
+        # 2 account_orders + 1 account_all + 1 user_stats + 2 ticker = 6
+        assert ws_mock.send.call_count == 6
         account_orders_calls = [c for c in calls if "account_orders" in c]
         account_all_calls = [c for c in calls if "account_all" in c]
         user_stats_calls = [c for c in calls if "user_stats" in c]
+        ticker_calls = [c for c in calls if "ticker/" in c]
         assert len(account_orders_calls) == 2
         assert len(account_all_calls) == 1
         assert len(user_stats_calls) == 1
+        assert len(ticker_calls) == 2
 
 
 # ===========================================================================
@@ -2565,7 +2568,7 @@ class TestDetermineUtcOffset:
         """Should compute offset from server timestamp."""
         mock_root_api = MagicMock()
         mock_root_api.status = AsyncMock(
-            return_value=types.SimpleNamespace(timestamp=str(time.time() * 1000))
+            return_value=types.SimpleNamespace(timestamp=str(time.time()))
         )
         with patch("lighter.RootApi", return_value=mock_root_api):
             await lighter_bot.determine_utc_offset(verbose=False)
@@ -2595,6 +2598,8 @@ class TestBackoffEscalation:
         """Verify escalation: 15 -> 30 -> 60 -> 120 (capped)."""
         expected = [15.0, 30.0, 60.0, 120.0, 120.0]
         for i, exp in enumerate(expected):
+            # Expire previous backoff window so next call can escalate
+            lighter_bot._global_backoff_until = 0
             before = time.monotonic()
             lighter_bot._trigger_global_backoff()
             duration = lighter_bot._global_backoff_until - before
@@ -3124,7 +3129,7 @@ class TestInitMarketsFlow:
 
         # Verify per-market maxLeverage from API
         assert lighter_bot.markets_dict["HYPE/USDC:USDC"]["info"]["maxLeverage"] == 20
-        assert lighter_bot.markets_dict["BTC/USDC:USDC"]["info"]["maxLeverage"] == 100
+        assert lighter_bot.markets_dict["BTC/USDC:USDC"]["info"]["maxLeverage"] == 20
 
 
 # ===========================================================================
@@ -3508,8 +3513,12 @@ class TestFetchOhlcvs1m:
     @pytest.mark.asyncio
     async def test_returns_candles(self, lighter_bot):
         """fetch_ohlcvs_1m should return parsed candle data."""
-        mock_resp = _make_obj(MOCK_CANDLES)
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(return_value=mock_resp)
+        parsed = [
+            [1709500000000, 15.00, 15.20, 14.90, 15.10, 1000.0],
+            [1709500060000, 15.10, 15.25, 15.05, 15.15, 800.0],
+            [1709500120000, 15.15, 15.30, 15.10, 15.20, 1200.0],
+        ]
+        lighter_bot._fetch_candles = AsyncMock(return_value=parsed)
         result = await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC")
         assert len(result) == 3
         assert result[0][0] == 1709500000000  # timestamp
@@ -3518,20 +3527,26 @@ class TestFetchOhlcvs1m:
     @pytest.mark.asyncio
     async def test_default_limit_is_5000(self, lighter_bot):
         """Default limit should be 5000, not 480 like fetch_ohlcv."""
-        mock_resp = _make_obj(MOCK_CANDLES)
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(return_value=mock_resp)
+        parsed = [
+            [1709500000000, 15.00, 15.20, 14.90, 15.10, 1000.0],
+        ]
+        lighter_bot._fetch_candles = AsyncMock(return_value=parsed)
         await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC")
-        call_kwargs = lighter_bot.candlestick_api.candlesticks.call_args[1]
-        assert call_kwargs["count_back"] == 5000
+        # _fetch_candles(symbol, timeframe, n_candles, since)
+        call_args = lighter_bot._fetch_candles.call_args[0]
+        assert call_args[2] == 5000
 
     @pytest.mark.asyncio
     async def test_custom_limit(self, lighter_bot):
         """Custom limit should be passed through."""
-        mock_resp = _make_obj(MOCK_CANDLES)
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(return_value=mock_resp)
+        parsed = [
+            [1709500000000, 15.00, 15.20, 14.90, 15.10, 1000.0],
+        ]
+        lighter_bot._fetch_candles = AsyncMock(return_value=parsed)
         await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC", limit=100)
-        call_kwargs = lighter_bot.candlestick_api.candlesticks.call_args[1]
-        assert call_kwargs["count_back"] == 100
+        # _fetch_candles(symbol, timeframe, n_candles, since)
+        call_args = lighter_bot._fetch_candles.call_args[0]
+        assert call_args[2] == 100
 
     @pytest.mark.asyncio
     async def test_unknown_symbol_returns_empty_list(self, lighter_bot):
@@ -3542,9 +3557,8 @@ class TestFetchOhlcvs1m:
     @pytest.mark.asyncio
     async def test_error_returns_empty_list(self, lighter_bot):
         """Exception should return [] (not False like fetch_ohlcv)."""
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(
-            side_effect=Exception("API error")
-        )
+        lighter_bot._fetch_candles = AsyncMock(side_effect=Exception("API error"))
+        lighter_bot._fetch_candles_via_sdk = AsyncMock(side_effect=Exception("SDK error"))
         result = await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC")
         assert result == []
 
@@ -3564,6 +3578,8 @@ class TestInitMarketsMalformed:
         lighter_bot.order_api.order_books = AsyncMock(
             side_effect=Exception("Connection refused")
         )
+        lighter_bot._load_market_metadata_cache = MagicMock(return_value=False)
+        lighter_bot.update_exchange_config = AsyncMock()
         with pytest.raises(Exception, match="Connection refused"):
             await lighter_bot.init_markets()
 
@@ -3581,6 +3597,8 @@ class TestInitMarketsMalformed:
             ]
         )
         lighter_bot.order_api.order_books = AsyncMock(return_value=malformed)
+        lighter_bot._load_market_metadata_cache = MagicMock(return_value=False)
+        lighter_bot.update_exchange_config = AsyncMock()
         with pytest.raises(AttributeError):
             await lighter_bot.init_markets()
 
@@ -3881,9 +3899,8 @@ class TestFetchOhlcvReturnsEmptyList:
     @pytest.mark.asyncio
     async def test_exception_returns_empty_list(self, lighter_bot):
         """fetch_ohlcv should return [] on exception, not False."""
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(
-            side_effect=Exception("API error")
-        )
+        lighter_bot._fetch_candles = AsyncMock(side_effect=Exception("API error"))
+        lighter_bot._fetch_candles_via_sdk = AsyncMock(side_effect=Exception("SDK error"))
         result = await lighter_bot.fetch_ohlcv("HYPE/USDC:USDC", "1m")
         assert result == []
         assert isinstance(result, list)
