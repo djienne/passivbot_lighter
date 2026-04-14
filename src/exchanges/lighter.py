@@ -1935,14 +1935,16 @@ class LighterBot(Passivbot):
                         else:
                             computed_pnl = close_qty * (avg_entry - trade_price)
 
-                # Derive position_side from position state
+                # Derive position_side from position state.
+                # When a fill fully closes a position (pos_after == 0), the fill
+                # belongs to the side that was closed, so use pos_before's sign.
                 pos_after = pos_before + trade_delta
                 if pos_after > 0:
                     position_side = "long"
                 elif pos_after < 0:
                     position_side = "short"
                 else:
-                    position_side = "long" if trade_delta > 0 else "short"
+                    position_side = "long" if pos_before > 0 else "short"
 
                 pnls.append({
                     "id": trade_id,
@@ -1983,6 +1985,7 @@ class LighterBot(Passivbot):
                         if new_pos != 0.0:
                             avg_entry = total_cost / abs(new_pos)
 
+                    prev_net_pos = net_pos
                     net_pos = new_pos
                     p["pnl"] = computed_pnl
 
@@ -1991,7 +1994,7 @@ class LighterBot(Passivbot):
                     elif net_pos < 0:
                         p["position_side"] = "short"
                     else:
-                        p["position_side"] = "long" if trade_qty > 0 else "short"
+                        p["position_side"] = "long" if prev_net_pos > 0 else "short"
 
             return pnls
         except Exception as e:
