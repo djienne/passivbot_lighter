@@ -2,6 +2,8 @@
 
 # Passivbot - Lighter Exchange Fork
 
+> **Video tutorial:** Watch the associated walkthrough on YouTube: https://youtu.be/E87Pbgfosoo
+
 A fork of [Passivbot](https://github.com/enarjord/passivbot) adapted to run on [Lighter](https://lighter.xyz) — a ZK-rollup perpetuals DEX with **zero trading fees**.
 
 Passivbot is a high-frequency market-making bot that places and cancels large numbers of limit orders. On a traditional exchange, fees would eat deeply into returns. Lighter's zero-fee model makes it an ideal venue for this strategy: every trade that would otherwise cost fees is pure profit instead.
