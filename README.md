@@ -13,6 +13,10 @@ Passivbot is a high-frequency market-making bot that places and cancels large nu
 :warning: **Used at one's own risk** :warning:
 
 > :penguin: **Linux only** — the `lighter` Python SDK requires Linux for transaction signing. Windows users must run this inside [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) or Docker.
+>
+> macOS has not been tested.
+>
+> A Linux VPS is also a good option and is even recommended. This bot does not need a fast or expensive VPS, since latency is not a major concern on Lighter.
 
 > :warning: **Lighter account type requirement:** Use a **Simple Trading Account**. Do **not** use a **Unified Trading Account (UTA)**.
 > 
