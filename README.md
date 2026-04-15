@@ -4,11 +4,11 @@
 
 > **Video tutorial:** Watch the associated walkthrough on YouTube: https://youtu.be/E87Pbgfosoo
 
-A fork of [Passivbot](https://github.com/enarjord/passivbot) adapted to run on [Lighter](https://lighter.xyz) — a ZK-rollup perpetuals DEX with **zero trading fees for both maker and taker**.
+A fork of [Passivbot](https://github.com/enarjord/passivbot) adapted to run on [Lighter](https://lighter.xyz) — a ZK-rollup perpetuals DEX with **zero trading fees for both maker and taker orders**.
 
-Passivbot is a high-frequency market-making bot that places and cancels large numbers of limit orders. On a traditional exchange, fees would eat deeply into returns. Lighter's zero-fee model for both maker and taker makes it an ideal venue for this strategy: every trade that would otherwise cost fees is pure profit instead.
+Passivbot is a high-frequency market-making bot that places and cancels large numbers of limit orders. On a traditional exchange, fees would eat deeply into returns. Lighter's zero-fee model for both maker and taker orders makes it an ideal venue for this strategy: every trade that would otherwise cost fees is pure profit instead.
 
-> **Affiliate link to support this project:** [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees for both maker and taker (100% kickback with this link).
+> **Affiliate link to support this project:** [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees for both maker and taker orders.
 
 :warning: **Used at one's own risk** :warning:
 
@@ -22,7 +22,7 @@ Passivbot is a high-frequency market-making bot that places and cancels large nu
 > 
 > :warning: Recommended to use a **sub-account**.
 >
-> **Recommended Lighter tier:** The **Free** tier works well with Passivbot. It keeps trading at **0 fees for both maker and taker**, and in practice its latency has not been a problem for this bot.
+> **Recommended Lighter tier:** The **Free** tier works well with Passivbot. It keeps trading at **0 fees for both maker and taker orders**, and in practice its latency has not been a problem for this bot.
 
 <p align="center">
   <img src="account.png" alt="Lighter account type selection showing that Simple Trading Account should be used instead of Unified Trading Account (UTA)" width="900" />
