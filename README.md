@@ -16,7 +16,7 @@ Passivbot is a high-frequency market-making bot that places and cancels large nu
 >
 > macOS has not been tested natively, but Docker on macOS will work.
 >
-> A Linux VPS is also a good option and is even recommended. This bot does not need a fast or expensive VPS, since latency is not a major concern on Lighter.
+> A Linux VPS is also a good option and is even recommended. This bot does not need a fast or expensive VPS, since latency is not a major concern for Passivbot in general.
 
 > :warning: **Lighter account type requirement:** Use a **Simple Trading Account**. Do **not** use a **Unified Trading Account (UTA)**.
 > 
