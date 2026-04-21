@@ -9,7 +9,7 @@ services:
     volumes:
       - ./:/app/
     working_dir: /app
-    command: python src/main.py configs/hype_top.json
+    command: python src/main.py configs/config_hype.json
     deploy:
       resources:
         limits:
