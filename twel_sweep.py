@@ -14,7 +14,7 @@ from tools.event_loop_policy import set_windows_event_loop_policy
 set_windows_event_loop_policy()
 
 async def main():
-    config_path = "configs/config_hype.json"
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/config_hype.json"
     base_config = load_config(config_path)
     base_config = format_config(base_config, verbose=False)
 

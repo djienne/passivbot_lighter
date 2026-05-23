@@ -1,14 +1,14 @@
 {
     "backtest": {
         "base_dir": "backtests/pbgui/hyperliquidhype",
-        "combine_ohlcvs": true,
+        "combine_ohlcvs": false,
         "compress_cache": true,
         "end_date": "now",
         "exchanges": [
             "lighter"
         ],
         "gap_tolerance_ohlcvs_minutes": 120,
-        "start_date": "2025-01-15",
+        "start_date": "2025-02-24",
         "starting_balance": 1000,
         "use_btc_collateral": false
     },
