@@ -480,7 +480,8 @@ async def run():
     log.info(f"  Max concurrent: {MAX_CONCURRENT}")
     log.info(f"  Request interval: {REQUEST_INTERVAL}s")
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(resolver=aiohttp.resolver.ThreadedResolver())
+    async with aiohttp.ClientSession(connector=connector) as session:
         markets = await discover_markets(session)
         if not markets:
             log.error("No markets found, exiting")

@@ -65,12 +65,12 @@
         },
         "combine_ohlcvs": false,
         "compress_cache": true,
-        "end_date": "2026-03-17",
+        "end_date": "now",
         "exchanges": [
-            "bybit"
+            "lighter"
         ],
         "gap_tolerance_ohlcvs_minutes": 120,
-        "start_date": "2025-01-01",
+        "start_date": "2025-02-24",
         "starting_balance": 100,
         "use_btc_collateral": false
     },
@@ -101,11 +101,12 @@
             "filter_volume_drop_pct": 0,
             "filter_volume_ema_span": 331.54,
             "n_positions": 1,
+            "risk_wel_enforcer_threshold": 1.0,
             "total_wallet_exposure_limit": 1.4,
-            "unstuck_close_pct": 0.0050246,
-            "unstuck_ema_dist": 0.0069327,
-            "unstuck_loss_allowance_pct": 0.18987,
-            "unstuck_threshold": 0.79883
+            "unstuck_close_pct": 0.0,
+            "unstuck_ema_dist": 0.0,
+            "unstuck_loss_allowance_pct": 0.0,
+            "unstuck_threshold": 1.0
         },
         "short": {
             "close_grid_markup_end": 0.001,
@@ -133,11 +134,12 @@
             "filter_volume_drop_pct": 0,
             "filter_volume_ema_span": 10,
             "n_positions": 0,
+            "risk_wel_enforcer_threshold": 1.0,
             "total_wallet_exposure_limit": 0,
-            "unstuck_close_pct": 0.005,
-            "unstuck_ema_dist": -0.1,
-            "unstuck_loss_allowance_pct": 0.01,
-            "unstuck_threshold": 0.7
+            "unstuck_close_pct": 0.0,
+            "unstuck_ema_dist": 0.0,
+            "unstuck_loss_allowance_pct": 0.0,
+            "unstuck_threshold": 1.0
         }
     },
     "coin_overrides": {},
