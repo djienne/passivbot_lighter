@@ -10,5 +10,5 @@ sortedcontainers==2.4.0
 portalocker==3.2.0
 tqdm==4.66.5
 openpyxl==3.1.5
-lighter-sdk==1.0.4
+lighter-sdk==1.0.9
 
