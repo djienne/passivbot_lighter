@@ -300,6 +300,19 @@ def build_backtest_payload(
     except Exception:
         first_ts_ms = 0
     backtest_params["first_timestamp_ms"] = first_ts_ms
+    if (
+        "candle_interval_minutes" not in backtest_params
+        or int(backtest_params.get("candle_interval_minutes") or 1) <= 1
+    ) and timestamps is not None and len(timestamps) > 1:
+        try:
+            ts_sample = np.asarray(timestamps[: min(len(timestamps), 1000)], dtype=np.int64)
+            diffs = np.diff(ts_sample)
+            diffs = diffs[diffs > 0]
+            if len(diffs):
+                interval_minutes = max(1, int(round(float(np.median(diffs)) / 60_000.0)))
+                backtest_params["candle_interval_minutes"] = interval_minutes
+        except Exception:
+            backtest_params.setdefault("candle_interval_minutes", 1)
 
     warmup_map = compute_per_coin_warmup_minutes(config)
     default_warm = int(warmup_map.get("__default__", 0))
@@ -494,6 +507,7 @@ def process_forager_fills(
             "psize",
             "pprice",
             "type",
+            "liquidity",
             "wallet_exposure",
             "twe_long",
             "twe_short",
@@ -937,7 +951,15 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
         bot_params_list.append(coin_specific_bot_params)
     if exchange_params is None:
         exchange_params = [
-            {k: mss[coin][k] for k in ["qty_step", "price_step", "min_qty", "min_cost", "c_mult"]}
+            {
+                "qty_step": mss[coin]["qty_step"],
+                "price_step": mss[coin]["price_step"],
+                "min_qty": mss[coin]["min_qty"],
+                "min_cost": mss[coin]["min_cost"],
+                "c_mult": mss[coin]["c_mult"],
+                "maker_fee": mss[coin].get("maker_fee", mss[coin].get("maker", 0.0002)),
+                "taker_fee": mss[coin].get("taker_fee", mss[coin].get("taker", 0.00055)),
+            }
             for coin in coins
         ]
     if backtest_params is None:
@@ -952,9 +974,17 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
             maker_fee = mss[coins[0]]["maker"]
         else:
             maker_fee = float(maker_fee_override)
+        taker_fee_override = get_optional_config_value(
+            config, "backtest.taker_fee_override", None
+        )
+        if taker_fee_override is None:
+            taker_fee = mss[coins[0]].get("taker_fee", mss[coins[0]].get("taker", maker_fee))
+        else:
+            taker_fee = float(taker_fee_override)
         backtest_params = {
             "starting_balance": require_config_value(config, "backtest.starting_balance"),
             "maker_fee": maker_fee,
+            "taker_fee": taker_fee,
             "coins": coins,
             "btc_collateral_cap": btc_collateral_cap,
             "btc_collateral_ltv_cap": btc_collateral_ltv_cap,
@@ -968,7 +998,49 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
             "filter_by_min_effective_cost": bool(
                 require_config_value(config, "backtest.filter_by_min_effective_cost")
             ),
+            "dynamic_wel_by_tradability": bool(
+                get_optional_config_value(config, "backtest.dynamic_wel_by_tradability", False)
+            ),
             "hedge_mode": bool(require_config_value(config, "live.hedge_mode")),
+            "max_realized_loss_pct": float(
+                get_optional_config_value(config, "backtest.max_realized_loss_pct", 1.0)
+            ),
+            "pnls_max_lookback_days": float(
+                get_optional_config_value(config, "live.pnls_max_lookback_days", -1.0)
+            ),
+            "liquidation_threshold": float(
+                get_optional_config_value(config, "backtest.liquidation_threshold", 0.0)
+            ),
+            "equity_hard_stop_loss": get_optional_config_value(
+                config,
+                "backtest.equity_hard_stop_loss",
+                {
+                    "enabled": False,
+                    "signal_mode": "unified",
+                    "red_threshold": 0.25,
+                    "ema_span_minutes": 60.0,
+                    "cooldown_minutes_after_red": 0.0,
+                    "no_restart_drawdown_threshold": 1.0,
+                    "tier_ratios": {"yellow": 0.5, "orange": 0.75},
+                    "orange_tier_mode": "tp_only_with_active_entry_cancellation",
+                    "panic_close_order_type": "market",
+                },
+            ),
+            "market_orders_allowed": bool(
+                get_optional_config_value(config, "backtest.market_orders_allowed", False)
+            ),
+            "market_order_near_touch_threshold": float(
+                get_optional_config_value(config, "backtest.market_order_near_touch_threshold", 0.001)
+            ),
+            "market_order_slippage_pct": float(
+                get_optional_config_value(config, "backtest.market_order_slippage_pct", 0.0005)
+            ),
+            "forager_score_hysteresis_pct": float(
+                get_optional_config_value(config, "backtest.forager_score_hysteresis_pct", 0.02)
+            ),
+            "candle_interval_minutes": int(
+                get_optional_config_value(config, "backtest.candle_interval_minutes", 1)
+            ),
         }
     return bot_params_list, exchange_params, backtest_params
 
@@ -992,6 +1064,7 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
             )
 
     shared_keys = {
+        "liquidated",
         "positions_held_per_day",
         "positions_held_per_day_w",
         "position_held_hours_mean",

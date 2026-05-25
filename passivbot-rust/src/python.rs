@@ -713,6 +713,8 @@ fn run_backtest_core<'py>(
             backtest.balance.use_btc_collateral,
             &backtest.total_wallet_exposures,
         );
+        analysis_usd.liquidated = backtest.liquidated();
+        analysis_btc.liquidated = backtest.liquidated();
         analysis_usd.entry_initial_balance_pct_long = entry_pct_long;
         analysis_usd.entry_initial_balance_pct_short = entry_pct_short;
         analysis_btc.entry_initial_balance_pct_long = entry_pct_long;
@@ -729,7 +731,7 @@ fn run_backtest_core<'py>(
                 py_analysis_btc,
             ));
         }
-        let mut py_fills = Array2::from_elem((fills.len(), 18), py.None());
+        let mut py_fills = Array2::from_elem((fills.len(), 19), py.None());
         for (i, fill) in fills.iter().enumerate() {
             py_fills[(i, 0)] = fill.index.into_py(py);
             py_fills[(i, 1)] = (fill.timestamp_ms as i64).into_py(py);
@@ -745,10 +747,11 @@ fn run_backtest_core<'py>(
             py_fills[(i, 11)] = fill.position_size.into_py(py);
             py_fills[(i, 12)] = fill.position_price.into_py(py);
             py_fills[(i, 13)] = fill.order_type.to_string().into_py(py);
-            py_fills[(i, 14)] = fill.wallet_exposure.into_py(py);
-            py_fills[(i, 15)] = fill.twe_long.into_py(py);
-            py_fills[(i, 16)] = fill.twe_short.into_py(py);
-            py_fills[(i, 17)] = fill.twe_net.into_py(py);
+            py_fills[(i, 14)] = fill.liquidity.clone().into_py(py);
+            py_fills[(i, 15)] = fill.wallet_exposure.into_py(py);
+            py_fills[(i, 16)] = fill.twe_long.into_py(py);
+            py_fills[(i, 17)] = fill.twe_short.into_py(py);
+            py_fills[(i, 18)] = fill.twe_net.into_py(py);
         }
 
         let equities_array =
@@ -789,9 +792,80 @@ fn struct_to_py_dict<T: Serialize + ?Sized>(py: Python<'_>, obj: &T) -> PyResult
 }
 
 fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
+    let parse_hsl_cfg = |parent: &PyDict| -> PyResult<crate::types::EquityHardStopLossConfig> {
+        let Some(item) = parent.get_item("equity_hard_stop_loss")? else {
+            return Ok(crate::types::EquityHardStopLossConfig::default());
+        };
+        if item.is_none() {
+            return Ok(crate::types::EquityHardStopLossConfig::default());
+        }
+        let cfg = item
+            .downcast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("equity_hard_stop_loss must be a dict"))?;
+        let ratios = cfg
+            .get_item("tier_ratios")?
+            .and_then(|item| item.downcast::<PyDict>().ok());
+        Ok(crate::types::EquityHardStopLossConfig {
+            enabled: cfg
+                .get_item("enabled")?
+                .map(|item| item.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false),
+            signal_mode: cfg
+                .get_item("signal_mode")?
+                .map(|item| item.extract::<String>())
+                .transpose()?
+                .unwrap_or_else(|| "unified".to_string()),
+            red_threshold: cfg
+                .get_item("red_threshold")?
+                .map(|item| item.extract::<f64>())
+                .transpose()?
+                .unwrap_or(0.25),
+            ema_span_minutes: cfg
+                .get_item("ema_span_minutes")?
+                .map(|item| item.extract::<f64>())
+                .transpose()?
+                .unwrap_or(60.0),
+            cooldown_minutes_after_red: cfg
+                .get_item("cooldown_minutes_after_red")?
+                .map(|item| item.extract::<f64>())
+                .transpose()?
+                .unwrap_or(0.0),
+            no_restart_drawdown_threshold: cfg
+                .get_item("no_restart_drawdown_threshold")?
+                .map(|item| item.extract::<f64>())
+                .transpose()?
+                .unwrap_or(1.0),
+            tier_ratios: crate::types::EquityHardStopLossTierRatios {
+                yellow: ratios
+                    .and_then(|r| r.get_item("yellow").ok().flatten())
+                    .map(|item| item.extract::<f64>())
+                    .transpose()?
+                    .unwrap_or(0.5),
+                orange: ratios
+                    .and_then(|r| r.get_item("orange").ok().flatten())
+                    .map(|item| item.extract::<f64>())
+                    .transpose()?
+                    .unwrap_or(0.75),
+            },
+            orange_tier_mode: cfg
+                .get_item("orange_tier_mode")?
+                .map(|item| item.extract::<String>())
+                .transpose()?
+                .unwrap_or_else(|| "tp_only_with_active_entry_cancellation".to_string()),
+            panic_close_order_type: cfg
+                .get_item("panic_close_order_type")?
+                .map(|item| item.extract::<String>())
+                .transpose()?
+                .unwrap_or_else(|| "market".to_string()),
+        })
+    };
+
     Ok(BacktestParams {
         starting_balance: extract_value(dict, "starting_balance").unwrap_or_default(),
         maker_fee: extract_value(dict, "maker_fee").unwrap_or_default(),
+        taker_fee: extract_value(dict, "taker_fee")
+            .unwrap_or_else(|_| extract_value(dict, "maker_fee").unwrap_or_default()),
         coins: extract_value(dict, "coins").unwrap_or_default(),
         active_coin_indices: dict
             .get_item("active_coin_indices")?
@@ -837,11 +911,57 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<bool>())
             .transpose()?
             .unwrap_or(false),
+        dynamic_wel_by_tradability: dict
+            .get_item("dynamic_wel_by_tradability")?
+            .map(|item| item.extract::<bool>())
+            .transpose()?
+            .unwrap_or(false),
         hedge_mode: dict
             .get_item("hedge_mode")?
             .map(|item| item.extract::<bool>())
             .transpose()?
             .unwrap_or(true),
+        max_realized_loss_pct: dict
+            .get_item("max_realized_loss_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(1.0),
+        pnls_max_lookback_days: dict
+            .get_item("pnls_max_lookback_days")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(-1.0),
+        liquidation_threshold: dict
+            .get_item("liquidation_threshold")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.0),
+        equity_hard_stop_loss: parse_hsl_cfg(dict)?,
+        market_orders_allowed: dict
+            .get_item("market_orders_allowed")?
+            .map(|item| item.extract::<bool>())
+            .transpose()?
+            .unwrap_or(false),
+        market_order_near_touch_threshold: dict
+            .get_item("market_order_near_touch_threshold")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.001),
+        market_order_slippage_pct: dict
+            .get_item("market_order_slippage_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.0005),
+        forager_score_hysteresis_pct: dict
+            .get_item("forager_score_hysteresis_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.02),
+        candle_interval_minutes: dict
+            .get_item("candle_interval_minutes")?
+            .map(|item| item.extract::<u64>())
+            .transpose()?
+            .unwrap_or(1),
     })
 }
 
@@ -852,6 +972,8 @@ fn exchange_params_from_dict(dict: &PyDict) -> PyResult<ExchangeParams> {
         min_qty: extract_value(dict, "min_qty").unwrap_or_default(),
         min_cost: extract_value(dict, "min_cost").unwrap_or_default(),
         c_mult: extract_value(dict, "c_mult").unwrap_or_default(),
+        maker_fee: extract_value(dict, "maker_fee").unwrap_or(0.0002),
+        taker_fee: extract_value(dict, "taker_fee").unwrap_or(0.00055),
     })
 }
 
@@ -1033,6 +1155,7 @@ pub fn calc_next_entry_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1123,6 +1246,7 @@ pub fn calc_next_close_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1209,6 +1333,7 @@ pub fn calc_next_entry_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1299,6 +1424,7 @@ pub fn calc_next_close_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1385,6 +1511,7 @@ pub fn calc_entries_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
@@ -1486,6 +1613,7 @@ pub fn calc_entries_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
@@ -1561,6 +1689,7 @@ pub fn calc_min_entry_qty_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     crate::entries::calc_min_entry_qty(price, &exchange_params)
 }
@@ -1597,6 +1726,7 @@ pub fn calc_closes_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
@@ -1679,6 +1809,7 @@ pub fn calc_closes_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
