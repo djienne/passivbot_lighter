@@ -751,6 +751,55 @@ fn run_backtest_core<'py>(
             hard_stop_metrics.flatten_time_minutes_mean;
         analysis_btc.hard_stop_post_restart_retrigger_pct =
             hard_stop_metrics.post_restart_retrigger_pct;
+        let strategy_metrics = backtest.strategy_equity_metrics();
+        analysis_usd.gain_strategy_eq = strategy_metrics.gain_strategy_eq;
+        analysis_usd.adg_strategy_eq = strategy_metrics.adg_strategy_eq;
+        analysis_usd.mdg_strategy_eq = strategy_metrics.mdg_strategy_eq;
+        analysis_usd.sharpe_ratio_strategy_eq = strategy_metrics.sharpe_ratio_strategy_eq;
+        analysis_usd.sortino_ratio_strategy_eq = strategy_metrics.sortino_ratio_strategy_eq;
+        analysis_usd.omega_ratio_strategy_eq = strategy_metrics.omega_ratio_strategy_eq;
+        analysis_usd.expected_shortfall_1pct_strategy_eq =
+            strategy_metrics.expected_shortfall_1pct_strategy_eq;
+        analysis_usd.calmar_ratio_strategy_eq = strategy_metrics.calmar_ratio_strategy_eq;
+        analysis_usd.sterling_ratio_strategy_eq = strategy_metrics.sterling_ratio_strategy_eq;
+        analysis_usd.drawdown_worst_strategy_eq = strategy_metrics.drawdown_worst_strategy_eq;
+        analysis_usd.drawdown_worst_mean_1pct_strategy_eq =
+            strategy_metrics.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_usd.peak_recovery_hours_strategy_eq =
+            strategy_metrics.peak_recovery_hours_strategy_eq;
+        analysis_usd.peak_recovery_days_strategy_eq =
+            strategy_metrics.peak_recovery_days_strategy_eq;
+        analysis_usd.adg_strategy_eq_w = strategy_metrics.adg_strategy_eq_w;
+        analysis_usd.mdg_strategy_eq_w = strategy_metrics.mdg_strategy_eq_w;
+        analysis_usd.sharpe_ratio_strategy_eq_w = strategy_metrics.sharpe_ratio_strategy_eq_w;
+        analysis_usd.sortino_ratio_strategy_eq_w = strategy_metrics.sortino_ratio_strategy_eq_w;
+        analysis_usd.omega_ratio_strategy_eq_w = strategy_metrics.omega_ratio_strategy_eq_w;
+        analysis_usd.calmar_ratio_strategy_eq_w = strategy_metrics.calmar_ratio_strategy_eq_w;
+        analysis_usd.sterling_ratio_strategy_eq_w = strategy_metrics.sterling_ratio_strategy_eq_w;
+        analysis_btc.gain_strategy_eq = strategy_metrics.gain_strategy_eq;
+        analysis_btc.adg_strategy_eq = strategy_metrics.adg_strategy_eq;
+        analysis_btc.mdg_strategy_eq = strategy_metrics.mdg_strategy_eq;
+        analysis_btc.sharpe_ratio_strategy_eq = strategy_metrics.sharpe_ratio_strategy_eq;
+        analysis_btc.sortino_ratio_strategy_eq = strategy_metrics.sortino_ratio_strategy_eq;
+        analysis_btc.omega_ratio_strategy_eq = strategy_metrics.omega_ratio_strategy_eq;
+        analysis_btc.expected_shortfall_1pct_strategy_eq =
+            strategy_metrics.expected_shortfall_1pct_strategy_eq;
+        analysis_btc.calmar_ratio_strategy_eq = strategy_metrics.calmar_ratio_strategy_eq;
+        analysis_btc.sterling_ratio_strategy_eq = strategy_metrics.sterling_ratio_strategy_eq;
+        analysis_btc.drawdown_worst_strategy_eq = strategy_metrics.drawdown_worst_strategy_eq;
+        analysis_btc.drawdown_worst_mean_1pct_strategy_eq =
+            strategy_metrics.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_btc.peak_recovery_hours_strategy_eq =
+            strategy_metrics.peak_recovery_hours_strategy_eq;
+        analysis_btc.peak_recovery_days_strategy_eq =
+            strategy_metrics.peak_recovery_days_strategy_eq;
+        analysis_btc.adg_strategy_eq_w = strategy_metrics.adg_strategy_eq_w;
+        analysis_btc.mdg_strategy_eq_w = strategy_metrics.mdg_strategy_eq_w;
+        analysis_btc.sharpe_ratio_strategy_eq_w = strategy_metrics.sharpe_ratio_strategy_eq_w;
+        analysis_btc.sortino_ratio_strategy_eq_w = strategy_metrics.sortino_ratio_strategy_eq_w;
+        analysis_btc.omega_ratio_strategy_eq_w = strategy_metrics.omega_ratio_strategy_eq_w;
+        analysis_btc.calmar_ratio_strategy_eq_w = strategy_metrics.calmar_ratio_strategy_eq_w;
+        analysis_btc.sterling_ratio_strategy_eq_w = strategy_metrics.sterling_ratio_strategy_eq_w;
 
         // Create a dictionary to store analysis results using a more concise approach
         let py_analysis_usd = struct_to_py_dict(py, &analysis_usd)?;

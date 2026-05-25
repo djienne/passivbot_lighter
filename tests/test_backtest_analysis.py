@@ -75,3 +75,45 @@ def test_expand_analysis_includes_entry_balance_pct():
     assert "entry_initial_balance_pct_short" in result
     assert result["entry_initial_balance_pct_long"] == 0.123
     assert result["entry_initial_balance_pct_short"] == 0.123
+
+
+def test_expand_analysis_keeps_strategy_trade_metrics_shared():
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.75)
+    for key in [
+        "win_rate",
+        "win_rate_w",
+        "trade_loss_max",
+        "trade_loss_mean",
+        "trade_loss_median",
+        "gain_strategy_eq",
+        "adg_strategy_eq",
+        "drawdown_worst_strategy_eq",
+        "peak_recovery_hours_strategy_eq",
+        "loss_profit_ratio_long",
+        "loss_profit_ratio_short",
+    ]:
+        analysis_usd[key] = 0.25
+        analysis_btc[key] = 0.25
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+
+    assert result["win_rate"] == 0.25
+    assert result["trade_loss_max"] == 0.25
+    assert result["gain_strategy_eq"] == 0.25
+    assert result["drawdown_worst_strategy_eq"] == 0.25
+    assert result["loss_profit_ratio_long"] == 0.25
+    assert "win_rate_usd" not in result
+    assert "gain_strategy_eq_usd" not in result

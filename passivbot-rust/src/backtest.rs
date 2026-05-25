@@ -1,3 +1,4 @@
+use crate::analysis::analyze_equity_series;
 use crate::constants::{CLOSE, HIGH, LONG, LOW, SHORT, VOLUME};
 use crate::entries::calc_min_entry_qty;
 use crate::equity_hard_stop_loss as ehsl;
@@ -39,6 +40,8 @@ const DEBUG_UNSTUCK_COIN_FILTER: Option<&str> = None;
 const DEBUG_TRACE_WINDOW: Option<(usize, usize)> = None;
 // Optional coin filter for balance trace debug (by coin name, e.g. Some("SOL")); None dumps all.
 const DEBUG_TRACE_COIN_FILTER: Option<&str> = None;
+const MS_PER_DAY: u64 = 86_400_000;
+const MS_PER_HOUR: u64 = 3_600_000;
 use ndarray::{ArrayView1, ArrayView3};
 use serde_json;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -312,6 +315,30 @@ pub struct HardStopMetrics {
     pub post_restart_retrigger_pct: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StrategyEquityMetrics {
+    pub gain_strategy_eq: f64,
+    pub adg_strategy_eq: f64,
+    pub mdg_strategy_eq: f64,
+    pub sharpe_ratio_strategy_eq: f64,
+    pub sortino_ratio_strategy_eq: f64,
+    pub omega_ratio_strategy_eq: f64,
+    pub expected_shortfall_1pct_strategy_eq: f64,
+    pub calmar_ratio_strategy_eq: f64,
+    pub sterling_ratio_strategy_eq: f64,
+    pub drawdown_worst_strategy_eq: f64,
+    pub drawdown_worst_mean_1pct_strategy_eq: f64,
+    pub peak_recovery_hours_strategy_eq: f64,
+    pub peak_recovery_days_strategy_eq: f64,
+    pub adg_strategy_eq_w: f64,
+    pub mdg_strategy_eq_w: f64,
+    pub sharpe_ratio_strategy_eq_w: f64,
+    pub sortino_ratio_strategy_eq_w: f64,
+    pub omega_ratio_strategy_eq_w: f64,
+    pub calmar_ratio_strategy_eq_w: f64,
+    pub sterling_ratio_strategy_eq_w: f64,
+}
+
 #[derive(Default, Debug)]
 pub struct TrailingPrices {
     pub long: HashMap<usize, TrailingPriceBundle>,
@@ -396,6 +423,9 @@ pub struct Backtest<'a> {
     hard_stop_panic_close_loss_max: f64,
     hard_stop_flatten_time_minutes_sum: f64,
     hard_stop_flatten_time_count: u32,
+    strategy_equity_series: Vec<f64>,
+    strategy_equity_timestamps_ms: Vec<u64>,
+    final_strategy_equity_metrics: Option<StrategyEquityMetrics>,
     trading_enabled: TradingEnabled,
     trailing_enabled: Vec<TrailingEnabled>,
     any_trailing_long: bool,
@@ -1636,6 +1666,9 @@ impl<'a> Backtest<'a> {
             hard_stop_panic_close_loss_max: 0.0,
             hard_stop_flatten_time_minutes_sum: 0.0,
             hard_stop_flatten_time_count: 0,
+            strategy_equity_series: Vec::new(),
+            strategy_equity_timestamps_ms: Vec::new(),
+            final_strategy_equity_metrics: None,
             trading_enabled: TradingEnabled {
                 long: bot_params
                     .iter()
@@ -1737,6 +1770,7 @@ impl<'a> Backtest<'a> {
             }
             if self.equity_tracking_active {
                 self.update_equities(k);
+                self.record_strategy_equity_sample();
                 self.record_total_wallet_exposure();
                 if self.check_and_apply_liquidation(k) {
                     break;
@@ -1744,6 +1778,7 @@ impl<'a> Backtest<'a> {
             }
         }
         self.finalize_hard_stop_at_end(self.timestamp_at(self.current_step));
+        self.final_strategy_equity_metrics = Some(self.strategy_equity_metrics());
         if let Some(mut writer) = self.debug_writer.take() {
             writer.finish();
         }
@@ -2135,6 +2170,141 @@ impl<'a> Backtest<'a> {
                 self.finalize_hard_stop_halt_if_needed(pside, timestamp_ms);
             }
         }
+    }
+
+    fn record_strategy_equity_sample(&mut self) {
+        let Some(&equity) = self.equities.usd_total_equity.last() else {
+            return;
+        };
+        let Some(&timestamp_ms) = self.equities.timestamps_ms.last() else {
+            return;
+        };
+        let balance = self.balance.usd_total_balance;
+        let unrealized_pnl = equity - balance;
+        let strategy_pnl = self.pnl_cumsum_running_net + unrealized_pnl;
+        self.strategy_equity_series
+            .push(self.backtest_params.starting_balance + strategy_pnl);
+        self.strategy_equity_timestamps_ms.push(timestamp_ms);
+    }
+
+    fn strategy_equity_metrics_from_series(
+        &self,
+        strategy_equity_series: &[f64],
+        timestamps_ms: &[u64],
+    ) -> StrategyEquityMetrics {
+        let sample_count = strategy_equity_series.len().min(timestamps_ms.len());
+        if sample_count < 2 {
+            return StrategyEquityMetrics::default();
+        }
+        let series = &strategy_equity_series[strategy_equity_series.len() - sample_count..];
+        let timestamps = &timestamps_ms[timestamps_ms.len() - sample_count..];
+        let drawdowns = calc_strategy_equity_drawdowns(series);
+
+        let compute_metrics = |series: &[f64], timestamps: &[u64], drawdowns: &[f64]| {
+            if series.len() < 2 || timestamps.len() != series.len() {
+                return StrategyEquityMetrics::default();
+            }
+            let equity_metrics = analyze_equity_series(series, timestamps);
+            let drawdown_worst = drawdowns.iter().fold(0.0_f64, |max_dd, &x| max_dd.max(x));
+            let daily_worst_drawdowns =
+                daily_worst_strategy_drawdowns(drawdowns, timestamps, series.len());
+            let drawdown_worst_mean_1pct = mean_worst_1pct_abs_local(&daily_worst_drawdowns);
+            StrategyEquityMetrics {
+                gain_strategy_eq: equity_metrics.gain,
+                adg_strategy_eq: equity_metrics.adg,
+                mdg_strategy_eq: equity_metrics.mdg,
+                sharpe_ratio_strategy_eq: equity_metrics.sharpe_ratio,
+                sortino_ratio_strategy_eq: equity_metrics.sortino_ratio,
+                omega_ratio_strategy_eq: equity_metrics.omega_ratio,
+                expected_shortfall_1pct_strategy_eq: equity_metrics.expected_shortfall_1pct,
+                calmar_ratio_strategy_eq: equity_metrics.adg / drawdown_worst.max(1e-12),
+                sterling_ratio_strategy_eq: equity_metrics.adg
+                    / drawdown_worst_mean_1pct.max(1e-12),
+                drawdown_worst_strategy_eq: drawdown_worst,
+                drawdown_worst_mean_1pct_strategy_eq: drawdown_worst_mean_1pct,
+                ..StrategyEquityMetrics::default()
+            }
+        };
+
+        let full = compute_metrics(series, timestamps, &drawdowns);
+        let peak_recovery_hours_strategy_eq =
+            calc_peak_recovery_hours_from_strategy_series(series, timestamps);
+        let peak_recovery_days_strategy_eq = peak_recovery_hours_strategy_eq / 24.0;
+        let n = sample_count;
+        let mut subset_metrics = Vec::with_capacity(10);
+        subset_metrics.push(StrategyEquityMetrics {
+            peak_recovery_hours_strategy_eq,
+            peak_recovery_days_strategy_eq,
+            ..full
+        });
+        for i in 1..10 {
+            let fraction = 1.0 / (1.0 + i as f64);
+            let start_idx = (n as f64 - fraction * n as f64).round() as usize;
+            if start_idx >= n {
+                continue;
+            }
+            let subset_series = &series[start_idx..];
+            let subset_timestamps = &timestamps[start_idx..];
+            let subset_drawdowns = &drawdowns[start_idx..];
+            let mut subset_metric =
+                compute_metrics(subset_series, subset_timestamps, subset_drawdowns);
+            subset_metric.peak_recovery_hours_strategy_eq =
+                calc_peak_recovery_hours_from_strategy_series(subset_series, subset_timestamps);
+            subset_metric.peak_recovery_days_strategy_eq =
+                subset_metric.peak_recovery_hours_strategy_eq / 24.0;
+            subset_metrics.push(subset_metric);
+        }
+
+        StrategyEquityMetrics {
+            peak_recovery_hours_strategy_eq,
+            peak_recovery_days_strategy_eq,
+            adg_strategy_eq_w: subset_metrics
+                .iter()
+                .map(|m| m.adg_strategy_eq)
+                .sum::<f64>()
+                / 10.0,
+            mdg_strategy_eq_w: subset_metrics
+                .iter()
+                .map(|m| m.mdg_strategy_eq)
+                .sum::<f64>()
+                / 10.0,
+            sharpe_ratio_strategy_eq_w: subset_metrics
+                .iter()
+                .map(|m| m.sharpe_ratio_strategy_eq)
+                .sum::<f64>()
+                / 10.0,
+            sortino_ratio_strategy_eq_w: subset_metrics
+                .iter()
+                .map(|m| m.sortino_ratio_strategy_eq)
+                .sum::<f64>()
+                / 10.0,
+            omega_ratio_strategy_eq_w: subset_metrics
+                .iter()
+                .map(|m| m.omega_ratio_strategy_eq)
+                .sum::<f64>()
+                / 10.0,
+            calmar_ratio_strategy_eq_w: subset_metrics
+                .iter()
+                .map(|m| m.calmar_ratio_strategy_eq)
+                .sum::<f64>()
+                / 10.0,
+            sterling_ratio_strategy_eq_w: subset_metrics
+                .iter()
+                .map(|m| m.sterling_ratio_strategy_eq)
+                .sum::<f64>()
+                / 10.0,
+            ..full
+        }
+    }
+
+    pub fn strategy_equity_metrics(&self) -> StrategyEquityMetrics {
+        if self.strategy_equity_series.is_empty() {
+            return self.final_strategy_equity_metrics.unwrap_or_default();
+        }
+        self.strategy_equity_metrics_from_series(
+            &self.strategy_equity_series,
+            &self.strategy_equity_timestamps_ms,
+        )
     }
 
     pub fn hard_stop_metrics(&self) -> HardStopMetrics {
@@ -3560,6 +3730,101 @@ fn span_minutes_to_bars(span_minutes: f64, candle_interval_minutes: u64) -> f64 
     (span_minutes / interval).max(1.0)
 }
 
+fn calc_strategy_equity_drawdowns(values: &[f64]) -> Vec<f64> {
+    let mut peak = f64::NEG_INFINITY;
+    let mut drawdowns = Vec::with_capacity(values.len());
+    for &value in values {
+        if value.is_finite() {
+            peak = peak.max(value);
+        }
+        if peak.is_finite() && peak > 0.0 && value.is_finite() {
+            drawdowns.push((1.0 - value / peak).max(0.0));
+        } else {
+            drawdowns.push(0.0);
+        }
+    }
+    drawdowns
+}
+
+fn mean_worst_1pct_abs_local(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let worst_n = ((sorted.len() as f64) * 0.01).ceil().max(1.0) as usize;
+    sorted
+        .iter()
+        .rev()
+        .take(worst_n.min(sorted.len()))
+        .map(|x| x.abs())
+        .sum::<f64>()
+        / worst_n.min(sorted.len()) as f64
+}
+
+fn daily_worst_strategy_drawdowns(
+    drawdowns: &[f64],
+    timestamps_ms: &[u64],
+    fallback_len: usize,
+) -> Vec<f64> {
+    if drawdowns.is_empty() {
+        return Vec::new();
+    }
+    let use_timestamps = timestamps_ms.len() == drawdowns.len();
+    let mut current_day = if use_timestamps {
+        (timestamps_ms[0] / MS_PER_DAY) as usize
+    } else {
+        0
+    };
+    let mut current_worst = drawdowns[0];
+    let mut daily_worst = Vec::new();
+    for (i, &drawdown) in drawdowns.iter().enumerate() {
+        let day = if use_timestamps {
+            (timestamps_ms[i] / MS_PER_DAY) as usize
+        } else {
+            i.min(fallback_len) / 1440
+        };
+        if day > current_day {
+            daily_worst.push(current_worst);
+            current_day = day;
+            current_worst = drawdown;
+        } else {
+            current_worst = current_worst.max(drawdown);
+        }
+    }
+    daily_worst.push(current_worst);
+    daily_worst
+}
+
+fn calc_peak_recovery_hours_from_strategy_series(series: &[f64], timestamps_ms: &[u64]) -> f64 {
+    if series.is_empty() {
+        return 0.0;
+    }
+    let use_timestamps = timestamps_ms.len() == series.len();
+    let mut peak = f64::NEG_INFINITY;
+    let mut peak_ts = if use_timestamps { timestamps_ms[0] } else { 0 };
+    let mut max_duration_ms = 0_u64;
+    for (i, &value) in series.iter().enumerate() {
+        let ts = if use_timestamps {
+            timestamps_ms[i]
+        } else {
+            (i as u64) * 60_000
+        };
+        if value >= peak {
+            max_duration_ms = max_duration_ms.max(ts.saturating_sub(peak_ts));
+            peak = value;
+            peak_ts = ts;
+        }
+    }
+    if let Some(&last_ts) = timestamps_ms.last() {
+        max_duration_ms = max_duration_ms.max(last_ts.saturating_sub(peak_ts));
+    }
+    max_duration_ms as f64 / MS_PER_HOUR as f64
+}
+
 fn calc_ema_alphas(bot_params_pair: &BotParamsPair, candle_interval_minutes: u64) -> EmaAlphas {
     let mut ema_spans_long = [
         span_minutes_to_bars(bot_params_pair.long.ema_span_0, candle_interval_minutes),
@@ -3829,6 +4094,43 @@ mod tests {
         assert!(bt.liquidated());
         assert!((bt.equities.usd_total_equity[0] - 50.0).abs() < 1e-12);
         assert!((bt.equities.btc_total_equity[0] - 25.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn strategy_equity_metrics_are_populated_from_rebased_pnl_series() {
+        let hlcvs = Array3::from_shape_vec((3, 1, 4), vec![1.0; 3 * 1 * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; 3]);
+        let bp_pair = make_test_bot_params_pair();
+        let mut backtest_params = make_test_backtest_params(3, 1);
+        backtest_params.starting_balance = 100.0;
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair],
+            vec![ExchangeParams::default()],
+            &backtest_params,
+        );
+
+        for (timestamp_ms, equity) in [
+            (0_u64, 100.0_f64),
+            (86_400_000_u64, 90.0_f64),
+            (172_800_000_u64, 75.0_f64),
+        ] {
+            bt.balance.usd_total_balance = 100.0;
+            bt.equities.timestamps_ms.push(timestamp_ms);
+            bt.equities.usd_total_equity.push(equity);
+            bt.record_strategy_equity_sample();
+        }
+
+        let metrics = bt.strategy_equity_metrics();
+        let expected_gain: f64 = ((100.0 + 90.0 + 75.0) / 3.0) / 100.0;
+        let expected_adg = expected_gain.powf(1.0 / 3.0) - 1.0;
+
+        assert!((metrics.gain_strategy_eq - expected_gain).abs() < 1e-12);
+        assert!((metrics.adg_strategy_eq - expected_adg).abs() < 1e-12);
+        assert!((metrics.drawdown_worst_strategy_eq - 0.25).abs() < 1e-12);
+        assert!((metrics.drawdown_worst_mean_1pct_strategy_eq - 0.25).abs() < 1e-12);
+        assert!((metrics.peak_recovery_hours_strategy_eq - 48.0).abs() < 1e-12);
     }
 
     #[test]

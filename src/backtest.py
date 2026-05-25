@@ -46,6 +46,7 @@ from config_utils import (
     require_live_value,
     get_optional_config_value,
     strip_config_metadata,
+    ANALYSIS_SHARED_KEYS,
 )
 from utils import (
     utc_ms,
@@ -333,10 +334,12 @@ def build_backtest_payload(
         last_valid_indices.append(last_idx)
         warm = int(meta.get("warmup_minutes", warmup_map.get(coin, default_warm)))
         warmup_minutes.append(warm)
+        interval_minutes = max(1, int(backtest_params.get("candle_interval_minutes") or 1))
+        warm_bars = (warm + interval_minutes - 1) // interval_minutes
         if first_idx > last_idx:
             trade_idx = first_idx
         else:
-            trade_idx = min(last_idx, first_idx + warm)
+            trade_idx = min(last_idx, first_idx + warm_bars)
         trade_start_indices.append(trade_idx)
     backtest_params["first_valid_indices"] = first_valid_indices
     backtest_params["last_valid_indices"] = last_valid_indices
@@ -1063,47 +1066,7 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
                 else None
             )
 
-    shared_keys = {
-        "liquidated",
-        "positions_held_per_day",
-        "positions_held_per_day_w",
-        "position_held_hours_mean",
-        "position_held_hours_max",
-        "position_held_hours_median",
-        "position_unchanged_hours_max",
-        "loss_profit_ratio",
-        "loss_profit_ratio_w",
-        "volume_pct_per_day_avg",
-        "volume_pct_per_day_avg_w",
-        "peak_recovery_hours_pnl",
-        "total_wallet_exposure_max",
-        "total_wallet_exposure_mean",
-        "total_wallet_exposure_median",
-        "entry_initial_balance_pct_long",
-        "entry_initial_balance_pct_short",
-        "adg_pnl",
-        "adg_pnl_w",
-        "mdg_pnl",
-        "mdg_pnl_w",
-        "sharpe_ratio_pnl",
-        "sharpe_ratio_pnl_w",
-        "sortino_ratio_pnl",
-        "sortino_ratio_pnl_w",
-        "hard_stop_triggers",
-        "hard_stop_triggers_per_year",
-        "hard_stop_restarts",
-        "hard_stop_restarts_per_year",
-        "hard_stop_time_in_yellow_pct",
-        "hard_stop_time_in_orange_pct",
-        "hard_stop_time_in_red_pct",
-        "hard_stop_duration_minutes_mean",
-        "hard_stop_duration_minutes_max",
-        "hard_stop_trigger_drawdown_mean",
-        "hard_stop_panic_close_loss_sum",
-        "hard_stop_panic_close_loss_max",
-        "hard_stop_flatten_time_minutes_mean",
-        "hard_stop_post_restart_retrigger_pct",
-    }
+    shared_keys = set(ANALYSIS_SHARED_KEYS)
 
     result = {}
 
