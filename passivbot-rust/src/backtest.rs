@@ -1180,6 +1180,9 @@ impl<'a> Backtest<'a> {
 
         input.balance = self.balance.usd_total_balance_rounded;
         input.balance_raw = self.balance.usd_total_balance;
+        let (realized_pnl_cumsum_max, realized_pnl_cumsum_last) = self.effective_pnl_cumsum(k);
+        input.global.realized_pnl_cumsum_max = realized_pnl_cumsum_max;
+        input.global.realized_pnl_cumsum_last = realized_pnl_cumsum_last;
 
         let balance = input.balance;
         input.global.unstuck_allowance_long =
@@ -1725,10 +1728,12 @@ impl<'a> Backtest<'a> {
         }
 
         // --- register first & last valid candle for every coin ---
+        let bars_per_day =
+            ((MS_PER_DAY + self.interval_ms.saturating_sub(1)) / self.interval_ms).max(1) as usize;
         for idx in 0..self.n_coins {
             if let Some((start, end)) = self.coin_valid_range(idx) {
                 self.first_valid_timestamps.insert(idx, start);
-                if end.saturating_add(1400) < n_timesteps {
+                if end.saturating_add(bars_per_day) < n_timesteps {
                     // add only if delisted more than one day before last timestamp
                     self.last_valid_timestamps.insert(idx, end);
                 }
@@ -3978,12 +3983,16 @@ mod tests {
         bt.orchestrator_input_cache = Some(input);
 
         bt.bot_params[0].long.wallet_exposure_limit = 0.2;
+        bt.pnl_cumsum_running = -25.0;
+        bt.pnl_cumsum_max = 10.0;
 
         let input = bt.get_orchestrator_input_cached(1, None);
         assert!(
             (input.symbols[0].long.bot_params.wallet_exposure_limit - 0.2).abs() < 1e-12,
             "expected cached input WEL to update after bot_params change"
         );
+        assert!((input.global.realized_pnl_cumsum_max - 10.0).abs() < 1e-12);
+        assert!((input.global.realized_pnl_cumsum_last + 25.0).abs() < 1e-12);
         bt.orchestrator_input_cache = Some(input);
     }
 
@@ -4157,6 +4166,33 @@ mod tests {
         assert!((alpha_1m - (2.0 / 11.0)).abs() < 1e-12);
         assert!((alpha_5m - (2.0 / 3.0)).abs() < 1e-12);
         assert!(alpha_5m > alpha_1m);
+    }
+
+    #[test]
+    fn five_minute_delisting_day_window_uses_interval_bars() {
+        let n_timesteps = 400;
+        let hlcvs =
+            Array3::from_shape_vec((n_timesteps, 1, 4), vec![1.0; n_timesteps * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; n_timesteps]);
+        let mut bp_pair = make_test_bot_params_pair();
+        bp_pair.long.wallet_exposure_limit = 0.0;
+        bp_pair.short.wallet_exposure_limit = 0.0;
+        let mut backtest_params = make_test_backtest_params(n_timesteps, 5);
+        backtest_params.last_valid_indices = vec![100];
+
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair],
+            vec![ExchangeParams::default()],
+            &backtest_params,
+        );
+        bt.run();
+
+        assert!(
+            bt.last_valid_timestamps.contains_key(&0),
+            "5m data should treat 288 bars, not 1400 bars, as roughly one day"
+        );
     }
 
     #[test]
