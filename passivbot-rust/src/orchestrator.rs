@@ -3207,6 +3207,167 @@ mod core {
             assert_eq!(out.orders.len(), 1);
             assert_eq!(out.orders[0].order_type, OrderType::ClosePanicLong);
         }
+
+        #[test]
+        fn market_execution_marks_near_touch_orders_and_panic_closes() {
+            let order_book = OrderBook {
+                bid: 100.0,
+                ask: 102.0,
+            };
+            let near_touch_entry = IdealOrder {
+                symbol_idx: 0,
+                pside: PositionSide::Long,
+                qty: 1.0,
+                price: 101.0,
+                order_type: OrderType::EntryInitialNormalLong,
+            };
+            let limit_global = OrchestratorGlobal::default();
+            assert_eq!(
+                to_executable_order(near_touch_entry.clone(), &limit_global, &order_book)
+                    .execution_type,
+                ExecutionType::Limit
+            );
+
+            let market_global = OrchestratorGlobal {
+                market_orders_allowed: true,
+                market_order_near_touch_threshold: 0.02,
+                ..Default::default()
+            };
+            assert_eq!(
+                to_executable_order(near_touch_entry, &market_global, &order_book).execution_type,
+                ExecutionType::Market
+            );
+
+            let panic_close = IdealOrder {
+                symbol_idx: 0,
+                pside: PositionSide::Long,
+                qty: -1.0,
+                price: 90.0,
+                order_type: OrderType::ClosePanicLong,
+            };
+            let panic_global = OrchestratorGlobal {
+                panic_close_market: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                to_executable_order(panic_close, &panic_global, &order_book).execution_type,
+                ExecutionType::Market
+            );
+        }
+
+        #[test]
+        fn realized_loss_gate_blocks_lossy_non_panic_close_and_keeps_panic_close() {
+            let mut sym = make_basic_symbol(0);
+            sym.long.position = Position {
+                size: 1.0,
+                price: 100.0,
+            };
+
+            let input = OrchestratorInput {
+                balance: 950.0,
+                balance_raw: 950.0,
+                global: OrchestratorGlobal {
+                    max_realized_loss_pct: 0.05,
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: -50.0,
+                    ..Default::default()
+                },
+                symbols: vec![sym],
+                peek_hints: None,
+            };
+            let mut per_long = vec![Some(PerSymbolOrders {
+                symbol_idx: 0,
+                entries: Vec::new(),
+                closes: vec![
+                    IdealOrder {
+                        symbol_idx: 0,
+                        pside: PositionSide::Long,
+                        qty: -1.0,
+                        price: 50.0,
+                        order_type: OrderType::CloseGridLong,
+                    },
+                    IdealOrder {
+                        symbol_idx: 0,
+                        pside: PositionSide::Long,
+                        qty: -1.0,
+                        price: 50.0,
+                        order_type: OrderType::ClosePanicLong,
+                    },
+                ],
+                pos: Position {
+                    size: 1.0,
+                    price: 100.0,
+                },
+                mode: TradingMode::Normal,
+            })];
+            let mut per_short = vec![None];
+            let mut diagnostics = OrchestratorDiagnostics::default();
+
+            gate_lossy_closes_by_peak_balance(
+                &input,
+                &mut per_long,
+                &mut per_short,
+                &mut diagnostics,
+            );
+
+            let closes = &per_long[0].as_ref().unwrap().closes;
+            assert_eq!(closes.len(), 1);
+            assert_eq!(closes[0].order_type, OrderType::ClosePanicLong);
+            assert_eq!(diagnostics.loss_gate_blocks.len(), 1);
+            let block = &diagnostics.loss_gate_blocks[0];
+            assert_eq!(block.order_type, OrderType::CloseGridLong);
+            assert!((block.balance_peak - 1000.0).abs() < 1e-12);
+            assert!((block.balance_floor - 950.0).abs() < 1e-12);
+        }
+
+        #[test]
+        fn realized_loss_gate_default_does_not_block_lossy_closes() {
+            let mut sym = make_basic_symbol(0);
+            sym.long.position = Position {
+                size: 1.0,
+                price: 100.0,
+            };
+
+            let input = OrchestratorInput {
+                balance: 950.0,
+                balance_raw: 950.0,
+                global: OrchestratorGlobal {
+                    realized_pnl_cumsum_max: 0.0,
+                    realized_pnl_cumsum_last: -50.0,
+                    ..Default::default()
+                },
+                symbols: vec![sym],
+                peek_hints: None,
+            };
+            let mut per_long = vec![Some(PerSymbolOrders {
+                symbol_idx: 0,
+                entries: Vec::new(),
+                closes: vec![IdealOrder {
+                    symbol_idx: 0,
+                    pside: PositionSide::Long,
+                    qty: -1.0,
+                    price: 50.0,
+                    order_type: OrderType::CloseGridLong,
+                }],
+                pos: Position {
+                    size: 1.0,
+                    price: 100.0,
+                },
+                mode: TradingMode::Normal,
+            })];
+            let mut per_short = vec![None];
+            let mut diagnostics = OrchestratorDiagnostics::default();
+
+            gate_lossy_closes_by_peak_balance(
+                &input,
+                &mut per_long,
+                &mut per_short,
+                &mut diagnostics,
+            );
+
+            assert_eq!(per_long[0].as_ref().unwrap().closes.len(), 1);
+            assert!(diagnostics.loss_gate_blocks.is_empty());
+        }
     }
 }
 

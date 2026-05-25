@@ -3136,20 +3136,11 @@ mod tests {
     use super::*;
     use ndarray::{Array1, Array3};
 
-    #[test]
-    fn cached_orchestrator_input_updates_dynamic_wallet_exposure_limit() {
-        let hlcvs = Array3::from_shape_vec((2, 1, 4), vec![1.0; 2 * 1 * 4]).unwrap();
-        let btc_usd_prices = Array1::from_vec(vec![20_000.0, 20_000.0]);
-
-        let mut bp_pair = BotParamsPair::default();
-        bp_pair.long.n_positions = 1;
-        bp_pair.long.total_wallet_exposure_limit = 1.0;
-        bp_pair.long.wallet_exposure_limit = 0.1;
-        bp_pair.long.entry_initial_qty_pct = 0.1;
-        bp_pair.long.ema_span_0 = 10.0;
-        bp_pair.long.ema_span_1 = 20.0;
-
-        let backtest_params = BacktestParams {
+    fn make_test_backtest_params(
+        n_timesteps: usize,
+        candle_interval_minutes: u64,
+    ) -> BacktestParams {
+        BacktestParams {
             starting_balance: 1000.0,
             maker_fee: 0.0,
             taker_fee: 0.0,
@@ -3158,7 +3149,7 @@ mod tests {
             first_timestamp_ms: 0,
             requested_start_timestamp_ms: 0,
             first_valid_indices: vec![0],
-            last_valid_indices: vec![1],
+            last_valid_indices: vec![n_timesteps.saturating_sub(1)],
             warmup_minutes: vec![0],
             trade_start_indices: vec![0],
             global_warmup_bars: 0,
@@ -3176,8 +3167,34 @@ mod tests {
             market_order_near_touch_threshold: 0.001,
             market_order_slippage_pct: 0.0,
             forager_score_hysteresis_pct: 0.0,
-            candle_interval_minutes: 1,
-        };
+            candle_interval_minutes,
+        }
+    }
+
+    fn make_test_bot_params_pair() -> BotParamsPair {
+        let mut bp_pair = BotParamsPair::default();
+        bp_pair.long.n_positions = 1;
+        bp_pair.long.total_wallet_exposure_limit = 1.0;
+        bp_pair.long.wallet_exposure_limit = 0.1;
+        bp_pair.long.entry_initial_qty_pct = 0.1;
+        bp_pair.long.ema_span_0 = 10.0;
+        bp_pair.long.ema_span_1 = 20.0;
+        bp_pair.short.n_positions = 1;
+        bp_pair.short.total_wallet_exposure_limit = 1.0;
+        bp_pair.short.wallet_exposure_limit = 0.1;
+        bp_pair.short.entry_initial_qty_pct = 0.1;
+        bp_pair.short.ema_span_0 = 10.0;
+        bp_pair.short.ema_span_1 = 20.0;
+        bp_pair
+    }
+
+    #[test]
+    fn cached_orchestrator_input_updates_dynamic_wallet_exposure_limit() {
+        let hlcvs = Array3::from_shape_vec((2, 1, 4), vec![1.0; 2 * 1 * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0, 20_000.0]);
+
+        let bp_pair = make_test_bot_params_pair();
+        let backtest_params = make_test_backtest_params(2, 1);
 
         let mut bt = Backtest::new(
             hlcvs.view(),
@@ -3202,6 +3219,180 @@ mod tests {
             "expected cached input WEL to update after bot_params change"
         );
         bt.orchestrator_input_cache = Some(input);
+    }
+
+    #[test]
+    fn market_fill_uses_close_slippage_taker_fee_and_liquidity() {
+        let hlcvs = Array3::from_shape_vec(
+            (2, 1, 4),
+            vec![105.0, 95.0, 100.0, 1.0, 110.0, 90.0, 100.0, 1.0],
+        )
+        .unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0, 20_000.0]);
+        let bp_pair = make_test_bot_params_pair();
+        let mut backtest_params = make_test_backtest_params(2, 1);
+        backtest_params.taker_fee = 0.001;
+        backtest_params.maker_fee = 0.0002;
+        backtest_params.market_order_slippage_pct = 0.01;
+        let exchange = ExchangeParams {
+            price_step: 0.1,
+            ..Default::default()
+        };
+        let bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair],
+            vec![exchange],
+            &backtest_params,
+        );
+
+        let buy_order = BacktestOrder {
+            order: Order {
+                qty: 1.0,
+                price: 100.0,
+                order_type: crate::types::OrderType::EntryInitialNormalLong,
+            },
+            execution_type: orchestrator::ExecutionType::Market,
+        };
+        let buy_exec = bt.order_fill_execution(1, 0, &buy_order).unwrap();
+        assert!((buy_exec.price - 101.0).abs() < 1e-12);
+        assert!((buy_exec.fee_rate - 0.001).abs() < 1e-12);
+        assert_eq!(buy_exec.liquidity, "taker");
+
+        let sell_order = BacktestOrder {
+            order: Order {
+                qty: -1.0,
+                price: 100.0,
+                order_type: crate::types::OrderType::CloseGridLong,
+            },
+            execution_type: orchestrator::ExecutionType::Market,
+        };
+        let sell_exec = bt.order_fill_execution(1, 0, &sell_order).unwrap();
+        assert!((sell_exec.price - 99.0).abs() < 1e-12);
+        assert!((sell_exec.fee_rate - 0.001).abs() < 1e-12);
+        assert_eq!(sell_exec.liquidity, "taker");
+    }
+
+    #[test]
+    fn limit_fill_preserves_order_price_maker_fee_and_liquidity() {
+        let hlcvs = Array3::from_shape_vec(
+            (2, 1, 4),
+            vec![105.0, 95.0, 100.0, 1.0, 110.0, 90.0, 100.0, 1.0],
+        )
+        .unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0, 20_000.0]);
+        let bp_pair = make_test_bot_params_pair();
+        let mut backtest_params = make_test_backtest_params(2, 1);
+        backtest_params.maker_fee = 0.0003;
+        backtest_params.taker_fee = 0.001;
+        let bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair],
+            vec![ExchangeParams::default()],
+            &backtest_params,
+        );
+
+        let order = BacktestOrder {
+            order: Order {
+                qty: 1.0,
+                price: 95.0,
+                order_type: crate::types::OrderType::EntryInitialNormalLong,
+            },
+            execution_type: orchestrator::ExecutionType::Limit,
+        };
+        let exec = bt.order_fill_execution(1, 0, &order).unwrap();
+        assert!((exec.price - 95.0).abs() < 1e-12);
+        assert!((exec.fee_rate - 0.0003).abs() < 1e-12);
+        assert_eq!(exec.liquidity, "maker");
+    }
+
+    #[test]
+    fn liquidation_clamps_last_equity_and_sets_flag() {
+        let hlcvs = Array3::from_shape_vec((2, 1, 4), vec![1.0; 2 * 1 * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![2.0, 2.0]);
+        let bp_pair = make_test_bot_params_pair();
+        let mut backtest_params = make_test_backtest_params(2, 1);
+        backtest_params.liquidation_threshold = 0.05;
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair],
+            vec![ExchangeParams::default()],
+            &backtest_params,
+        );
+        bt.equities.usd_total_equity.push(49.0);
+        bt.equities.btc_total_equity.push(0.0);
+
+        assert!(bt.check_and_apply_liquidation(0));
+        assert!(bt.liquidated());
+        assert!((bt.equities.usd_total_equity[0] - 50.0).abs() < 1e-12);
+        assert!((bt.equities.btc_total_equity[0] - 25.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn five_minute_candle_interval_controls_timestamps_warmup_and_ema_alpha() {
+        let hlcvs = Array3::from_shape_vec((10, 1, 4), vec![1.0; 10 * 1 * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; 10]);
+        let bp_pair = make_test_bot_params_pair();
+        let mut backtest_params = make_test_backtest_params(10, 5);
+        backtest_params.first_timestamp_ms = 1_700_000_000_000;
+        backtest_params.warmup_minutes = vec![7];
+        let bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair.clone()],
+            vec![ExchangeParams::default()],
+            &backtest_params,
+        );
+
+        assert_eq!(bt.timestamp_at(2), 1_700_000_000_000 + 2 * 5 * 60_000);
+        assert_eq!(bt.coin_trade_start_idx[0], 2);
+
+        let alpha_1m = calc_ema_alphas(&bp_pair, 1).long.alphas[0];
+        let alpha_5m = calc_ema_alphas(&bp_pair, 5).long.alphas[0];
+        assert!((alpha_1m - (2.0 / 11.0)).abs() < 1e-12);
+        assert!((alpha_5m - (2.0 / 3.0)).abs() < 1e-12);
+        assert!(alpha_5m > alpha_1m);
+    }
+
+    #[test]
+    fn dynamic_wel_by_tradability_uses_side_specific_grow_only_denominator() {
+        let hlcvs = Array3::from_shape_vec((3, 2, 4), vec![1.0; 3 * 2 * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; 3]);
+        let mut bp_pair = make_test_bot_params_pair();
+        bp_pair.long.n_positions = 2;
+        bp_pair.long.total_wallet_exposure_limit = 1.0;
+        bp_pair.long.wallet_exposure_limit = -1.0;
+        bp_pair.short.n_positions = 2;
+        bp_pair.short.total_wallet_exposure_limit = 2.0;
+        bp_pair.short.wallet_exposure_limit = 0.0;
+
+        let mut backtest_params = make_test_backtest_params(3, 1);
+        backtest_params.coins = vec!["A".to_string(), "B".to_string()];
+        backtest_params.first_valid_indices = vec![0, 0];
+        backtest_params.last_valid_indices = vec![2, 1];
+        backtest_params.warmup_minutes = vec![0, 0];
+        backtest_params.trade_start_indices = vec![0, 0];
+        backtest_params.dynamic_wel_by_tradability = true;
+
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair.clone(), bp_pair],
+            vec![ExchangeParams::default(), ExchangeParams::default()],
+            &backtest_params,
+        );
+
+        assert!(bt.update_n_positions_and_wallet_exposure_limits(1));
+        assert_eq!(bt.max_tradable_coins_seen.long, 2);
+        assert!((bt.bot_params[0].long.wallet_exposure_limit - 0.5).abs() < 1e-12);
+        assert!((bt.bot_params[1].long.wallet_exposure_limit - 0.5).abs() < 1e-12);
+
+        assert!(bt.update_n_positions_and_wallet_exposure_limits(2));
+        assert_eq!(bt.max_tradable_coins_seen.long, 2);
+        assert!((bt.bot_params[0].long.wallet_exposure_limit - 0.5).abs() < 1e-12);
+        assert_eq!(bt.max_tradable_coins_seen.short, 0);
     }
 }
 
