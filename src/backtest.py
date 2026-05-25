@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 import json
 import asyncio
+import numbers
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 from config_utils import (
@@ -81,6 +82,8 @@ from logging_setup import configure_logging, resolve_log_level
 from suite_runner import extract_suite_config, run_backtest_suite_async
 import passivbot_rust as pbr  # noqa: E402
 from tools.event_loop_policy import set_windows_event_loop_policy
+
+ANALYSIS_SHARED_PREFIXES = ("hard_stop_",)
 
 # Fallback stubs for test environments without full extension symbols
 if not hasattr(pbr, "HlcvsBundle"):  # pragma: no cover
@@ -160,6 +163,75 @@ def _int_or(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return int(default)
+
+
+DEFAULT_BACKTEST_HSL_CONFIG = {
+    "enabled": False,
+    "signal_mode": "unified",
+    "red_threshold": 0.25,
+    "ema_span_minutes": 60.0,
+    "cooldown_minutes_after_red": 0.0,
+    "no_restart_drawdown_threshold": 1.0,
+    "tier_ratios": {"yellow": 0.5, "orange": 0.75},
+    "orange_tier_mode": "tp_only_with_active_entry_cancellation",
+    "panic_close_order_type": "market",
+}
+
+
+def _normalized_backtest_hsl_config(*configs: dict | None) -> dict:
+    out = deepcopy(DEFAULT_BACKTEST_HSL_CONFIG)
+    out["tier_ratios"] = dict(DEFAULT_BACKTEST_HSL_CONFIG["tier_ratios"])
+    for cfg in configs:
+        if not isinstance(cfg, dict):
+            continue
+        for key, value in cfg.items():
+            if key == "tier_ratios" and isinstance(value, dict):
+                out["tier_ratios"].update(value)
+            else:
+                out[key] = value
+    return {
+        "enabled": bool(out["enabled"]),
+        "signal_mode": str(out.get("signal_mode") or "unified"),
+        "red_threshold": float(out["red_threshold"]),
+        "ema_span_minutes": float(out["ema_span_minutes"]),
+        "cooldown_minutes_after_red": float(out["cooldown_minutes_after_red"]),
+        "no_restart_drawdown_threshold": float(out["no_restart_drawdown_threshold"]),
+        "tier_ratios": {
+            "yellow": float(out["tier_ratios"]["yellow"]),
+            "orange": float(out["tier_ratios"]["orange"]),
+        },
+        "orange_tier_mode": str(out["orange_tier_mode"]),
+        "panic_close_order_type": str(out["panic_close_order_type"]),
+    }
+
+
+def _ensure_backtest_hsl_bot_fields(config: dict, bot_params: dict) -> None:
+    common_cfg = get_optional_config_value(
+        config, "backtest.equity_hard_stop_loss", DEFAULT_BACKTEST_HSL_CONFIG
+    )
+    for pside in ["long", "short"]:
+        side_params = bot_params.setdefault(pside, {})
+        side_cfg = _normalized_backtest_hsl_config(
+            common_cfg,
+            side_params.get("hsl"),
+        )
+        side_params.setdefault("hsl_enabled", side_cfg["enabled"])
+        side_params.setdefault("hsl_red_threshold", side_cfg["red_threshold"])
+        side_params.setdefault("hsl_ema_span_minutes", side_cfg["ema_span_minutes"])
+        side_params.setdefault(
+            "hsl_cooldown_minutes_after_red",
+            side_cfg["cooldown_minutes_after_red"],
+        )
+        side_params.setdefault(
+            "hsl_no_restart_drawdown_threshold",
+            side_cfg["no_restart_drawdown_threshold"],
+        )
+        side_params.setdefault("hsl_tier_ratios", dict(side_cfg["tier_ratios"]))
+        side_params.setdefault("hsl_orange_tier_mode", side_cfg["orange_tier_mode"])
+        side_params.setdefault(
+            "hsl_panic_close_order_type",
+            side_cfg["panic_close_order_type"],
+        )
 
 
 def _build_coin_metadata_entries(
@@ -275,6 +347,7 @@ class BacktestPayload:
     bot_params_list: list
     exchange_params: list
     backtest_params: dict
+    hard_stop_plot_data: dict | None = None
 
 
 def build_backtest_payload(
@@ -392,20 +465,43 @@ def execute_backtest(payload: BacktestPayload, config: dict):
     Execute a prepared backtest payload and expand the resulting analysis.
     """
 
-    (
-        fills,
-        equities_array,
-        analysis_usd,
-        analysis_btc,
-    ) = pbr.run_backtest_bundle(
+    backtest_result = pbr.run_backtest_bundle(
         payload.bundle,
         payload.bot_params_list,
         payload.exchange_params,
         payload.backtest_params,
     )
+    if len(backtest_result) == 5:
+        (
+            fills,
+            equities_array,
+            analysis_usd,
+            analysis_btc,
+            hard_stop_plot_data,
+        ) = backtest_result
+    elif len(backtest_result) == 4:
+        fills, equities_array, analysis_usd, analysis_btc = backtest_result
+        hard_stop_plot_data = {}
+    else:
+        raise ValueError(
+            f"run_backtest_bundle returned {len(backtest_result)} values; expected 4 or 5"
+        )
 
     equities_array = np.asarray(equities_array)
+    payload.hard_stop_plot_data = dict(hard_stop_plot_data or {})
     analysis = expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config)
+    if bool(analysis.get("liquidated", False)):
+        final_equity_usd = (
+            float(equities_array[-1, 1]) if equities_array.size else float("nan")
+        )
+        logging.debug(
+            "Backtest liquidated early | final_equity_usd=%.6f | liquidation_threshold=%.6f",
+            final_equity_usd,
+            float(
+                get_optional_config_value(config, "backtest.liquidation_threshold", 0.05)
+                or 0.0
+            ),
+        )
     return fills, equities_array, analysis
 
 
@@ -483,6 +579,7 @@ def subset_backtest_payload(
         bot_params_list=new_bot,
         exchange_params=new_exchange_params,
         backtest_params=new_backtest_params,
+        hard_stop_plot_data=payload.hard_stop_plot_data,
     )
 
 
@@ -596,11 +693,24 @@ def process_forager_fills(
         index=equities_index,
         name="btc_total_equity",
     )
+    if equities_array.shape[1] > 3:
+        strategy_eq_series = pd.Series(
+            equities_array[:, 3],
+            index=equities_index,
+            name="strategy_equity",
+        )
+    else:
+        strategy_eq_series = pd.Series(
+            dtype=float,
+            name="strategy_equity",
+            index=equities_index,
+        )
     bal_eq = pd.concat(
         [
             usd_cash_series,
             usd_total_balance_series,
             edf,
+            strategy_eq_series,
             btc_cash_series,
             btc_total_balance_series,
             ebdf,
@@ -614,6 +724,7 @@ def process_forager_fills(
                 "usd_cash_wallet",
                 "usd_total_balance",
                 "usd_total_equity",
+                "strategy_equity",
                 "btc_cash_wallet",
                 "btc_total_balance",
                 "btc_total_equity",
@@ -951,6 +1062,7 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
                 "bot", {}
             ).get(pside, {}):
                 coin_specific_bot_params[pside]["wallet_exposure_limit"] = -1.0
+        _ensure_backtest_hsl_bot_fields(config, coin_specific_bot_params)
         bot_params_list.append(coin_specific_bot_params)
     if exchange_params is None:
         exchange_params = [
@@ -1069,16 +1181,39 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
                 else None
             )
 
-    shared_keys = set(ANALYSIS_SHARED_KEYS)
-
     result = {}
 
-    for key in shared_keys:
-        usd_val = analysis_usd.pop(key, None)
-        btc_val = analysis_btc.pop(key, None)
+    def _scalar_values_match(usd_val, btc_val) -> bool:
+        if usd_val is None or btc_val is None:
+            return False
+        if isinstance(usd_val, numbers.Integral) and isinstance(btc_val, numbers.Integral):
+            return usd_val == btc_val
+        if isinstance(usd_val, bool) and isinstance(btc_val, bool):
+            return usd_val == btc_val
+        try:
+            return bool(np.isclose(usd_val, btc_val, equal_nan=True))
+        except Exception:
+            return usd_val == btc_val
+
+    def _is_shared_key(key: str, usd_val, btc_val) -> bool:
+        if key in ANALYSIS_SHARED_KEYS:
+            return True
+        if key.startswith(ANALYSIS_SHARED_PREFIXES):
+            return True
+        if isinstance(usd_val, (bool, numbers.Integral)) and isinstance(
+            btc_val, (bool, numbers.Integral)
+        ):
+            return usd_val == btc_val
+        return False
+
+    for key in sorted(set(analysis_usd) | set(analysis_btc)):
+        usd_val = analysis_usd.get(key)
+        btc_val = analysis_btc.get(key)
+        if not _is_shared_key(key, usd_val, btc_val):
+            continue
         if usd_val is not None:
             result[key] = usd_val
-            if btc_val is not None and not np.isclose(usd_val, btc_val, equal_nan=True):
+            if btc_val is not None and not _scalar_values_match(usd_val, btc_val):
                 logging.debug(
                     "shared metric %s differs across denominations: usd=%s btc=%s",
                     key,
@@ -1087,6 +1222,8 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
                 )
         elif btc_val is not None:
             result[key] = btc_val
+        analysis_usd.pop(key, None)
+        analysis_btc.pop(key, None)
 
     def _add_metrics(metrics: dict, suffix: str):
         for key, value in metrics.items():

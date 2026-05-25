@@ -182,6 +182,8 @@ pub struct EquityHardStopLossConfig {
     pub no_restart_drawdown_threshold: f64,
     pub tier_ratios: EquityHardStopLossTierRatios,
     pub orange_tier_mode: String,
+    #[allow(dead_code)]
+    // Parsed in Rust for config parity; consumed by Python live order handling.
     pub panic_close_order_type: String,
 }
 
@@ -228,9 +230,8 @@ pub struct BacktestParams {
     pub market_orders_allowed: bool,
     pub market_order_near_touch_threshold: f64,
     pub market_order_slippage_pct: f64,
-    #[allow(dead_code)]
     pub forager_score_hysteresis_pct: f64,
-    pub candle_interval_minutes: u64,
+    pub candle_interval_minutes: u64, // 1 for 1m candles (default), 5 for 5m, etc.
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
@@ -294,6 +295,85 @@ pub struct BotParamsPair {
     pub short: BotParams,
 }
 
+fn default_hsl_enabled() -> bool {
+    false
+}
+
+fn default_hsl_red_threshold() -> f64 {
+    0.25
+}
+
+fn default_hsl_ema_span_minutes() -> f64 {
+    60.0
+}
+
+fn default_hsl_cooldown_minutes_after_red() -> f64 {
+    0.0
+}
+
+fn default_hsl_no_restart_drawdown_threshold() -> f64 {
+    1.0
+}
+
+fn default_hsl_tier_ratio_yellow() -> f64 {
+    0.5
+}
+
+fn default_hsl_tier_ratio_orange() -> f64 {
+    0.75
+}
+
+fn default_hsl_orange_tier_mode() -> String {
+    "tp_only_with_active_entry_cancellation".to_string()
+}
+
+fn default_hsl_panic_close_order_type() -> String {
+    "market".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ForagerScoreWeights {
+    pub volume: f64,
+    pub ema_readiness: f64,
+    pub volatility: f64,
+}
+
+impl Default for ForagerScoreWeights {
+    fn default() -> Self {
+        Self {
+            volume: 0.0,
+            ema_readiness: 0.0,
+            volatility: 1.0,
+        }
+    }
+}
+
+impl ForagerScoreWeights {
+    pub fn canonicalize(&self) -> Result<Self, String> {
+        let values = [self.volume, self.ema_readiness, self.volatility];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err("forager_score_weights must be finite and non-negative".to_string());
+        }
+        let total = self.volume + self.ema_readiness + self.volatility;
+        if total <= 0.0 {
+            return Ok(Self {
+                volume: 0.0,
+                ema_readiness: 1.0,
+                volatility: 0.0,
+            });
+        }
+        Ok(Self {
+            volume: self.volume / total,
+            ema_readiness: self.ema_readiness / total,
+            volatility: self.volatility / total,
+        })
+    }
+}
+
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BotParams {
@@ -320,11 +400,33 @@ pub struct BotParams {
     pub entry_trailing_threshold_we_weight: f64,
     pub entry_trailing_threshold_volatility_weight: f64,
     pub filter_volatility_ema_span: f64,
-    pub filter_volatility_drop_pct: f64,
     pub filter_volume_ema_span: f64,
-    pub filter_volume_drop_pct: f64,
+    #[serde(default, skip_serializing, rename = "filter_volatility_drop_pct")]
+    pub _legacy_filter_volatility_drop_pct: f64,
+    #[serde(default, alias = "filter_volume_drop_pct")]
+    pub forager_volume_drop_pct: f64,
+    #[serde(default)]
+    pub forager_score_weights: ForagerScoreWeights,
     pub ema_span_0: f64,
     pub ema_span_1: f64,
+    #[serde(default = "default_hsl_enabled")]
+    pub hsl_enabled: bool,
+    #[serde(default = "default_hsl_red_threshold")]
+    pub hsl_red_threshold: f64,
+    #[serde(default = "default_hsl_ema_span_minutes")]
+    pub hsl_ema_span_minutes: f64,
+    #[serde(default = "default_hsl_cooldown_minutes_after_red")]
+    pub hsl_cooldown_minutes_after_red: f64,
+    #[serde(default = "default_hsl_no_restart_drawdown_threshold")]
+    pub hsl_no_restart_drawdown_threshold: f64,
+    #[serde(default = "default_hsl_tier_ratio_yellow")]
+    pub hsl_tier_ratio_yellow: f64,
+    #[serde(default = "default_hsl_tier_ratio_orange")]
+    pub hsl_tier_ratio_orange: f64,
+    #[serde(default = "default_hsl_orange_tier_mode")]
+    pub hsl_orange_tier_mode: String,
+    #[serde(default = "default_hsl_panic_close_order_type")]
+    pub hsl_panic_close_order_type: String,
     pub n_positions: usize,
     pub total_wallet_exposure_limit: f64,
     pub wallet_exposure_limit: f64, // per-position base limit (without excess allowance)
@@ -512,9 +614,23 @@ pub struct Analysis {
     pub calmar_ratio_strategy_eq: f64,
     pub sterling_ratio_strategy_eq: f64,
     pub drawdown_worst_strategy_eq: f64,
+    pub drawdown_worst_strategy_eq_long: f64,
+    pub drawdown_worst_strategy_eq_short: f64,
+    pub drawdown_worst_ema_strategy_eq: f64,
+    pub drawdown_worst_ema_strategy_eq_long: f64,
+    pub drawdown_worst_ema_strategy_eq_short: f64,
     pub drawdown_worst_mean_1pct_strategy_eq: f64,
+    pub drawdown_worst_mean_1pct_strategy_eq_long: f64,
+    pub drawdown_worst_mean_1pct_strategy_eq_short: f64,
+    pub drawdown_worst_mean_1pct_ema_strategy_eq: f64,
+    pub drawdown_worst_mean_1pct_ema_strategy_eq_long: f64,
+    pub drawdown_worst_mean_1pct_ema_strategy_eq_short: f64,
     pub peak_recovery_hours_strategy_eq: f64,
+    pub peak_recovery_hours_strategy_eq_long: f64,
+    pub peak_recovery_hours_strategy_eq_short: f64,
     pub peak_recovery_days_strategy_eq: f64,
+    pub peak_recovery_days_strategy_eq_long: f64,
+    pub peak_recovery_days_strategy_eq_short: f64,
     pub equity_balance_diff_neg_max: f64,
     pub equity_balance_diff_neg_mean: f64,
     pub equity_balance_diff_pos_max: f64,
@@ -595,10 +711,18 @@ pub struct Analysis {
     pub high_exposure_days_max_short: f64,
     pub entry_initial_balance_pct_long: f64,
     pub entry_initial_balance_pct_short: f64,
+
     pub hard_stop_triggers: u32,
     pub hard_stop_triggers_per_year: f64,
+    pub hard_stop_triggers_long: u32,
+    pub hard_stop_triggers_short: u32,
+    pub hard_stop_halt_to_restart_equity_loss_pct: f64,
     pub hard_stop_restarts: u32,
     pub hard_stop_restarts_per_year: f64,
+    pub hard_stop_restarts_per_year_long: f64,
+    pub hard_stop_restarts_per_year_short: f64,
+    pub hard_stop_restarts_long: u32,
+    pub hard_stop_restarts_short: u32,
     pub hard_stop_time_in_yellow_pct: f64,
     pub hard_stop_time_in_orange_pct: f64,
     pub hard_stop_time_in_red_pct: f64,
@@ -640,9 +764,23 @@ impl Default for Analysis {
             calmar_ratio_strategy_eq: 0.0,
             sterling_ratio_strategy_eq: 0.0,
             drawdown_worst_strategy_eq: 0.0,
+            drawdown_worst_strategy_eq_long: 0.0,
+            drawdown_worst_strategy_eq_short: 0.0,
+            drawdown_worst_ema_strategy_eq: 0.0,
+            drawdown_worst_ema_strategy_eq_long: 0.0,
+            drawdown_worst_ema_strategy_eq_short: 0.0,
             drawdown_worst_mean_1pct_strategy_eq: 0.0,
+            drawdown_worst_mean_1pct_strategy_eq_long: 0.0,
+            drawdown_worst_mean_1pct_strategy_eq_short: 0.0,
+            drawdown_worst_mean_1pct_ema_strategy_eq: 0.0,
+            drawdown_worst_mean_1pct_ema_strategy_eq_long: 0.0,
+            drawdown_worst_mean_1pct_ema_strategy_eq_short: 0.0,
             peak_recovery_hours_strategy_eq: 0.0,
+            peak_recovery_hours_strategy_eq_long: 0.0,
+            peak_recovery_hours_strategy_eq_short: 0.0,
             peak_recovery_days_strategy_eq: 0.0,
+            peak_recovery_days_strategy_eq_long: 0.0,
+            peak_recovery_days_strategy_eq_short: 0.0,
             equity_balance_diff_neg_max: 1.0,
             equity_balance_diff_neg_mean: 1.0,
             equity_balance_diff_pos_max: 1.0,
@@ -721,8 +859,15 @@ impl Default for Analysis {
             entry_initial_balance_pct_short: 0.0,
             hard_stop_triggers: 0,
             hard_stop_triggers_per_year: 0.0,
+            hard_stop_triggers_long: 0,
+            hard_stop_triggers_short: 0,
+            hard_stop_halt_to_restart_equity_loss_pct: 0.0,
             hard_stop_restarts: 0,
             hard_stop_restarts_per_year: 0.0,
+            hard_stop_restarts_per_year_long: 0.0,
+            hard_stop_restarts_per_year_short: 0.0,
+            hard_stop_restarts_long: 0,
+            hard_stop_restarts_short: 0,
             hard_stop_time_in_yellow_pct: 0.0,
             hard_stop_time_in_orange_pct: 0.0,
             hard_stop_time_in_red_pct: 0.0,

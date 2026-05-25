@@ -10,7 +10,6 @@ fn fallback_timestamp_ms(index: usize) -> u64 {
 }
 
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct EquitySeriesMetrics {
     pub gain: f64,
     pub adg: f64,
@@ -21,7 +20,6 @@ pub struct EquitySeriesMetrics {
     pub expected_shortfall_1pct: f64,
 }
 
-#[allow(dead_code)]
 pub fn analyze_equity_series(equities: &[f64], timestamps_ms: &[u64]) -> EquitySeriesMetrics {
     if equities.len() < 2 {
         return EquitySeriesMetrics::default();
