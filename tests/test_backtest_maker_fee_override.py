@@ -1,3 +1,5 @@
+import pytest
+
 from config_utils import get_template_config
 from backtest import prep_backtest_args
 
@@ -34,3 +36,19 @@ def test_prep_backtest_args_uses_maker_fee_override_when_set():
     mss = _base_mss()
     _, _, backtest_params = prep_backtest_args(config, mss, "binance")
     assert backtest_params["maker_fee"] == 0.0002
+
+
+def test_prep_backtest_args_defaults_liquidation_threshold_to_upstream_floor():
+    config = _base_config()
+    config["backtest"].pop("liquidation_threshold", None)
+    mss = _base_mss()
+    _, _, backtest_params = prep_backtest_args(config, mss, "binance")
+    assert backtest_params["liquidation_threshold"] == 0.05
+
+
+def test_prep_backtest_args_rejects_invalid_liquidation_threshold():
+    config = _base_config()
+    config["backtest"]["liquidation_threshold"] = 1.0
+    mss = _base_mss()
+    with pytest.raises(ValueError, match=r"backtest\.liquidation_threshold"):
+        prep_backtest_args(config, mss, "binance")

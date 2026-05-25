@@ -3932,7 +3932,7 @@ mod tests {
             hedge_mode: true,
             max_realized_loss_pct: 1.0,
             pnls_max_lookback_days: -1.0,
-            liquidation_threshold: 0.0,
+            liquidation_threshold: 0.05,
             equity_hard_stop_loss: crate::types::EquityHardStopLossConfig::default(),
             market_orders_allowed: false,
             market_order_near_touch_threshold: 0.001,

@@ -942,6 +942,17 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
         })
     };
 
+    let liquidation_threshold = dict
+        .get_item("liquidation_threshold")?
+        .map(|item| item.extract::<f64>())
+        .transpose()?
+        .unwrap_or(0.05);
+    if !(0.0..1.0).contains(&liquidation_threshold) {
+        return Err(PyValueError::new_err(
+            "backtest.liquidation_threshold must satisfy 0.0 <= x < 1.0",
+        ));
+    }
+
     Ok(BacktestParams {
         starting_balance: extract_value(dict, "starting_balance").unwrap_or_default(),
         maker_fee: extract_value(dict, "maker_fee").unwrap_or_default(),
@@ -1012,11 +1023,7 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<f64>())
             .transpose()?
             .unwrap_or(-1.0),
-        liquidation_threshold: dict
-            .get_item("liquidation_threshold")?
-            .map(|item| item.extract::<f64>())
-            .transpose()?
-            .unwrap_or(0.0),
+        liquidation_threshold,
         equity_hard_stop_loss: parse_hsl_cfg(dict)?,
         market_orders_allowed: dict
             .get_item("market_orders_allowed")?

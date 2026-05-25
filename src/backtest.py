@@ -984,6 +984,11 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
             taker_fee = mss[coins[0]].get("taker_fee", mss[coins[0]].get("taker", maker_fee))
         else:
             taker_fee = float(taker_fee_override)
+        liquidation_threshold = float(
+            get_optional_config_value(config, "backtest.liquidation_threshold", 0.05) or 0.0
+        )
+        if not (0.0 <= liquidation_threshold < 1.0):
+            raise ValueError("backtest.liquidation_threshold must satisfy 0.0 <= x < 1.0")
         backtest_params = {
             "starting_balance": require_config_value(config, "backtest.starting_balance"),
             "maker_fee": maker_fee,
@@ -1011,9 +1016,7 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
             "pnls_max_lookback_days": float(
                 get_optional_config_value(config, "live.pnls_max_lookback_days", -1.0)
             ),
-            "liquidation_threshold": float(
-                get_optional_config_value(config, "backtest.liquidation_threshold", 0.0)
-            ),
+            "liquidation_threshold": liquidation_threshold,
             "equity_hard_stop_loss": get_optional_config_value(
                 config,
                 "backtest.equity_hard_stop_loss",
