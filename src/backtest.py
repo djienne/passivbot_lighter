@@ -1089,6 +1089,20 @@ def expand_analysis(analysis_usd, analysis_btc, fills, equities_array, config):
         "sharpe_ratio_pnl_w",
         "sortino_ratio_pnl",
         "sortino_ratio_pnl_w",
+        "hard_stop_triggers",
+        "hard_stop_triggers_per_year",
+        "hard_stop_restarts",
+        "hard_stop_restarts_per_year",
+        "hard_stop_time_in_yellow_pct",
+        "hard_stop_time_in_orange_pct",
+        "hard_stop_time_in_red_pct",
+        "hard_stop_duration_minutes_mean",
+        "hard_stop_duration_minutes_max",
+        "hard_stop_trigger_drawdown_mean",
+        "hard_stop_panic_close_loss_sum",
+        "hard_stop_panic_close_loss_max",
+        "hard_stop_flatten_time_minutes_mean",
+        "hard_stop_post_restart_retrigger_pct",
     }
 
     result = {}

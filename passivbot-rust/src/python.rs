@@ -718,6 +718,39 @@ fn run_backtest_core<'py>(
         analysis_usd.entry_initial_balance_pct_short = entry_pct_short;
         analysis_btc.entry_initial_balance_pct_long = entry_pct_long;
         analysis_btc.entry_initial_balance_pct_short = entry_pct_short;
+        let hard_stop_metrics = backtest.hard_stop_metrics();
+        analysis_usd.hard_stop_triggers = hard_stop_metrics.triggers;
+        analysis_usd.hard_stop_triggers_per_year = hard_stop_metrics.triggers_per_year;
+        analysis_usd.hard_stop_restarts = hard_stop_metrics.restarts;
+        analysis_usd.hard_stop_restarts_per_year = hard_stop_metrics.restarts_per_year;
+        analysis_usd.hard_stop_time_in_yellow_pct = hard_stop_metrics.time_in_yellow_pct;
+        analysis_usd.hard_stop_time_in_orange_pct = hard_stop_metrics.time_in_orange_pct;
+        analysis_usd.hard_stop_time_in_red_pct = hard_stop_metrics.time_in_red_pct;
+        analysis_usd.hard_stop_duration_minutes_mean = hard_stop_metrics.duration_minutes_mean;
+        analysis_usd.hard_stop_duration_minutes_max = hard_stop_metrics.duration_minutes_max;
+        analysis_usd.hard_stop_trigger_drawdown_mean = hard_stop_metrics.trigger_drawdown_mean;
+        analysis_usd.hard_stop_panic_close_loss_sum = hard_stop_metrics.panic_close_loss_sum;
+        analysis_usd.hard_stop_panic_close_loss_max = hard_stop_metrics.panic_close_loss_max;
+        analysis_usd.hard_stop_flatten_time_minutes_mean =
+            hard_stop_metrics.flatten_time_minutes_mean;
+        analysis_usd.hard_stop_post_restart_retrigger_pct =
+            hard_stop_metrics.post_restart_retrigger_pct;
+        analysis_btc.hard_stop_triggers = hard_stop_metrics.triggers;
+        analysis_btc.hard_stop_triggers_per_year = hard_stop_metrics.triggers_per_year;
+        analysis_btc.hard_stop_restarts = hard_stop_metrics.restarts;
+        analysis_btc.hard_stop_restarts_per_year = hard_stop_metrics.restarts_per_year;
+        analysis_btc.hard_stop_time_in_yellow_pct = hard_stop_metrics.time_in_yellow_pct;
+        analysis_btc.hard_stop_time_in_orange_pct = hard_stop_metrics.time_in_orange_pct;
+        analysis_btc.hard_stop_time_in_red_pct = hard_stop_metrics.time_in_red_pct;
+        analysis_btc.hard_stop_duration_minutes_mean = hard_stop_metrics.duration_minutes_mean;
+        analysis_btc.hard_stop_duration_minutes_max = hard_stop_metrics.duration_minutes_max;
+        analysis_btc.hard_stop_trigger_drawdown_mean = hard_stop_metrics.trigger_drawdown_mean;
+        analysis_btc.hard_stop_panic_close_loss_sum = hard_stop_metrics.panic_close_loss_sum;
+        analysis_btc.hard_stop_panic_close_loss_max = hard_stop_metrics.panic_close_loss_max;
+        analysis_btc.hard_stop_flatten_time_minutes_mean =
+            hard_stop_metrics.flatten_time_minutes_mean;
+        analysis_btc.hard_stop_post_restart_retrigger_pct =
+            hard_stop_metrics.post_restart_retrigger_pct;
 
         // Create a dictionary to store analysis results using a more concise approach
         let py_analysis_usd = struct_to_py_dict(py, &analysis_usd)?;

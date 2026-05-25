@@ -4,6 +4,7 @@ mod closes;
 mod coin_selection;
 mod constants;
 mod entries;
+mod equity_hard_stop_loss;
 mod orchestrator;
 mod python;
 mod risk;
