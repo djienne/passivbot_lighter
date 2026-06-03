@@ -556,6 +556,38 @@ def _is_metric_from_pareto(metrics: Dict[str, Any], key: str) -> Optional[float]
     return None
 
 
+def _summarize_trade_guards(window_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Roll the per-window trade-count guard decisions into one at-a-glance summary.
+
+    Reads each record's ``trade_guard`` dict (produced by
+    :func:`tools.wfo_utils.select_with_trade_guard`) and reports, across the whole run,
+    in which windows the guard had to walk down the Pareto front (``chosen_rank > 0``),
+    where it fell back because no candidate cleared the threshold (``no_pass``), and how
+    many candidates were rejected in total. Tolerant of missing keys (legacy records).
+    """
+    min_trade_ratio: Optional[float] = None
+    walked: List[int] = []
+    no_pass: List[int] = []
+    rejected_total = 0
+    for rec in window_records:
+        tg = rec.get("trade_guard") or {}
+        if min_trade_ratio is None and tg.get("min_trade_ratio") is not None:
+            min_trade_ratio = tg.get("min_trade_ratio")
+        idx = rec.get("index")
+        if tg.get("no_pass"):
+            no_pass.append(idx)
+        elif tg.get("chosen_rank"):  # rank 0 / None => guard left the top pick alone
+            walked.append(idx)
+        rejected_total += len(tg.get("rejected", []) or [])
+    return {
+        "min_trade_ratio": min_trade_ratio,
+        "windows_total": len(window_records),
+        "windows_guard_walked": walked,
+        "windows_no_pass": no_pass,
+        "n_candidates_rejected_total": rejected_total,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
@@ -727,19 +759,22 @@ def run(args: argparse.Namespace) -> int:
         # far less than last month (falls back down the front; window 0 = top rank).
         choice, trade_guard = select_with_trade_guard(candidates, prev_trade_rate, min_trade_ratio)
         if trade_guard.get("no_pass"):
+            _r = trade_guard.get("chosen_trade_rate")
             logger.warning(
                 "window %02d | trade-guard: NO candidate >= %.2f x prev rate %.4f; "
-                "falling back to highest-rate (rank %d, rate=%.4f)",
+                "falling back to highest-rate (rank %d, rate=%s)",
                 w.index, min_trade_ratio, prev_trade_rate or 0.0,
-                trade_guard.get("chosen_rank", 0), trade_guard.get("chosen_trade_rate") or 0.0,
+                trade_guard.get("chosen_rank", 0),
+                f"{_r:.4f}" if _r is not None else "n/a",
             )
         elif trade_guard.get("applied") and trade_guard.get("chosen_rank"):
+            _r = trade_guard.get("chosen_trade_rate")
             logger.warning(
                 "window %02d | trade-guard: rejected %d higher-ranked candidate(s) "
-                "(trade rate < %.2f x prev %.4f); chose rank %d (rate=%.4f)",
+                "(trade rate < %.2f x prev %.4f); chose rank %d (rate=%s)",
                 w.index, len(trade_guard.get("rejected", [])), min_trade_ratio,
                 prev_trade_rate or 0.0, trade_guard.get("chosen_rank", 0),
-                trade_guard.get("chosen_trade_rate") or 0.0,
+                f"{_r:.4f}" if _r is not None else "n/a",
             )
 
         # Save the chosen config (a complete config: backtest- and live-ready).
@@ -880,6 +915,7 @@ def run(args: argparse.Namespace) -> int:
         ]
         overfit_means[key] = (sum(ratios) / len(ratios)) if ratios else None
 
+    trade_guard_summary = _summarize_trade_guards(window_records)
     summary = {
         "run_id": run_id,
         "span": {"start_date": str(start_date), "end_date": str(end_date)},
@@ -889,6 +925,7 @@ def run(args: argparse.Namespace) -> int:
         "results": {
             "oos_stitched_metrics": stitched["metrics"],
             "overfit_mean_oos_is_ratio": overfit_means,
+            "trade_guard": trade_guard_summary,
             "windows": window_records,
         },
     }
@@ -902,9 +939,12 @@ def run(args: argparse.Namespace) -> int:
 
     _maybe_plot(stitched["equity"], summary_dir / "stitched_equity.png")
 
-    logger.info("Walk-forward complete | windows=%d/%d | OOS total_return=%.4f | summary=%s",
+    logger.info("Walk-forward complete | windows=%d/%d | OOS total_return=%.4f | "
+                "guard: walked=%d no_pass=%d | summary=%s",
                 len(window_records), len(windows),
                 stitched["metrics"].get("total_return", 0.0),
+                len(trade_guard_summary["windows_guard_walked"]),
+                len(trade_guard_summary["windows_no_pass"]),
                 summary_dir / "walkforward_summary.json")
     return 0
 

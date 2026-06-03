@@ -239,6 +239,49 @@ class TestCandidateCache:
 
 
 # ---------------------------------------------------------------------------
+# Aggregate trade-guard rollup for walkforward_summary.json
+# ---------------------------------------------------------------------------
+class TestSummarizeTradeGuards:
+    def test_rolls_up_walked_no_pass_and_rejections(self):
+        from walkforward import _summarize_trade_guards
+
+        # Build per-window guard decisions from the real selector so the rollup is tied
+        # to the actual trade_guard dict shape.
+        _, g_win0 = select_with_trade_guard([_choice("a", 5.0)], None, 0.5)       # disabled (window 0)
+        _, g_walked = select_with_trade_guard(                                    # walks to rank 1
+            [_choice("r0", 2.0), _choice("r1", 6.0)], 10.0, 0.5)
+        _, g_nopass = select_with_trade_guard(                                    # none pass -> fallback
+            [_choice("r0", 1.0), _choice("r1", 3.0)], 10.0, 0.5)
+
+        records = [
+            {"index": 0, "trade_guard": g_win0},
+            {"index": 1, "trade_guard": g_walked},
+            {"index": 2, "trade_guard": g_nopass},
+        ]
+        out = _summarize_trade_guards(records)
+        assert out["windows_total"] == 3
+        assert out["windows_guard_walked"] == [1]
+        assert out["windows_no_pass"] == [2]
+        assert out["n_candidates_rejected_total"] == 3   # 0 (win0) + 1 (walked) + 2 (no_pass)
+        assert out["min_trade_ratio"] == pytest.approx(0.5)
+
+    def test_empty_and_legacy_records_tolerated(self):
+        from walkforward import _summarize_trade_guards
+
+        assert _summarize_trade_guards([]) == {
+            "min_trade_ratio": None,
+            "windows_total": 0,
+            "windows_guard_walked": [],
+            "windows_no_pass": [],
+            "n_candidates_rejected_total": 0,
+        }
+        # A record predating the guard (no trade_guard key) must not raise.
+        out = _summarize_trade_guards([{"index": 0}])
+        assert out["windows_total"] == 1
+        assert out["windows_guard_walked"] == []
+
+
+# ---------------------------------------------------------------------------
 # Equity stitching
 # ---------------------------------------------------------------------------
 class TestStitchOosEquity:

@@ -267,19 +267,23 @@ def select_with_trade_guard(
     if not candidates:
         raise ValueError("select_with_trade_guard called with no candidates")
 
+    # Trade rate per candidate, computed once and reused by both the walk below and the
+    # no-pass fallback (avoids recomputing pareto_trade_rate for the same candidate).
+    rates = [pareto_trade_rate(c) for c in candidates]
+
     top = candidates[0]
     if not prev_trade_rate or prev_trade_rate <= 0 or min_trade_ratio <= 0:
         return top, {
             "applied": False,
             "prev_trade_rate": prev_trade_rate,
             "chosen_rank": 0,
-            "chosen_trade_rate": pareto_trade_rate(top),
+            "chosen_trade_rate": rates[0],
         }
 
     threshold = float(min_trade_ratio) * float(prev_trade_rate)
     rejected: List[Dict[str, Any]] = []
     for rank, cand in enumerate(candidates):
-        rate = pareto_trade_rate(cand)
+        rate = rates[rank]
         # A candidate with no trade-rate metric cannot be judged; accept it (rank order).
         if rate is None or rate >= threshold:
             return cand, {
@@ -293,11 +297,10 @@ def select_with_trade_guard(
             }
         rejected.append({"rank": rank, "hash_id": cand.hash_id, "trade_rate": rate})
 
-    # No candidate clears the threshold: fall back to the highest-trade-rate one.
-    best_rank, best_choice = max(
-        enumerate(candidates),
-        key=lambda rc: (pareto_trade_rate(rc[1]) or 0.0, -rc[0]),
-    )
+    # No candidate clears the threshold: fall back to the highest-trade-rate one
+    # (ties broken toward the better-ranked / lower-index candidate).
+    best_rank = max(range(len(candidates)), key=lambda i: (rates[i] or 0.0, -i))
+    best_choice = candidates[best_rank]
     return best_choice, {
         "applied": True,
         "no_pass": True,
@@ -306,7 +309,7 @@ def select_with_trade_guard(
         "threshold": threshold,
         "min_trade_ratio": float(min_trade_ratio),
         "chosen_rank": best_rank,
-        "chosen_trade_rate": pareto_trade_rate(best_choice),
+        "chosen_trade_rate": rates[best_rank],
         "rejected": rejected,
     }
 
