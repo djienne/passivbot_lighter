@@ -399,3 +399,191 @@ live bot or re-backtest it directly.
 | R10 | Save every config chronologically | `configs_history/` + `latest_config.json` |
 | R11 | Backtest- and live-ready outputs | complete configs; stitched OOS equity + overfit table |
 | R12 | Deterministic reuse/caching | two-run smoke: all windows cache-hit with identical results |
+| R13 | Live auto-rolls monthly | `wfo_scheduler.py` + bot watcher; `current_live_window` unit tests |
+| R14 | Trading off until month's optimize done | scheduler publishes only on completion; bot bootstraps to ADOPT |
+| R15 | Boundary handoff (tp_only + small-loss flatten) | `should_flatten` unit tests; `_wfo_wind_down` |
+| R16 | Restart recovery (local + docker) | soft-restart in-process; positions re-read from exchange |
+| R17 | Stateful OOS carry (continuous equity) | `advance_carry` unit tests; carry-parity backtest |
+| R18 | Cross-platform VPS pickup | portable JSON artifacts; relative `config_path`; bot swaps `bot` only |
+
+---
+
+## 12. Live rolling cross-validation
+
+The backtest walk-forward above (R1–R12) and the **live** bot run the *same* rolling
+cross-validation idea: at any wall-clock moment the bot trades the config that was
+optimized on the **6 months immediately before the current test month** and has never
+seen the current month — so **all live trading is out-of-sample by construction**, just
+as every OOS test segment is in backtest.
+
+### Architecture: decoupled scheduler ↔ bot watcher
+
+Two cooperating processes, so a resource-heavy optimization never blocks or destabilizes
+the live trading loop (and, per R18, can even run on a *different machine*):
+
+- **Scheduler** (`src/wfo_scheduler.py`) — resolves the *current live window* from a fixed
+  anchor (`current_live_window`), replays the warm-start window chain through the shared
+  content-addressed cache (R12) so each month optimizes **once**, and **publishes** the
+  result as portable JSON artifacts under `live.wfo_rolling.active_dir`
+  (default `runs/walkforward/live/`):
+  - `active_config.json` — the full, deployable config for the current month;
+  - `active.json` — a small pointer `{period, test_start, test_end, config_path}` where
+    `config_path` is the **relative, co-located** name `"active_config.json"` (R18);
+  - `configs_history/` — chronological copies.
+  Writes are atomic (tmp + `fsync` + `os.replace`) so the bot never reads a half-written
+  file. Runs as a loop or one-shot (`--once` / `--dry-run`).
+- **Bot watcher** (`src/passivbot.py`) — when `live.wfo_rolling.enabled`, the bot adds a
+  `maintain_wfo_rolling` data-maintainer that periodically (`check_interval_minutes`)
+  reads `active.json` and runs the **state machine** (`decide_rolling_state`):
+
+  | State | Trigger | Bot action |
+  |---|---|---|
+  | **NORMAL** | published period == loaded period, calendar aligned | trade normally |
+  | **WIND_DOWN** | calendar has rolled past the loaded period, next config not yet published | stop opening; apply the **boundary handoff rule** to existing positions |
+  | **ADOPT** | a *different* period is published (or nothing loaded yet) | **soft-restart** to load the new config |
+
+### R13 — Live auto-rolls every month (retrain → use → repeat)
+> "if we start a new month … it will automatically move to next period and train model to
+> converged; model is used during this month, until next month where a new optimization occurs."
+
+- The current live window is a deterministic function of `today` and a fixed anchor
+  (`current_live_window(anchor, train_months, test_months, step_months, today)`), so the
+  scheduler and bot always agree on which month is live without shared mutable state.
+- On a new month the scheduler optimizes the new 6-month training window **to convergence**
+  (R7 early-stop) and publishes; the bot adopts it for that month, then repeats.
+
+**Where:** `wfo_handoff.current_live_window`, `wfo_scheduler.run_once`/`run`.
+
+### R14 — Trading off until the month's optimization is complete
+> "at start of month there should be a period where trading is off and not reactivated
+> until the new optimization for the given month is completed."
+
+- The scheduler **only publishes a new `active.json` when the month's optimize+OOS chain
+  has finished**. Until then the bot stays in **WIND_DOWN** (no new entries) for the prior
+  config, and flips to **ADOPT** (which soft-restarts into NORMAL) the moment the new
+  artifact appears. There is no window in which the bot opens positions on a not-yet-trained
+  month.
+
+**Where:** `decide_rolling_state` (WIND_DOWN vs ADOPT), `_wfo_rolling_tick`.
+
+### R15 — Boundary handoff for open positions (tp_only + small-loss flatten)
+> "there is a little problem if at end of month a position is open … the rule could be to
+> only close it if it is in profit or a fairly small unrealized drawdown (<5% of total TWE)."
+
+- During **WIND_DOWN** the bot:
+  1. sets `forced_mode_long/short = "tp_only"` globally (no new entries; let take-profits run), and
+  2. for each open position that **`should_flatten`** — `uPnL ≥ 0` **or**
+     `|uPnL| < max_loss_flatten_frac × total_wallet_equity` (default **5%**) — forces that
+     symbol to `"panic"` via a per-symbol `coin_overrides`, so winners and small losers are
+     flattened at the seam while a position in a larger drawdown is **kept** and carried into
+     the next month rather than realized at a bad time.
+- The identical rule (`should_flatten`) is reused by the backtest stateful carry (R17), so
+  live and backtest treat the boundary the same way.
+
+**Where:** `wfo_handoff.should_flatten`, `passivbot._wfo_wind_down`.
+
+### R16 — Recover from any restart (local or docker)
+> "it must be able to recover any restart, running local or with docker."
+
+- Adoption uses an **in-process soft-restart** (`soft_restart_requested` breaks the
+  execution loop; `main()` re-reads the active config and rebuilds the bot **without**
+  counting against the hard-restart budget), which behaves identically whether the bot runs
+  as a local process or inside the `restart: unless-stopped` docker container.
+- On any restart the bot **re-reads open positions from the exchange** (`fetched_positions`)
+  and re-derives the live window from the anchor + `active.json`, so it resumes the correct
+  month and the correct NORMAL/WIND_DOWN/ADOPT state with no local checkpoint required.
+- The bot adopts by **swapping only the `bot` section** from `active_config.json` into a
+  deep copy of its pristine startup config (`_maybe_adopt_wfo_config`), so operator-managed
+  `live`/keys settings are preserved across rolls.
+
+**Where:** `passivbot.maintain_wfo_rolling`/`_wfo_rolling_tick`, `_maybe_adopt_wfo_config`,
+the soft-restart handling in `main()`.
+
+---
+
+## 13. Stateful OOS carry-over (R17)
+
+> "all trading is always done out of sample during backtest … (and obviously during live)"
+
+By default the backtest stitches consecutive OOS segments by **compounding returns** from a
+flat start each month (R11) — correct for a track record, but it does not model an open
+position surviving a month boundary the way live does. Opt-in **`walk_forward.stateful_oos`**
+makes the backtest carry **balance + open positions** across OOS seams using the **same**
+handoff rule live uses, producing one **value-continuous** OOS equity curve:
+
+- The engine emits an **`end_state.json`** per segment (final equity + open positions with
+  uPnL) when `backtest.wfo_write_end_state` is set (`compute_end_state`).
+- `advance_carry(end_state, max_loss_flatten_frac)` applies `should_flatten` (R15): kept
+  positions carry forward; flattened positions' mark-to-market becomes cash, so
+  `next_balance = equity − Σ uPnL(kept)`.
+- The next segment is seeded via `backtest.starting_balance` + `backtest.initial_positions`
+  (the Rust engine seeds `Positions` from these), and `stitch_oos_equity(..., stateful=True)`
+  **concatenates** raw equity (de-duping the overlapping seam timestamp) instead of compounding.
+- **`stateful_oos` off ⇒ byte-identical to the historical behavior** (default off).
+
+**Fidelity model & its bound.** Seeding reconstructs the boundary state exactly; the only
+divergence from a hypothetical *continuous* run is that per-coin **EMA state resets** at each
+seam (each segment is a fresh backtest process). Measured on a 2-month HYPE carry-parity check
+(one fixed config, a real open long carried across the seam, no flatten — to isolate the
+plumbing from the handoff rule):
+
+| Check | Result |
+|---|---|
+| `end_state.equity` vs continuous equity at the boundary | rel **1.8e-4** (residual = 60-min balance sampling) |
+| seg-2 first-bar equity vs `end_state.equity` (MTM reconstruction) | rel **9.6e-4** |
+| seg-2 final equity vs continuous final equity (full stitched fidelity) | rel **5.3e-5** |
+
+So the carry plumbing is exact to sampling granularity, and full-curve fidelity is bounded by
+the EMA-warmup transient at each seam (small here; grows with shorter test windows / longer EMAs).
+
+**Not yet modeled:** `walk_forward.retrain_delay_days` (a knob for the real-world lag between
+month start and the new config being ready) exists but is **not** reflected in the stateful
+stitch — the stitch assumes the new config is live from the first bar of the test month.
+
+**Where:** `backtest.compute_end_state` + gated `end_state.json` write in `post_process`;
+`wfo_handoff.advance_carry`; `wfo_utils.stitch_oos_equity(stateful=True)` / `_concat_oos_equity`;
+the stateful OOS loop in `walkforward.run`; Rust `BacktestParams.initial_positions_{long,short}`.
+
+---
+
+## 14. VPS deployment flow (R18)
+
+> "live (not backtest) will run on a VPS with limited resources … beginning-of-month
+> optimizations will probably have to be run locally and uploaded to the VPS. The VPS live
+> (clone of current code) should pick them up automatically. VPS is Linux; here we are on Windows."
+
+The decoupled design (Section 12) supports a **split deployment** with no code changes:
+
+1. **Optimize locally** (Windows, full CPU): run the scheduler one-shot for the current month
+   — `python src/wfo_scheduler.py --config configs/wfo_hype.json --once`. It writes the
+   portable artifacts under `runs/walkforward/live/`.
+2. **Upload** that directory's `active_config.json` + `active.json` (+ `configs_history/`) to
+   the VPS's `live.wfo_rolling.active_dir`.
+3. **VPS auto-adopts**: the live bot's watcher sees the new `active.json`, runs
+   `decide_rolling_state` → **ADOPT**, and soft-restarts into the new config — no scheduler
+   needed on the VPS.
+
+Portability guarantees that make this safe across OS:
+- Artifacts are **plain JSON** with **relative, co-located** paths (`active.json.config_path
+  = "active_config.json"`), so an absolute Windows path is never baked in.
+- Adoption swaps **only the `bot` section** into the VPS bot's own pristine config, so the
+  VPS keeps its own keys, exchange wiring, and `live` settings.
+- The live window is derived from a **fixed anchor + `today`**, identical on both machines, so
+  local and VPS always agree on which month is live.
+
+To instead run everything on one capable host, enable the bundled
+`passivbot-wfo-scheduler` docker service (`profiles: ["wfo"]`) alongside the live bot.
+
+### New config keys (live rolling + stateful carry)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `live.wfo_rolling.enabled` | `false` | Turn on the bot-side watcher |
+| `live.wfo_rolling.active_dir` | `runs/walkforward/live` | Where the bot reads `active.json` / `active_config.json` |
+| `live.wfo_rolling.max_loss_flatten_frac` | `0.05` | Boundary handoff threshold (R15) |
+| `live.wfo_rolling.check_interval_minutes` | `60.0` | How often the watcher polls `active.json` |
+| `walk_forward.stateful_oos` | `false` | Carry balance+positions across OOS seams (R17) |
+| `walk_forward.max_loss_flatten_frac` | `0.05` | Backtest copy of the handoff threshold |
+| `walk_forward.retrain_delay_days` | `0` | Intended month-start lag (knob exists; **not yet** modeled in the stitch) |
+| `backtest.initial_positions` | `{}` | Seed open positions (coin → side → {size, price}); engine input for R17 |
+| `backtest.wfo_write_end_state` | `false` | Emit `end_state.json` for the next segment's carry |

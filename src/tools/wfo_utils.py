@@ -272,6 +272,7 @@ def normalized_distance(
 def stitch_oos_equity(
     segments: Sequence[Any],
     starting_balance: float = 1.0,
+    stateful: bool = False,
 ) -> Dict[str, Any]:
     """Splice consecutive OOS equity segments into one continuous curve.
 
@@ -282,8 +283,15 @@ def stitch_oos_equity(
     historical behavior: each segment's return is chained onto the running
     equity.
 
+    When ``stateful=True`` the segments are already value-continuous (each backtest
+    started from the previous segment's carried balance + open positions), so their
+    raw equity values are simply **concatenated** (deduping overlapping timestamps)
+    rather than rebased — see :func:`tools.wfo_handoff.advance_carry`.
+
     Returns the stitched curve plus aggregate metrics derived from it.
     """
+    if stateful:
+        return _concat_oos_equity(segments, starting_balance)
     stitched: List[float] = []
     timestamps: List[Any] = []
     timestamp_to_equity: Dict[Any, float] = {}
@@ -341,6 +349,36 @@ def stitch_oos_equity(
     metrics["starting_balance"] = float(starting_balance)
     result = {"equity": stitched, "metrics": metrics}
     if timestamps and len(timestamps) == len(stitched):
+        result["timestamps"] = timestamps
+    return result
+
+
+def _concat_oos_equity(
+    segments: Sequence[Any],
+    starting_balance: float = 1.0,
+) -> Dict[str, Any]:
+    """Concatenate value-continuous OOS segments (stateful carry), deduping
+    overlapping timestamps. No rebasing: the segments already share one balance line."""
+    stitched: List[float] = []
+    timestamps: List[Any] = []
+    seen_timestamps = set()
+    have_ts = True
+    for seg in segments:
+        for ts, value in _normalise_oos_segment(seg):
+            if ts is None:
+                have_ts = False
+                stitched.append(value)
+                continue
+            if ts in seen_timestamps:
+                continue
+            seen_timestamps.add(ts)
+            timestamps.append(ts)
+            stitched.append(value)
+    metrics = _equity_metrics(stitched)
+    metrics["final_equity"] = stitched[-1] if stitched else float(starting_balance)
+    metrics["starting_balance"] = float(starting_balance)
+    result: Dict[str, Any] = {"equity": stitched, "metrics": metrics}
+    if have_ts and timestamps and len(timestamps) == len(stitched):
         result["timestamps"] = timestamps
     return result
 

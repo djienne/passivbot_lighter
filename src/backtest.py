@@ -1298,6 +1298,70 @@ def run_backtest(hlcvs, mss, config: dict, exchange: str, btc_usd_prices, timest
     return fills, equities_array, analysis
 
 
+def compute_end_state(fdf, config, exchange, hlcvs, equities_array, mss):
+    """Final equity + open positions (with uPnL) at the end of a backtest segment.
+
+    Used by walk-forward stateful carry-over (walk_forward.stateful_oos). Positions are
+    seeded from ``backtest.initial_positions`` (the carry-in) and then overridden by the
+    last fill per (coin, side); a carried position that was never traded has no fill and
+    is therefore preserved unchanged. Per-position uPnL uses the segment's final close.
+    """
+    coins = sorted(set(require_config_value(config, f"backtest.coins.{exchange}")))
+    coin_idx = {c: i for i, c in enumerate(coins)}
+    eq = np.asarray(equities_array)
+    if eq.ndim == 2 and eq.shape[0] > 0 and eq.shape[1] > 1:
+        equity = float(eq[-1, 1])  # USD total equity column
+    else:
+        equity = float(require_config_value(config, "backtest.starting_balance"))
+
+    pos: dict = {}  # (coin, side) -> {"size", "entry"}
+    init = (config.get("backtest", {}) or {}).get("initial_positions", {}) or {}
+    for coin, sides in init.items():
+        if not isinstance(sides, dict):
+            continue
+        for side in ("long", "short"):
+            leg = sides.get(side)
+            if not leg:
+                continue
+            if isinstance(leg, dict):
+                size = float(leg.get("size", 0.0) or 0.0)
+                entry = float(leg.get("price", 0.0) or 0.0)
+            else:
+                size, entry = float(leg[0]), float(leg[1])
+            if size != 0.0:
+                pos[(coin, side)] = {"size": size, "entry": entry}
+
+    if fdf is not None and not fdf.empty and "type" in fdf.columns:
+        types = fdf["type"].astype(str)
+        for side in ("long", "short"):
+            side_df = fdf[types.str.contains(side, na=False)]
+            for coin, grp in side_df.groupby("coin"):
+                last = grp.iloc[-1]
+                size = float(last["psize"])
+                entry = float(last["pprice"])
+                if size == 0.0:
+                    pos.pop((coin, side), None)
+                else:
+                    pos[(coin, side)] = {"size": size, "entry": entry}
+
+    positions = []
+    for (coin, side), pv in pos.items():
+        ci = coin_idx.get(coin)
+        if ci is None or ci >= hlcvs.shape[1]:
+            continue
+        final_price = float(hlcvs[-1, ci, 2])  # CLOSE column = 2
+        c_mult = float((mss or {}).get(coin, {}).get("c_mult", 1.0))
+        size, entry = pv["size"], pv["entry"]
+        if side == "long":
+            upnl = (final_price - entry) * size * c_mult
+        else:
+            upnl = (entry - final_price) * size * c_mult
+        positions.append(
+            {"coin": coin, "side": side, "size": size, "entry": entry, "upnl": upnl}
+        )
+    return {"equity": equity, "positions": positions}
+
+
 def post_process(
     config,
     hlcvs,
@@ -1307,6 +1371,7 @@ def post_process(
     analysis,
     results_path,
     exchange,
+    mss=None,
 ):
     sts = utc_ms()
     equities_array = np.asarray(equities_array)
@@ -1332,6 +1397,16 @@ def post_process(
         oj(results_path, f"{ts_to_date(utc_ms())[:19].replace(':', '_')}", "")
     )
     json.dump(analysis, open(f"{results_path}analysis.json", "w"), indent=4, sort_keys=True)
+    # Walk-forward stateful carry-over: persist end-of-segment balance + open positions
+    # so the next OOS segment can be seeded from them (gated; off => no extra output).
+    if (config.get("backtest", {}) or {}).get("wfo_write_end_state"):
+        try:
+            end_state = compute_end_state(fdf, config, exchange, hlcvs, equities_array, mss)
+            json.dump(
+                end_state, open(f"{results_path}end_state.json", "w"), indent=2, sort_keys=True
+            )
+        except Exception as e:
+            logging.warning("failed to write end_state.json: %s", e)
     config["analysis"] = analysis
     formatted_config = format_config(config)
     sanitized_config = strip_config_metadata(formatted_config)
@@ -1535,6 +1610,7 @@ async def main():
             analysis,
             results_path,
             exchange,
+            mss=mss,
         )
     else:
         print("combined false")
@@ -1562,6 +1638,7 @@ async def main():
                 analysis,
                 results_path,
                 exchange,
+                mss=mss,
             )
 
 

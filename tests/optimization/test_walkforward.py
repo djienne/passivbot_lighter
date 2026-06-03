@@ -173,6 +173,25 @@ class TestStitchOosEquity:
         assert out["timestamps"] == [1, 2, 3]
         assert out["equity"] == pytest.approx([1000.0, 1100.0, 1210.0])
 
+    def test_stateful_concatenates_and_dedupes_overlap(self):
+        # Stateful segments are already value-continuous: concatenate raw values,
+        # dropping the duplicate boundary timestamp.
+        seg1 = {"timestamps": [1, 2, 3], "equity": [100.0, 110.0, 120.0]}
+        seg2 = {"timestamps": [3, 4], "equity": [120.0, 130.0]}  # overlaps at ts 3
+        out = stitch_oos_equity([seg1, seg2], starting_balance=100.0, stateful=True)
+        assert out["timestamps"] == [1, 2, 3, 4]
+        assert out["equity"] == pytest.approx([100.0, 110.0, 120.0, 130.0])
+        assert out["metrics"]["final_equity"] == pytest.approx(130.0)
+        assert out["metrics"]["total_return"] == pytest.approx(0.30)
+
+    def test_stateful_differs_from_compounded(self):
+        seg1 = {"timestamps": [1, 2], "equity": [100.0, 110.0]}
+        seg2 = {"timestamps": [3, 4], "equity": [200.0, 220.0]}
+        stateful = stitch_oos_equity([seg1, seg2], starting_balance=100.0, stateful=True)
+        compounded = stitch_oos_equity([seg1, seg2], starting_balance=100.0, stateful=False)
+        assert stateful["equity"] == pytest.approx([100.0, 110.0, 200.0, 220.0])
+        assert stateful["equity"] != compounded["equity"]
+
 
 # ---------------------------------------------------------------------------
 # Parameter drift
@@ -575,6 +594,70 @@ def test_proximity_penalty_does_not_increase_constraint_violation(monkeypatch):
     assert penalty == pytest.approx(0.0)
     assert metrics["constraint_violation"] == pytest.approx(0.0)
     assert metrics["proximity_penalty"] == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# Backtest end-state extraction (stateful OOS carry)
+# ---------------------------------------------------------------------------
+class TestComputeEndState:
+    def _cfg(self, initial_positions=None):
+        return {
+            "backtest": {
+                "coins": {"lighter": ["HYPE"]},
+                "starting_balance": 100.0,
+                "initial_positions": initial_positions or {},
+            }
+        }
+
+    def test_extracts_position_and_upnl_from_fills(self):
+        import pandas as pd
+        from backtest import compute_end_state
+
+        hlcvs = np.zeros((3, 1, 4))
+        hlcvs[-1, 0, 2] = 50.0  # final close (CLOSE col = 2)
+        equities = np.zeros((3, 4))
+        equities[-1, 1] = 142.0  # USD total equity col = 1
+        fdf = pd.DataFrame([
+            {"coin": "HYPE", "type": "entry_initial_normal_long", "psize": 2.0, "pprice": 30.0},
+        ])
+        es = compute_end_state(fdf, self._cfg(), "lighter", hlcvs, equities, {"HYPE": {"c_mult": 1.0}})
+        assert es["equity"] == pytest.approx(142.0)
+        assert len(es["positions"]) == 1
+        p = es["positions"][0]
+        assert (p["coin"], p["side"], p["size"], p["entry"]) == ("HYPE", "long", 2.0, 30.0)
+        assert p["upnl"] == pytest.approx((50.0 - 30.0) * 2.0)  # 40.0
+
+    def test_untraded_seeded_position_is_preserved(self):
+        import pandas as pd
+        from backtest import compute_end_state
+
+        hlcvs = np.zeros((2, 1, 4))
+        hlcvs[-1, 0, 2] = 12.0
+        equities = np.zeros((2, 4))
+        equities[-1, 1] = 110.0
+        cfg = self._cfg({"HYPE": {"long": {"size": 5.0, "price": 10.0}}})
+        empty = pd.DataFrame(columns=["coin", "type", "psize", "pprice"])
+        es = compute_end_state(empty, cfg, "lighter", hlcvs, equities, {"HYPE": {"c_mult": 1.0}})
+        # No fills => the carried-in position survives unchanged.
+        assert len(es["positions"]) == 1
+        p = es["positions"][0]
+        assert (p["size"], p["entry"]) == (5.0, 10.0)
+        assert p["upnl"] == pytest.approx((12.0 - 10.0) * 5.0)  # 10.0
+
+    def test_closed_position_dropped(self):
+        import pandas as pd
+        from backtest import compute_end_state
+
+        hlcvs = np.zeros((2, 1, 4))
+        hlcvs[-1, 0, 2] = 50.0
+        equities = np.zeros((2, 4))
+        equities[-1, 1] = 105.0
+        fdf = pd.DataFrame([
+            {"coin": "HYPE", "type": "entry_long", "psize": 2.0, "pprice": 30.0},
+            {"coin": "HYPE", "type": "close_long", "psize": 0.0, "pprice": 0.0},
+        ])
+        es = compute_end_state(fdf, self._cfg(), "lighter", hlcvs, equities, {"HYPE": {"c_mult": 1.0}})
+        assert es["positions"] == []
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,44 @@ def should_flatten(
 
 
 # ---------------------------------------------------------------------------
+# Backtest stateful carry between OOS segments
+# ---------------------------------------------------------------------------
+def advance_carry(end_state: dict, max_loss_frac: float = 0.05) -> dict:
+    """Compute the next OOS segment's seed (balance + positions) from this segment's
+    end-state, applying the same handoff rule (``should_flatten``) the live bot uses.
+
+    ``end_state`` = ``{"equity": float, "positions": [{coin, side, size, entry, upnl}, ...]}``.
+    Positions that should be flattened (in profit, or small unrealized loss) are realized
+    into cash; the rest are carried forward as open positions for the next segment.
+
+    Returns ``{"balance": float, "positions": {coin: {side: {"size", "price"}}}}`` shaped for
+    ``backtest.initial_positions``. Equity-based accounting keeps the stitched curve continuous:
+    next first-step equity = next_balance + Σ uPnL(kept) at ≈ the same price ≈ this segment's equity.
+    """
+    equity = float(end_state.get("equity", 0.0) or 0.0)
+    positions = end_state.get("positions", []) or []
+    kept = [
+        p for p in positions
+        if not should_flatten(float(p.get("upnl", 0.0) or 0.0), equity, max_loss_frac)
+    ]
+    next_balance = equity - sum(float(p.get("upnl", 0.0) or 0.0) for p in kept)
+    next_positions: dict = {}
+    for p in kept:
+        size = float(p.get("size", 0.0) or 0.0)
+        if size == 0.0:
+            continue
+        coin = p.get("coin")
+        side = p.get("side")
+        if coin is None or side not in ("long", "short"):
+            continue
+        next_positions.setdefault(coin, {})[side] = {
+            "size": size,
+            "price": float(p.get("entry", 0.0) or 0.0),
+        }
+    return {"balance": next_balance, "positions": next_positions}
+
+
+# ---------------------------------------------------------------------------
 # Live rolling state machine (pure decision)
 # ---------------------------------------------------------------------------
 def decide_rolling_state(

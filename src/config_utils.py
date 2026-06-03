@@ -1976,6 +1976,7 @@ def get_template_config():
             "max_warmup_minutes": 0.0,
             "start_date": "2021-04-01",
             "starting_balance": 100000.0,
+            "wfo_write_end_state": False,
             "suite": {
                 "aggregate": {"default": "mean"},
                 "base_label": "base",

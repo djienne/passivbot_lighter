@@ -51,6 +51,7 @@ from tools.wfo_utils import (  # noqa: E402
     param_drift,
     stitch_oos_equity,
 )
+from tools.wfo_handoff import advance_carry  # noqa: E402
 
 logger = logging.getLogger("walkforward")
 
@@ -203,6 +204,8 @@ def build_test_config(
     chosen_config: Dict[str, Any],
     window,
     test_base_dir: str,
+    starting_balance: Optional[float] = None,
+    initial_positions: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     cfg = deepcopy(base_config)
     cfg.setdefault("backtest", {})
@@ -213,6 +216,14 @@ def build_test_config(
     # Inject the optimized strategy parameters; keep everything else from the base.
     cfg["bot"] = deepcopy(chosen_config.get("bot", cfg.get("bot", {})))
     cfg["disable_plotting"] = True
+    # Stateful carry-over (walk_forward.stateful_oos): seed this OOS segment with the
+    # previous segment's carried balance + open positions and ask the engine to emit
+    # end_state.json for the next segment. None => flat start (historical behavior).
+    if starting_balance is not None:
+        cfg["backtest"]["starting_balance"] = float(starting_balance)
+    if initial_positions is not None:
+        cfg["backtest"]["initial_positions"] = initial_positions
+        cfg["backtest"]["wfo_write_end_state"] = True
     return cfg
 
 
@@ -597,6 +608,14 @@ def run(args: argparse.Namespace) -> int:
     prev_config_path: Optional[str] = None
     prev_config_dict: Optional[Dict[str, Any]] = None
 
+    # Stateful OOS carry-over: when enabled, each OOS segment is seeded with the
+    # previous segment's carried balance + open positions (handoff rule applied in
+    # between), yielding one continuous equity curve instead of flat-restart segments.
+    stateful_oos = bool(wf.get("stateful_oos"))
+    max_loss_flatten_frac = float(wf.get("max_loss_flatten_frac", 0.05) or 0.05)
+    base_starting_balance = float(base_config.get("backtest", {}).get("starting_balance", 1.0) or 1.0)
+    carry: Dict[str, Any] = {"balance": base_starting_balance, "positions": {}}
+
     for w in windows:
         wdir = run_dir / f"window_{w.index:02d}"
         train_dir = wdir / "train"
@@ -653,7 +672,14 @@ def run(args: argparse.Namespace) -> int:
 
         # --- OOS evaluation ---
         test_base_dir = str(test_dir / "bt")
-        test_cfg = build_test_config(base_config, choice.config, w, test_base_dir)
+        if stateful_oos:
+            test_cfg = build_test_config(
+                base_config, choice.config, w, test_base_dir,
+                starting_balance=carry["balance"],
+                initial_positions=carry["positions"],
+            )
+        else:
+            test_cfg = build_test_config(base_config, choice.config, w, test_base_dir)
         test_cfg_path = test_dir / "test_config.json"
         dump_config(test_cfg, str(test_cfg_path))
 
@@ -680,6 +706,22 @@ def run(args: argparse.Namespace) -> int:
                     oos_segment = _load_equity_segment(bal_eq_path)
                 except Exception as exc:
                     logger.warning("Failed to read OOS equity for window %02d: %s", w.index, exc)
+            # Stateful carry: advance balance + open positions for the next segment.
+            if stateful_oos:
+                es_path = _find_latest(test_base_dir, "end_state.json")
+                if es_path:
+                    try:
+                        with open(es_path, "r", encoding="utf-8") as fh:
+                            end_state = json.load(fh)
+                        carry = advance_carry(end_state, max_loss_flatten_frac)
+                        logger.info(
+                            "window %02d | carry -> balance=%.4f | kept positions=%d",
+                            w.index, carry["balance"], len(carry["positions"]),
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to advance carry for window %02d: %s", w.index, exc)
+                else:
+                    logger.warning("window %02d | stateful_oos on but no end_state.json found", w.index)
 
         if oos_segment.get("equity"):
             oos_segments.append(oos_segment)
@@ -727,7 +769,7 @@ def run(args: argparse.Namespace) -> int:
     summary_dir = run_dir / "walkforward_summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
     starting_balance = float(base_config.get("backtest", {}).get("starting_balance", 1.0) or 1.0)
-    stitched = stitch_oos_equity(oos_segments, starting_balance=starting_balance)
+    stitched = stitch_oos_equity(oos_segments, starting_balance=starting_balance, stateful=stateful_oos)
 
     # stitched equity CSV
     with open(summary_dir / "stitched_equity.csv", "w", encoding="utf-8") as fh:

@@ -8,7 +8,12 @@ import copy
 
 import pytest
 
-from tools.wfo_handoff import should_flatten, current_live_window, decide_rolling_state
+from tools.wfo_handoff import (
+    should_flatten,
+    current_live_window,
+    decide_rolling_state,
+    advance_carry,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +90,43 @@ class TestCurrentLiveWindow:
     def test_invalid_args_raise(self):
         with pytest.raises(ValueError):
             current_live_window(self.ANCHOR, 0, 1, 1, "2025-08-01")
+
+
+# ---------------------------------------------------------------------------
+# Stateful carry between OOS segments
+# ---------------------------------------------------------------------------
+class TestAdvanceCarry:
+    def test_keeps_big_loser_realizes_winner_and_small_loser(self):
+        # equity 1000; 5% threshold = 50.
+        end_state = {
+            "equity": 1000.0,
+            "positions": [
+                {"coin": "A", "side": "long", "size": 1.0, "entry": 100.0, "upnl": 30.0},   # profit -> flatten
+                {"coin": "B", "side": "long", "size": 2.0, "entry": 50.0, "upnl": -40.0},    # small loss -> flatten
+                {"coin": "C", "side": "long", "size": 3.0, "entry": 20.0, "upnl": -200.0},   # big loss -> keep
+            ],
+        }
+        out = advance_carry(end_state, max_loss_frac=0.05)
+        # kept = [C]; next_balance = 1000 - (-200) = 1200
+        assert out["balance"] == pytest.approx(1200.0)
+        assert set(out["positions"].keys()) == {"C"}
+        assert out["positions"]["C"]["long"] == {"size": 3.0, "price": 20.0}
+
+    def test_all_flattened_balance_equals_equity(self):
+        end_state = {
+            "equity": 500.0,
+            "positions": [
+                {"coin": "A", "side": "long", "size": 1.0, "entry": 1.0, "upnl": 10.0},
+            ],
+        }
+        out = advance_carry(end_state, max_loss_frac=0.05)
+        assert out["balance"] == pytest.approx(500.0)
+        assert out["positions"] == {}
+
+    def test_empty_positions(self):
+        out = advance_carry({"equity": 100.0, "positions": []}, max_loss_frac=0.05)
+        assert out["balance"] == pytest.approx(100.0)
+        assert out["positions"] == {}
 
 
 # ---------------------------------------------------------------------------
