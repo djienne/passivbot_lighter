@@ -132,13 +132,15 @@ impl HlcvsBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExchangeParams {
     pub qty_step: f64,
     pub price_step: f64,
     pub min_qty: f64,
     pub min_cost: f64,
     pub c_mult: f64,
+    pub maker_fee: f64,
+    pub taker_fee: f64,
 }
 
 impl Default for ExchangeParams {
@@ -149,6 +151,54 @@ impl Default for ExchangeParams {
             min_qty: 0.00001,
             min_cost: 1.0,
             c_mult: 1.0,
+            maker_fee: 0.0002,
+            taker_fee: 0.00055,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EquityHardStopLossTierRatios {
+    pub yellow: f64,
+    pub orange: f64,
+}
+
+impl Default for EquityHardStopLossTierRatios {
+    fn default() -> Self {
+        Self {
+            yellow: 0.5,
+            orange: 0.75,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EquityHardStopLossConfig {
+    pub enabled: bool,
+    pub signal_mode: String,
+    pub red_threshold: f64,
+    pub ema_span_minutes: f64,
+    pub cooldown_minutes_after_red: f64,
+    pub no_restart_drawdown_threshold: f64,
+    pub tier_ratios: EquityHardStopLossTierRatios,
+    pub orange_tier_mode: String,
+    #[allow(dead_code)]
+    // Parsed in Rust for config parity; consumed by Python live order handling.
+    pub panic_close_order_type: String,
+}
+
+impl Default for EquityHardStopLossConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            signal_mode: "unified".to_string(),
+            red_threshold: 0.25,
+            ema_span_minutes: 60.0,
+            cooldown_minutes_after_red: 0.0,
+            no_restart_drawdown_threshold: 1.0,
+            tier_ratios: EquityHardStopLossTierRatios::default(),
+            orange_tier_mode: "tp_only_with_active_entry_cancellation".to_string(),
+            panic_close_order_type: "market".to_string(),
         }
     }
 }
@@ -157,6 +207,7 @@ impl Default for ExchangeParams {
 pub struct BacktestParams {
     pub starting_balance: f64,
     pub maker_fee: f64,
+    pub taker_fee: f64,
     pub coins: Vec<String>,
     pub active_coin_indices: Option<Vec<usize>>,
     pub first_timestamp_ms: u64,
@@ -170,7 +221,17 @@ pub struct BacktestParams {
     pub btc_collateral_ltv_cap: Option<f64>,
     pub metrics_only: bool,
     pub filter_by_min_effective_cost: bool,
+    pub dynamic_wel_by_tradability: bool,
     pub hedge_mode: bool,
+    pub max_realized_loss_pct: f64,
+    pub pnls_max_lookback_days: f64,
+    pub liquidation_threshold: f64,
+    pub equity_hard_stop_loss: EquityHardStopLossConfig,
+    pub market_orders_allowed: bool,
+    pub market_order_near_touch_threshold: f64,
+    pub market_order_slippage_pct: f64,
+    pub forager_score_hysteresis_pct: f64,
+    pub candle_interval_minutes: u64, // 1 for 1m candles (default), 5 for 5m, etc.
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
@@ -234,6 +295,85 @@ pub struct BotParamsPair {
     pub short: BotParams,
 }
 
+fn default_hsl_enabled() -> bool {
+    false
+}
+
+fn default_hsl_red_threshold() -> f64 {
+    0.25
+}
+
+fn default_hsl_ema_span_minutes() -> f64 {
+    60.0
+}
+
+fn default_hsl_cooldown_minutes_after_red() -> f64 {
+    0.0
+}
+
+fn default_hsl_no_restart_drawdown_threshold() -> f64 {
+    1.0
+}
+
+fn default_hsl_tier_ratio_yellow() -> f64 {
+    0.5
+}
+
+fn default_hsl_tier_ratio_orange() -> f64 {
+    0.75
+}
+
+fn default_hsl_orange_tier_mode() -> String {
+    "tp_only_with_active_entry_cancellation".to_string()
+}
+
+fn default_hsl_panic_close_order_type() -> String {
+    "market".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ForagerScoreWeights {
+    pub volume: f64,
+    pub ema_readiness: f64,
+    pub volatility: f64,
+}
+
+impl Default for ForagerScoreWeights {
+    fn default() -> Self {
+        Self {
+            volume: 0.0,
+            ema_readiness: 0.0,
+            volatility: 1.0,
+        }
+    }
+}
+
+impl ForagerScoreWeights {
+    pub fn canonicalize(&self) -> Result<Self, String> {
+        let values = [self.volume, self.ema_readiness, self.volatility];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err("forager_score_weights must be finite and non-negative".to_string());
+        }
+        let total = self.volume + self.ema_readiness + self.volatility;
+        if total <= 0.0 {
+            return Ok(Self {
+                volume: 0.0,
+                ema_readiness: 1.0,
+                volatility: 0.0,
+            });
+        }
+        Ok(Self {
+            volume: self.volume / total,
+            ema_readiness: self.ema_readiness / total,
+            volatility: self.volatility / total,
+        })
+    }
+}
+
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BotParams {
@@ -260,11 +400,33 @@ pub struct BotParams {
     pub entry_trailing_threshold_we_weight: f64,
     pub entry_trailing_threshold_volatility_weight: f64,
     pub filter_volatility_ema_span: f64,
-    pub filter_volatility_drop_pct: f64,
     pub filter_volume_ema_span: f64,
-    pub filter_volume_drop_pct: f64,
+    #[serde(default, skip_serializing, rename = "filter_volatility_drop_pct")]
+    pub _legacy_filter_volatility_drop_pct: f64,
+    #[serde(default, alias = "filter_volume_drop_pct")]
+    pub forager_volume_drop_pct: f64,
+    #[serde(default)]
+    pub forager_score_weights: ForagerScoreWeights,
     pub ema_span_0: f64,
     pub ema_span_1: f64,
+    #[serde(default = "default_hsl_enabled")]
+    pub hsl_enabled: bool,
+    #[serde(default = "default_hsl_red_threshold")]
+    pub hsl_red_threshold: f64,
+    #[serde(default = "default_hsl_ema_span_minutes")]
+    pub hsl_ema_span_minutes: f64,
+    #[serde(default = "default_hsl_cooldown_minutes_after_red")]
+    pub hsl_cooldown_minutes_after_red: f64,
+    #[serde(default = "default_hsl_no_restart_drawdown_threshold")]
+    pub hsl_no_restart_drawdown_threshold: f64,
+    #[serde(default = "default_hsl_tier_ratio_yellow")]
+    pub hsl_tier_ratio_yellow: f64,
+    #[serde(default = "default_hsl_tier_ratio_orange")]
+    pub hsl_tier_ratio_orange: f64,
+    #[serde(default = "default_hsl_orange_tier_mode")]
+    pub hsl_orange_tier_mode: String,
+    #[serde(default = "default_hsl_panic_close_order_type")]
+    pub hsl_panic_close_order_type: String,
     pub n_positions: usize,
     pub total_wallet_exposure_limit: f64,
     pub wallet_exposure_limit: f64, // per-position base limit (without excess allowance)
@@ -417,6 +579,7 @@ pub struct Fill {
     pub position_size: f64,
     pub position_price: f64,
     pub order_type: OrderType,
+    pub liquidity: String,
     pub wallet_exposure: f64, // signed: long positive, short negative
     pub twe_long: f64,
     pub twe_short: f64, // signed negative
@@ -428,6 +591,7 @@ pub struct Analysis {
     pub adg: f64,
     pub mdg: f64,
     pub gain: f64,
+    pub liquidated: bool,
     pub adg_pnl: f64,
     pub mdg_pnl: f64,
     pub sharpe_ratio_pnl: f64,
@@ -440,13 +604,50 @@ pub struct Analysis {
     pub sterling_ratio: f64,
     pub drawdown_worst: f64,
     pub drawdown_worst_mean_1pct: f64,
+    pub gain_strategy_eq: f64,
+    pub adg_strategy_eq: f64,
+    pub mdg_strategy_eq: f64,
+    pub sharpe_ratio_strategy_eq: f64,
+    pub sortino_ratio_strategy_eq: f64,
+    pub omega_ratio_strategy_eq: f64,
+    pub expected_shortfall_1pct_strategy_eq: f64,
+    pub calmar_ratio_strategy_eq: f64,
+    pub sterling_ratio_strategy_eq: f64,
+    pub drawdown_worst_strategy_eq: f64,
+    pub drawdown_worst_strategy_eq_long: f64,
+    pub drawdown_worst_strategy_eq_short: f64,
+    pub drawdown_worst_ema_strategy_eq: f64,
+    pub drawdown_worst_ema_strategy_eq_long: f64,
+    pub drawdown_worst_ema_strategy_eq_short: f64,
+    pub drawdown_worst_mean_1pct_strategy_eq: f64,
+    pub drawdown_worst_mean_1pct_strategy_eq_long: f64,
+    pub drawdown_worst_mean_1pct_strategy_eq_short: f64,
+    pub drawdown_worst_mean_1pct_ema_strategy_eq: f64,
+    pub drawdown_worst_mean_1pct_ema_strategy_eq_long: f64,
+    pub drawdown_worst_mean_1pct_ema_strategy_eq_short: f64,
+    pub peak_recovery_hours_strategy_eq: f64,
+    pub peak_recovery_hours_strategy_eq_long: f64,
+    pub peak_recovery_hours_strategy_eq_short: f64,
+    pub peak_recovery_days_strategy_eq: f64,
+    pub peak_recovery_days_strategy_eq_long: f64,
+    pub peak_recovery_days_strategy_eq_short: f64,
     pub equity_balance_diff_neg_max: f64,
     pub equity_balance_diff_neg_mean: f64,
     pub equity_balance_diff_pos_max: f64,
     pub equity_balance_diff_pos_mean: f64,
+    pub paper_loss_ratio: f64,
+    pub paper_loss_mean_ratio: f64,
+    pub exposure_ratio: f64,
+    pub exposure_mean_ratio: f64,
     pub loss_profit_ratio: f64,
+    pub loss_profit_ratio_long: f64,
+    pub loss_profit_ratio_short: f64,
+    pub pnl_ratio_long_short: f64,
+    pub long_short_profit_ratio: f64,
     pub peak_recovery_hours_equity: f64,
     pub peak_recovery_hours_pnl: f64,
+    pub peak_recovery_days_equity: f64,
+    pub peak_recovery_days_pnl: f64,
 
     pub equity_choppiness: f64,
     pub equity_jerkiness: f64,
@@ -461,12 +662,27 @@ pub struct Analysis {
     pub position_held_hours_max: f64,
     pub position_held_hours_median: f64,
     pub position_unchanged_hours_max: f64,
+    pub position_held_days_mean: f64,
+    pub position_held_days_max: f64,
+    pub position_held_days_median: f64,
+    pub position_unchanged_days_max: f64,
+    pub win_rate: f64,
+    pub trade_loss_max: f64,
+    pub trade_loss_mean: f64,
+    pub trade_loss_median: f64,
 
     pub adg_w: f64,
     pub adg_pnl_w: f64,
     pub mdg_pnl_w: f64,
     pub sharpe_ratio_pnl_w: f64,
     pub sortino_ratio_pnl_w: f64,
+    pub adg_strategy_eq_w: f64,
+    pub mdg_strategy_eq_w: f64,
+    pub sharpe_ratio_strategy_eq_w: f64,
+    pub sortino_ratio_strategy_eq_w: f64,
+    pub omega_ratio_strategy_eq_w: f64,
+    pub calmar_ratio_strategy_eq_w: f64,
+    pub sterling_ratio_strategy_eq_w: f64,
     pub mdg_w: f64,
     pub sharpe_ratio_w: f64,
     pub sortino_ratio_w: f64,
@@ -474,14 +690,49 @@ pub struct Analysis {
     pub calmar_ratio_w: f64,
     pub sterling_ratio_w: f64,
     pub loss_profit_ratio_w: f64,
+    pub win_rate_w: f64,
+    pub paper_loss_ratio_w: f64,
+    pub paper_loss_mean_ratio_w: f64,
+    pub exposure_ratio_w: f64,
+    pub exposure_mean_ratio_w: f64,
     pub volume_pct_per_day_avg: f64,
     pub volume_pct_per_day_avg_w: f64,
 
     pub total_wallet_exposure_max: f64,
     pub total_wallet_exposure_mean: f64,
     pub total_wallet_exposure_median: f64,
+    pub high_exposure_hours_mean_long: f64,
+    pub high_exposure_hours_max_long: f64,
+    pub high_exposure_hours_mean_short: f64,
+    pub high_exposure_hours_max_short: f64,
+    pub high_exposure_days_mean_long: f64,
+    pub high_exposure_days_max_long: f64,
+    pub high_exposure_days_mean_short: f64,
+    pub high_exposure_days_max_short: f64,
     pub entry_initial_balance_pct_long: f64,
     pub entry_initial_balance_pct_short: f64,
+
+    pub hard_stop_triggers: u32,
+    pub hard_stop_triggers_per_year: f64,
+    pub hard_stop_triggers_long: u32,
+    pub hard_stop_triggers_short: u32,
+    pub hard_stop_halt_to_restart_equity_loss_pct: f64,
+    pub hard_stop_restarts: u32,
+    pub hard_stop_restarts_per_year: f64,
+    pub hard_stop_restarts_per_year_long: f64,
+    pub hard_stop_restarts_per_year_short: f64,
+    pub hard_stop_restarts_long: u32,
+    pub hard_stop_restarts_short: u32,
+    pub hard_stop_time_in_yellow_pct: f64,
+    pub hard_stop_time_in_orange_pct: f64,
+    pub hard_stop_time_in_red_pct: f64,
+    pub hard_stop_duration_minutes_mean: f64,
+    pub hard_stop_duration_minutes_max: f64,
+    pub hard_stop_trigger_drawdown_mean: f64,
+    pub hard_stop_panic_close_loss_sum: f64,
+    pub hard_stop_panic_close_loss_max: f64,
+    pub hard_stop_flatten_time_minutes_mean: f64,
+    pub hard_stop_post_restart_retrigger_pct: f64,
 }
 
 impl Default for Analysis {
@@ -490,6 +741,7 @@ impl Default for Analysis {
             adg: 0.0,
             mdg: 0.0,
             gain: 0.0,
+            liquidated: false,
             adg_pnl: 0.0,
             mdg_pnl: 0.0,
             sharpe_ratio_pnl: 0.0,
@@ -502,13 +754,50 @@ impl Default for Analysis {
             sterling_ratio: 0.0,
             drawdown_worst: 1.0,
             drawdown_worst_mean_1pct: 1.0,
+            gain_strategy_eq: 0.0,
+            adg_strategy_eq: 0.0,
+            mdg_strategy_eq: 0.0,
+            sharpe_ratio_strategy_eq: 0.0,
+            sortino_ratio_strategy_eq: 0.0,
+            omega_ratio_strategy_eq: 0.0,
+            expected_shortfall_1pct_strategy_eq: 0.0,
+            calmar_ratio_strategy_eq: 0.0,
+            sterling_ratio_strategy_eq: 0.0,
+            drawdown_worst_strategy_eq: 0.0,
+            drawdown_worst_strategy_eq_long: 0.0,
+            drawdown_worst_strategy_eq_short: 0.0,
+            drawdown_worst_ema_strategy_eq: 0.0,
+            drawdown_worst_ema_strategy_eq_long: 0.0,
+            drawdown_worst_ema_strategy_eq_short: 0.0,
+            drawdown_worst_mean_1pct_strategy_eq: 0.0,
+            drawdown_worst_mean_1pct_strategy_eq_long: 0.0,
+            drawdown_worst_mean_1pct_strategy_eq_short: 0.0,
+            drawdown_worst_mean_1pct_ema_strategy_eq: 0.0,
+            drawdown_worst_mean_1pct_ema_strategy_eq_long: 0.0,
+            drawdown_worst_mean_1pct_ema_strategy_eq_short: 0.0,
+            peak_recovery_hours_strategy_eq: 0.0,
+            peak_recovery_hours_strategy_eq_long: 0.0,
+            peak_recovery_hours_strategy_eq_short: 0.0,
+            peak_recovery_days_strategy_eq: 0.0,
+            peak_recovery_days_strategy_eq_long: 0.0,
+            peak_recovery_days_strategy_eq_short: 0.0,
             equity_balance_diff_neg_max: 1.0,
             equity_balance_diff_neg_mean: 1.0,
             equity_balance_diff_pos_max: 1.0,
             equity_balance_diff_pos_mean: 1.0,
+            paper_loss_ratio: 0.0,
+            paper_loss_mean_ratio: 0.0,
+            exposure_ratio: 0.0,
+            exposure_mean_ratio: 0.0,
             loss_profit_ratio: 1.0,
+            loss_profit_ratio_long: 1.0,
+            loss_profit_ratio_short: 1.0,
+            pnl_ratio_long_short: 0.5,
+            long_short_profit_ratio: 0.5,
             peak_recovery_hours_equity: 0.0,
             peak_recovery_hours_pnl: 0.0,
+            peak_recovery_days_equity: 0.0,
+            peak_recovery_days_pnl: 0.0,
             equity_choppiness: 1.0,
             equity_jerkiness: 1.0,
             exponential_fit_error: 1.0,
@@ -518,11 +807,26 @@ impl Default for Analysis {
             position_held_hours_max: 0.0,
             position_held_hours_median: 0.0,
             position_unchanged_hours_max: 0.0,
+            position_held_days_mean: 0.0,
+            position_held_days_max: 0.0,
+            position_held_days_median: 0.0,
+            position_unchanged_days_max: 0.0,
+            win_rate: 0.0,
+            trade_loss_max: 0.0,
+            trade_loss_mean: 0.0,
+            trade_loss_median: 0.0,
             adg_w: 0.0,
             adg_pnl_w: 0.0,
             mdg_pnl_w: 0.0,
             sharpe_ratio_pnl_w: 0.0,
             sortino_ratio_pnl_w: 0.0,
+            adg_strategy_eq_w: 0.0,
+            mdg_strategy_eq_w: 0.0,
+            sharpe_ratio_strategy_eq_w: 0.0,
+            sortino_ratio_strategy_eq_w: 0.0,
+            omega_ratio_strategy_eq_w: 0.0,
+            calmar_ratio_strategy_eq_w: 0.0,
+            sterling_ratio_strategy_eq_w: 0.0,
             mdg_w: 0.0,
             sharpe_ratio_w: 0.0,
             sortino_ratio_w: 0.0,
@@ -530,6 +834,11 @@ impl Default for Analysis {
             calmar_ratio_w: 0.0,
             sterling_ratio_w: 0.0,
             loss_profit_ratio_w: 1.0,
+            win_rate_w: 0.0,
+            paper_loss_ratio_w: 0.0,
+            paper_loss_mean_ratio_w: 0.0,
+            exposure_ratio_w: 0.0,
+            exposure_mean_ratio_w: 0.0,
             equity_choppiness_w: 1.0,
             equity_jerkiness_w: 1.0,
             exponential_fit_error_w: 1.0,
@@ -538,8 +847,37 @@ impl Default for Analysis {
             total_wallet_exposure_max: 0.0,
             total_wallet_exposure_mean: 0.0,
             total_wallet_exposure_median: 0.0,
+            high_exposure_hours_mean_long: 0.0,
+            high_exposure_hours_max_long: 0.0,
+            high_exposure_hours_mean_short: 0.0,
+            high_exposure_hours_max_short: 0.0,
+            high_exposure_days_mean_long: 0.0,
+            high_exposure_days_max_long: 0.0,
+            high_exposure_days_mean_short: 0.0,
+            high_exposure_days_max_short: 0.0,
             entry_initial_balance_pct_long: 0.0,
             entry_initial_balance_pct_short: 0.0,
+            hard_stop_triggers: 0,
+            hard_stop_triggers_per_year: 0.0,
+            hard_stop_triggers_long: 0,
+            hard_stop_triggers_short: 0,
+            hard_stop_halt_to_restart_equity_loss_pct: 0.0,
+            hard_stop_restarts: 0,
+            hard_stop_restarts_per_year: 0.0,
+            hard_stop_restarts_per_year_long: 0.0,
+            hard_stop_restarts_per_year_short: 0.0,
+            hard_stop_restarts_long: 0,
+            hard_stop_restarts_short: 0,
+            hard_stop_time_in_yellow_pct: 0.0,
+            hard_stop_time_in_orange_pct: 0.0,
+            hard_stop_time_in_red_pct: 0.0,
+            hard_stop_duration_minutes_mean: 0.0,
+            hard_stop_duration_minutes_max: 0.0,
+            hard_stop_trigger_drawdown_mean: 0.0,
+            hard_stop_panic_close_loss_sum: 0.0,
+            hard_stop_panic_close_loss_max: 0.0,
+            hard_stop_flatten_time_minutes_mean: 0.0,
+            hard_stop_post_restart_retrigger_pct: 0.0,
         }
     }
 }

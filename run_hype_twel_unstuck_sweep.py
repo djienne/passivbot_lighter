@@ -52,6 +52,7 @@ METRIC_FIELDS = [
     "config",
     "twel",
     "unstuck",
+    "liquidated",
     "adg_w_usd",
     "adg_usd",
     "gain_usd",
@@ -140,8 +141,8 @@ def make_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "## Best By Config",
             "",
-            "| config | best sharpe TWEL | unstuck | sharpe_w | adg_w | gain | drawdown | LPR | max TWEL | fills |",
-            "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| config | best sharpe TWEL | unstuck | liquidated | sharpe_w | adg_w | gain | drawdown | LPR | max TWEL | fills |",
+            "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for config_name in sorted({row["config"] for row in rows}):
@@ -150,10 +151,11 @@ def make_markdown(rows: list[dict[str, Any]]) -> str:
         if not best:
             continue
         lines.append(
-            "| {config} | {twel:.1f} | {unstuck} | {sharpe} | {adg} | {gain} | {dd} | {lpr} | {max_twel} | {fills} |".format(
+            "| {config} | {twel:.1f} | {unstuck} | {liquidated} | {sharpe} | {adg} | {gain} | {dd} | {lpr} | {max_twel} | {fills} |".format(
                 config=best["config"],
                 twel=best["twel"],
                 unstuck=best["unstuck"],
+                liquidated=best.get("liquidated", ""),
                 sharpe=fmt(best.get("sharpe_ratio_w_usd"), 4),
                 adg=fmt(best.get("adg_w_usd"), 6),
                 gain=fmt(best.get("gain_usd"), 4),
@@ -168,16 +170,17 @@ def make_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "## Full Results",
             "",
-            "| config | TWEL | unstuck | sharpe_w | adg_w | gain | drawdown | LPR | max TWEL | mean TWEL | fills |",
-            "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| config | TWEL | unstuck | liquidated | sharpe_w | adg_w | gain | drawdown | LPR | max TWEL | mean TWEL | fills |",
+            "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in sorted(rows, key=lambda r: (r["config"], r["unstuck"], r["twel"])):
         lines.append(
-            "| {config} | {twel:.1f} | {unstuck} | {sharpe} | {adg} | {gain} | {dd} | {lpr} | {max_twel} | {mean_twel} | {fills} |".format(
+            "| {config} | {twel:.1f} | {unstuck} | {liquidated} | {sharpe} | {adg} | {gain} | {dd} | {lpr} | {max_twel} | {mean_twel} | {fills} |".format(
                 config=row["config"],
                 twel=row["twel"],
                 unstuck=row["unstuck"],
+                liquidated=row.get("liquidated", ""),
                 sharpe=fmt(row.get("sharpe_ratio_w_usd"), 4),
                 adg=fmt(row.get("adg_w_usd"), 6),
                 gain=fmt(row.get("gain_usd"), 4),

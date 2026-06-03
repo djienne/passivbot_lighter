@@ -3,8 +3,8 @@ Lighter DEX 1-minute OHLCV collector.
 
 Fetches all available 1m candle history from Lighter and stores as daily .npy files
 compatible with passivbot backtesting format:
-  data/ohlcvs_lighter/{COIN}/YYYY-MM-DD.npy
-  shape (1440, 6) = [timestamp_ms, open, high, low, close, volume]
+  caches/ohlcv/lighter/1m/{COIN}/YYYY-MM-DD.npy
+  dtype [('ts', int64), ('o', float32), ('h', float32), ('l', float32), ('c', float32), ('bv', float32)]
 """
 
 import asyncio
@@ -34,11 +34,13 @@ log = logging.getLogger("lighter-collector")
 # ---------------------------------------------------------------------------
 BASE_URL = os.environ.get("BASE_URL", "https://mainnet.zklighter.elliot.ai")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
+LIGHTER_DATA_DIR = Path(os.environ.get("LIGHTER_DATA_DIR", "caches/ohlcv/lighter/1m"))
 SYMBOLS = os.environ.get("SYMBOLS", "BTC,ETH,HYPE")  # comma-separated, empty = all
 EARLIEST_DATE = os.environ.get("EARLIEST_DATE", "2025-01-15")  # Lighter mainnet data starts ~Jan 17, 2025
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "3"))
 REQUEST_INTERVAL = float(os.environ.get("REQUEST_INTERVAL", "0.5"))  # seconds between requests
+RUN_ONCE = os.environ.get("RUN_ONCE", "").strip().lower() in ("1", "true", "yes", "y")
 
 MS_PER_MIN = 60_000
 MS_PER_HOUR = 3_600_000
@@ -49,6 +51,16 @@ CANDLES_PER_DAY = 1440
 MAX_RETRIES = 8
 BACKOFF_BASE = 2.0
 BACKOFF_CAP = 120.0
+CANDLE_DTYPE = np.dtype(
+    [
+        ("ts", "<i8"),
+        ("o", "<f4"),
+        ("h", "<f4"),
+        ("l", "<f4"),
+        ("c", "<f4"),
+        ("bv", "<f4"),
+    ]
+)
 
 shutdown_event = asyncio.Event()
 _save_locks: dict[str, threading.Lock] = {}
@@ -217,7 +229,7 @@ async def fetch_candles(
 # Storage
 # ---------------------------------------------------------------------------
 def coin_dir(coin: str) -> Path:
-    d = DATA_DIR / "ohlcvs_lighter" / coin
+    d = LIGHTER_DATA_DIR / coin
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -283,41 +295,56 @@ def build_daily_array(
 ) -> np.ndarray:
     """Build a complete 1440-row daily array, forward/backward filling gaps."""
     day_start_ms = date_str_to_start_ms(date_str)
-    arr = np.full((CANDLES_PER_DAY, 6), np.nan, dtype=np.float64)
+    values = np.full((CANDLES_PER_DAY, 6), np.nan, dtype=np.float64)
 
     # Timestamps
-    arr[:, 0] = np.arange(CANDLES_PER_DAY, dtype=np.float64) * MS_PER_MIN + day_start_ms
+    values[:, 0] = np.arange(CANDLES_PER_DAY, dtype=np.float64) * MS_PER_MIN + day_start_ms
 
     # Existing data
     if existing is not None and existing.shape == (CANDLES_PER_DAY, 6):
         mask = ~np.isnan(existing[:, 1])
-        arr[mask, 1:] = existing[mask, 1:]
+        values[mask, 1:] = existing[mask, 1:]
+    elif existing is not None and existing.shape == (CANDLES_PER_DAY,):
+        if existing.dtype.fields:
+            mask = np.isfinite(existing["c"])
+            values[mask, 1] = existing["o"][mask]
+            values[mask, 2] = existing["h"][mask]
+            values[mask, 3] = existing["l"][mask]
+            values[mask, 4] = existing["c"][mask]
+            values[mask, 5] = existing["bv"][mask]
 
     # Overlay new candles (dedup: new data wins over existing)
     for c in candles:
         idx = (int(c[0]) - day_start_ms) // MS_PER_MIN
         if 0 <= idx < CANDLES_PER_DAY:
-            arr[idx, 1:] = c[1:]
+            values[idx, 1:] = c[1:]
 
     # Forward-fill gaps
     last_close = np.nan
     for i in range(CANDLES_PER_DAY):
-        if np.isnan(arr[i, 1]):
+        if np.isnan(values[i, 1]):
             if not np.isnan(last_close):
-                arr[i, 1:5] = last_close
-                arr[i, 5] = 0.0
+                values[i, 1:5] = last_close
+                values[i, 5] = 0.0
         else:
-            last_close = arr[i, 4]
+            last_close = values[i, 4]
 
     # Backward-fill leading NaN
     for i in range(CANDLES_PER_DAY):
-        if not np.isnan(arr[i, 1]):
+        if not np.isnan(values[i, 1]):
             if i > 0:
-                price = arr[i, 1]
-                arr[:i, 1:5] = price
-                arr[:i, 5] = 0.0
+                price = values[i, 1]
+                values[:i, 1:5] = price
+                values[:i, 5] = 0.0
             break
 
+    arr = np.empty((CANDLES_PER_DAY,), dtype=CANDLE_DTYPE)
+    arr["ts"] = values[:, 0].astype(np.int64)
+    arr["o"] = values[:, 1].astype(np.float32)
+    arr["h"] = values[:, 2].astype(np.float32)
+    arr["l"] = values[:, 3].astype(np.float32)
+    arr["c"] = values[:, 4].astype(np.float32)
+    arr["bv"] = values[:, 5].astype(np.float32)
     return arr
 
 
@@ -336,7 +363,7 @@ def save_day(coin: str, date_str: str, candles: list[list]):
 
         arr = build_daily_array(candles, date_str, existing)
 
-        if np.isnan(arr[:, 1]).all():
+        if np.isnan(arr["c"]).all():
             return
 
         tmp = fpath.parent / f"{fpath.stem}.tmp.npy"
@@ -472,13 +499,14 @@ async def run():
     signal.signal(signal.SIGTERM, _handle_signal)
 
     log.info("Lighter OHLCV Collector starting")
-    log.info(f"  Data dir:       {DATA_DIR.resolve()}")
+    log.info(f"  Data dir:       {LIGHTER_DATA_DIR.resolve()}")
     log.info(f"  Base URL:       {BASE_URL}")
     log.info(f"  Symbols:        {SYMBOLS or 'all'}")
     log.info(f"  Earliest date:  {EARLIEST_DATE}")
     log.info(f"  Poll interval:  {POLL_INTERVAL}s")
     log.info(f"  Max concurrent: {MAX_CONCURRENT}")
     log.info(f"  Request interval: {REQUEST_INTERVAL}s")
+    log.info(f"  Run once:       {RUN_ONCE}")
 
     connector = aiohttp.TCPConnector(resolver=aiohttp.resolver.ThreadedResolver())
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -495,8 +523,9 @@ async def run():
         ]
         await asyncio.gather(*tasks)
 
-        if shutdown_event.is_set():
-            log.info("Collector stopped (shutdown during backfill)")
+        if shutdown_event.is_set() or RUN_ONCE:
+            reason = "shutdown during backfill" if shutdown_event.is_set() else "run once complete"
+            log.info(f"Collector stopped ({reason})")
             return
 
         # Phase 2: Continuous updates

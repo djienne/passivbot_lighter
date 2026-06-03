@@ -7,6 +7,7 @@ use crate::constants::{LONG, SHORT};
 use crate::entries::{
     calc_entries_long, calc_entries_short, calc_next_entry_long, calc_next_entry_short,
 };
+use crate::equity_hard_stop_loss as ehsl;
 use crate::risk::{
     calc_twel_enforcer_actions, calc_unstucking_action, gate_entries_by_twel, GateEntriesCandidate,
     GateEntriesDecision, GateEntriesPosition, TwelEnforcerInputPosition, UnstuckPositionInput,
@@ -16,8 +17,9 @@ use crate::trailing::{
 };
 use crate::types::OrderType;
 use crate::types::{
-    BacktestParams, BotParams, BotParamsPair, CoinMeta, EMABands, ExchangeParams, HlcvsBundle,
-    HlcvsMeta, OrderBook, Position, StateParams, TrailingPriceBundle,
+    BacktestParams, BotParams, BotParamsPair, CoinMeta, EMABands, EquityHardStopLossConfig,
+    EquityHardStopLossTierRatios, ExchangeParams, ForagerScoreWeights, HlcvsBundle, HlcvsMeta,
+    OrderBook, Position, StateParams, TrailingPriceBundle,
 };
 use ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
@@ -29,11 +31,26 @@ use serde::Serialize;
 use serde_json;
 use std::str::FromStr;
 
-type BacktestPyResult = (PyObject, PyObject, Py<PyDict>, Py<PyDict>);
+type BacktestPyResult = (PyObject, PyObject, Py<PyDict>, Py<PyDict>, PyObject);
 
 #[pyclass(name = "HlcvsBundle", module = "passivbot_rust", unsendable)]
 pub struct HlcvsBundlePy {
     pub inner: HlcvsBundle,
+}
+
+#[pyclass(
+    name = "EquityHardStopRollingPeak",
+    module = "passivbot_rust",
+    unsendable
+)]
+pub struct EquityHardStopRollingPeakPy {
+    inner: ehsl::RollingPeakTracker,
+}
+
+#[pyclass(name = "EquityHardStopRuntime", module = "passivbot_rust", unsendable)]
+pub struct EquityHardStopRuntimePy {
+    state: ehsl::HardStopState,
+    last_rolling_peak: f64,
 }
 
 #[pymethods]
@@ -87,6 +104,128 @@ impl HlcvsBundlePy {
 
     pub fn coins_len(&self) -> usize {
         self.inner.coins_len()
+    }
+}
+
+#[pymethods]
+impl EquityHardStopRollingPeakPy {
+    #[new]
+    pub fn new() -> Self {
+        Self {
+            inner: ehsl::RollingPeakTracker::default(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn update(&mut self, timestamp_ms: u64, equity: f64, lookback_ms: u64) -> PyResult<f64> {
+        self.inner
+            .update(timestamp_ms, equity, lookback_ms)
+            .map_err(PyValueError::new_err)
+    }
+}
+
+#[pymethods]
+impl EquityHardStopRuntimePy {
+    #[new]
+    pub fn new() -> Self {
+        Self {
+            state: ehsl::HardStopState::default(),
+            last_rolling_peak: 0.0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.state = ehsl::HardStopState::default();
+        self.last_rolling_peak = 0.0;
+    }
+
+    pub fn reset_state_keep_peak(&mut self) {
+        self.state = ehsl::HardStopState::default();
+    }
+
+    pub fn initialized(&self) -> bool {
+        self.state.initialized
+    }
+
+    pub fn red_latched(&self) -> bool {
+        self.state.red_latched
+    }
+
+    pub fn tier(&self) -> &'static str {
+        hard_stop_tier_to_str(self.state.tier)
+    }
+
+    pub fn drawdown_ema(&self) -> f64 {
+        self.state.drawdown_ema
+    }
+
+    pub fn peak_strategy_equity(&self) -> f64 {
+        self.state.peak_strategy_equity
+    }
+
+    pub fn rolling_peak_strategy_equity(&self) -> f64 {
+        self.last_rolling_peak
+    }
+
+    #[pyo3(signature = (
+        *,
+        timestamp_ms,
+        equity,
+        peak_strategy_equity,
+        red_threshold,
+        ema_span_minutes,
+        tier_ratio_yellow,
+        tier_ratio_orange
+    ))]
+    pub fn apply_sample(
+        &mut self,
+        py: Python<'_>,
+        timestamp_ms: u64,
+        equity: f64,
+        peak_strategy_equity: f64,
+        red_threshold: f64,
+        ema_span_minutes: f64,
+        tier_ratio_yellow: f64,
+        tier_ratio_orange: f64,
+    ) -> PyResult<Py<PyDict>> {
+        self.last_rolling_peak = peak_strategy_equity;
+        let cfg = ehsl::HardStopConfig {
+            red_threshold,
+            ema_span_minutes,
+            tier_ratios: ehsl::HardStopTierRatios {
+                yellow: tier_ratio_yellow,
+                orange: tier_ratio_orange,
+            },
+        };
+        let step = ehsl::step_with_peak_strategy_equity(
+            &mut self.state,
+            cfg,
+            equity,
+            peak_strategy_equity,
+            timestamp_ms,
+        )
+        .map_err(PyValueError::new_err)?;
+
+        let out = PyDict::new_bound(py);
+        out.set_item("initialized", self.state.initialized)?;
+        out.set_item("red_latched", self.state.red_latched)?;
+        out.set_item("peak_strategy_equity", self.state.peak_strategy_equity)?;
+        out.set_item("rolling_peak_strategy_equity", self.last_rolling_peak)?;
+        out.set_item("drawdown_ema", self.state.drawdown_ema)?;
+        out.set_item("tier", hard_stop_tier_to_str(self.state.tier))?;
+        out.set_item("drawdown_raw", step.drawdown_raw)?;
+        out.set_item("drawdown_score", step.drawdown_score)?;
+        out.set_item("changed", step.changed)?;
+        out.set_item("alpha", step.alpha)?;
+        out.set_item("elapsed_minutes", step.elapsed_minutes)?;
+        Ok(out.unbind())
     }
 }
 
@@ -276,6 +415,96 @@ pub fn update_trailing_bundle_py(
     update_trailing_bundle_sequence(&mut bundle, highs, lows, closes);
 
     Ok(trailing_bundle_to_tuple(&bundle))
+}
+
+fn hard_stop_tier_from_str(raw: &str) -> Result<ehsl::HardStopTier, String> {
+    match raw {
+        "green" => Ok(ehsl::HardStopTier::Green),
+        "yellow" => Ok(ehsl::HardStopTier::Yellow),
+        "orange" => Ok(ehsl::HardStopTier::Orange),
+        "red" => Ok(ehsl::HardStopTier::Red),
+        _ => Err(format!(
+            "invalid hard-stop tier '{}'; expected one of {{green,yellow,orange,red}}",
+            raw
+        )),
+    }
+}
+
+fn hard_stop_tier_to_str(tier: ehsl::HardStopTier) -> &'static str {
+    match tier {
+        ehsl::HardStopTier::Green => "green",
+        ehsl::HardStopTier::Yellow => "yellow",
+        ehsl::HardStopTier::Orange => "orange",
+        ehsl::HardStopTier::Red => "red",
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    *,
+    initialized,
+    red_latched,
+    drawdown_ema,
+    tier,
+    red_threshold,
+    ema_span_minutes,
+    tier_ratio_yellow,
+    tier_ratio_orange,
+    equity,
+    peak_strategy_equity,
+    timestamp_ms
+))]
+pub fn equity_hard_stop_step_py(
+    py: Python<'_>,
+    initialized: bool,
+    red_latched: bool,
+    drawdown_ema: f64,
+    tier: &str,
+    red_threshold: f64,
+    ema_span_minutes: f64,
+    tier_ratio_yellow: f64,
+    tier_ratio_orange: f64,
+    equity: f64,
+    peak_strategy_equity: f64,
+    timestamp_ms: u64,
+) -> PyResult<Py<PyDict>> {
+    let mut state = ehsl::HardStopState {
+        peak_strategy_equity,
+        drawdown_ema,
+        tier: hard_stop_tier_from_str(tier).map_err(PyValueError::new_err)?,
+        red_latched,
+        initialized,
+        ..Default::default()
+    };
+    let cfg = ehsl::HardStopConfig {
+        red_threshold,
+        ema_span_minutes,
+        tier_ratios: ehsl::HardStopTierRatios {
+            yellow: tier_ratio_yellow,
+            orange: tier_ratio_orange,
+        },
+    };
+    let step = ehsl::step_with_peak_strategy_equity(
+        &mut state,
+        cfg,
+        equity,
+        peak_strategy_equity,
+        timestamp_ms,
+    )
+    .map_err(PyValueError::new_err)?;
+
+    let out = PyDict::new_bound(py);
+    out.set_item("initialized", state.initialized)?;
+    out.set_item("red_latched", state.red_latched)?;
+    out.set_item("peak_strategy_equity", state.peak_strategy_equity)?;
+    out.set_item("drawdown_ema", state.drawdown_ema)?;
+    out.set_item("tier", hard_stop_tier_to_str(state.tier))?;
+    out.set_item("drawdown_raw", step.drawdown_raw)?;
+    out.set_item("drawdown_score", step.drawdown_score)?;
+    out.set_item("changed", step.changed)?;
+    out.set_item("alpha", step.alpha)?;
+    out.set_item("elapsed_minutes", step.elapsed_minutes)?;
+    Ok(out.unbind())
 }
 
 #[pyfunction]
@@ -705,18 +934,172 @@ fn run_backtest_core<'py>(
 
     // Run the backtest and process results
     Python::with_gil(|py| {
-        let (fills, equities) = backtest.run();
+        let (fills, equities) = backtest.run().map_err(PyValueError::new_err)?;
         let (entry_pct_long, entry_pct_short) = backtest.initial_entry_balance_pct();
         let (mut analysis_usd, mut analysis_btc) = analyze_backtest_pair(
             &fills,
             &equities,
             backtest.balance.use_btc_collateral,
             &backtest.total_wallet_exposures,
+            backtest.liquidated(),
         );
         analysis_usd.entry_initial_balance_pct_long = entry_pct_long;
         analysis_usd.entry_initial_balance_pct_short = entry_pct_short;
         analysis_btc.entry_initial_balance_pct_long = entry_pct_long;
         analysis_btc.entry_initial_balance_pct_short = entry_pct_short;
+
+        let hs = backtest.hard_stop_metrics();
+        let strategy = backtest.strategy_equity_metrics_for_analysis();
+        analysis_usd.hard_stop_triggers = hs.triggers;
+        analysis_usd.hard_stop_triggers_per_year = hs.triggers_per_year;
+        analysis_usd.hard_stop_triggers_long = hs.triggers_long;
+        analysis_usd.hard_stop_triggers_short = hs.triggers_short;
+        analysis_usd.hard_stop_halt_to_restart_equity_loss_pct = hs.halt_to_restart_equity_loss_pct;
+        analysis_usd.hard_stop_restarts = hs.restarts;
+        analysis_usd.hard_stop_restarts_per_year = hs.restarts_per_year;
+        analysis_usd.hard_stop_restarts_per_year_long = hs.restarts_per_year_long;
+        analysis_usd.hard_stop_restarts_per_year_short = hs.restarts_per_year_short;
+        analysis_usd.hard_stop_restarts_long = hs.restarts_long;
+        analysis_usd.hard_stop_restarts_short = hs.restarts_short;
+        analysis_usd.hard_stop_time_in_yellow_pct = hs.time_in_yellow_pct;
+        analysis_usd.hard_stop_time_in_orange_pct = hs.time_in_orange_pct;
+        analysis_usd.hard_stop_time_in_red_pct = hs.time_in_red_pct;
+        analysis_usd.hard_stop_duration_minutes_mean = hs.duration_minutes_mean;
+        analysis_usd.hard_stop_duration_minutes_max = hs.duration_minutes_max;
+        analysis_usd.hard_stop_trigger_drawdown_mean = hs.trigger_drawdown_mean;
+        analysis_usd.hard_stop_panic_close_loss_sum = hs.panic_close_loss_sum;
+        analysis_usd.hard_stop_panic_close_loss_max = hs.panic_close_loss_max;
+        analysis_usd.hard_stop_flatten_time_minutes_mean = hs.flatten_time_minutes_mean;
+        analysis_usd.hard_stop_post_restart_retrigger_pct = hs.post_restart_retrigger_pct;
+        analysis_usd.drawdown_worst_strategy_eq = strategy.overall.drawdown_worst_strategy_eq;
+        analysis_usd.drawdown_worst_strategy_eq_long = strategy.long.drawdown_worst_strategy_eq;
+        analysis_usd.drawdown_worst_strategy_eq_short = strategy.short.drawdown_worst_strategy_eq;
+        analysis_usd.drawdown_worst_ema_strategy_eq = strategy
+            .long
+            .drawdown_worst_ema_strategy_eq
+            .max(strategy.short.drawdown_worst_ema_strategy_eq);
+        analysis_usd.drawdown_worst_ema_strategy_eq_long =
+            strategy.long.drawdown_worst_ema_strategy_eq;
+        analysis_usd.drawdown_worst_ema_strategy_eq_short =
+            strategy.short.drawdown_worst_ema_strategy_eq;
+        analysis_usd.drawdown_worst_mean_1pct_strategy_eq =
+            strategy.overall.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_usd.drawdown_worst_mean_1pct_strategy_eq_long =
+            strategy.long.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_usd.drawdown_worst_mean_1pct_strategy_eq_short =
+            strategy.short.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_usd.drawdown_worst_mean_1pct_ema_strategy_eq = strategy
+            .long
+            .drawdown_worst_mean_1pct_ema_strategy_eq
+            .max(strategy.short.drawdown_worst_mean_1pct_ema_strategy_eq);
+        analysis_usd.drawdown_worst_mean_1pct_ema_strategy_eq_long =
+            strategy.long.drawdown_worst_mean_1pct_ema_strategy_eq;
+        analysis_usd.drawdown_worst_mean_1pct_ema_strategy_eq_short =
+            strategy.short.drawdown_worst_mean_1pct_ema_strategy_eq;
+        analysis_usd.peak_recovery_hours_strategy_eq =
+            strategy.overall.peak_recovery_hours_strategy_eq;
+        analysis_usd.peak_recovery_hours_strategy_eq_long =
+            strategy.long.peak_recovery_hours_strategy_eq;
+        analysis_usd.peak_recovery_hours_strategy_eq_short =
+            strategy.short.peak_recovery_hours_strategy_eq;
+        analysis_usd.peak_recovery_days_strategy_eq =
+            strategy.overall.peak_recovery_days_strategy_eq;
+        analysis_usd.peak_recovery_days_strategy_eq_long =
+            strategy.long.peak_recovery_days_strategy_eq;
+        analysis_usd.peak_recovery_days_strategy_eq_short =
+            strategy.short.peak_recovery_days_strategy_eq;
+        analysis_usd.gain_strategy_eq = strategy.overall.gain_strategy_eq;
+        analysis_usd.adg_strategy_eq = strategy.overall.adg_strategy_eq;
+        analysis_usd.mdg_strategy_eq = strategy.overall.mdg_strategy_eq;
+        analysis_usd.sharpe_ratio_strategy_eq = strategy.overall.sharpe_ratio_strategy_eq;
+        analysis_usd.sortino_ratio_strategy_eq = strategy.overall.sortino_ratio_strategy_eq;
+        analysis_usd.omega_ratio_strategy_eq = strategy.overall.omega_ratio_strategy_eq;
+        analysis_usd.expected_shortfall_1pct_strategy_eq =
+            strategy.overall.expected_shortfall_1pct_strategy_eq;
+        analysis_usd.calmar_ratio_strategy_eq = strategy.overall.calmar_ratio_strategy_eq;
+        analysis_usd.sterling_ratio_strategy_eq = strategy.overall.sterling_ratio_strategy_eq;
+        analysis_usd.adg_strategy_eq_w = strategy.overall.adg_strategy_eq_w;
+        analysis_usd.mdg_strategy_eq_w = strategy.overall.mdg_strategy_eq_w;
+        analysis_usd.sharpe_ratio_strategy_eq_w = strategy.overall.sharpe_ratio_strategy_eq_w;
+        analysis_usd.sortino_ratio_strategy_eq_w = strategy.overall.sortino_ratio_strategy_eq_w;
+        analysis_usd.omega_ratio_strategy_eq_w = strategy.overall.omega_ratio_strategy_eq_w;
+        analysis_usd.calmar_ratio_strategy_eq_w = strategy.overall.calmar_ratio_strategy_eq_w;
+        analysis_usd.sterling_ratio_strategy_eq_w = strategy.overall.sterling_ratio_strategy_eq_w;
+        analysis_btc.hard_stop_triggers = hs.triggers;
+        analysis_btc.hard_stop_triggers_per_year = hs.triggers_per_year;
+        analysis_btc.hard_stop_triggers_long = hs.triggers_long;
+        analysis_btc.hard_stop_triggers_short = hs.triggers_short;
+        analysis_btc.hard_stop_halt_to_restart_equity_loss_pct = hs.halt_to_restart_equity_loss_pct;
+        analysis_btc.hard_stop_restarts = hs.restarts;
+        analysis_btc.hard_stop_restarts_per_year = hs.restarts_per_year;
+        analysis_btc.hard_stop_restarts_per_year_long = hs.restarts_per_year_long;
+        analysis_btc.hard_stop_restarts_per_year_short = hs.restarts_per_year_short;
+        analysis_btc.hard_stop_restarts_long = hs.restarts_long;
+        analysis_btc.hard_stop_restarts_short = hs.restarts_short;
+        analysis_btc.hard_stop_time_in_yellow_pct = hs.time_in_yellow_pct;
+        analysis_btc.hard_stop_time_in_orange_pct = hs.time_in_orange_pct;
+        analysis_btc.hard_stop_time_in_red_pct = hs.time_in_red_pct;
+        analysis_btc.hard_stop_duration_minutes_mean = hs.duration_minutes_mean;
+        analysis_btc.hard_stop_duration_minutes_max = hs.duration_minutes_max;
+        analysis_btc.hard_stop_trigger_drawdown_mean = hs.trigger_drawdown_mean;
+        analysis_btc.hard_stop_panic_close_loss_sum = hs.panic_close_loss_sum;
+        analysis_btc.hard_stop_panic_close_loss_max = hs.panic_close_loss_max;
+        analysis_btc.hard_stop_flatten_time_minutes_mean = hs.flatten_time_minutes_mean;
+        analysis_btc.hard_stop_post_restart_retrigger_pct = hs.post_restart_retrigger_pct;
+        analysis_btc.drawdown_worst_strategy_eq = strategy.overall.drawdown_worst_strategy_eq;
+        analysis_btc.drawdown_worst_strategy_eq_long = strategy.long.drawdown_worst_strategy_eq;
+        analysis_btc.drawdown_worst_strategy_eq_short = strategy.short.drawdown_worst_strategy_eq;
+        analysis_btc.drawdown_worst_ema_strategy_eq = strategy
+            .long
+            .drawdown_worst_ema_strategy_eq
+            .max(strategy.short.drawdown_worst_ema_strategy_eq);
+        analysis_btc.drawdown_worst_ema_strategy_eq_long =
+            strategy.long.drawdown_worst_ema_strategy_eq;
+        analysis_btc.drawdown_worst_ema_strategy_eq_short =
+            strategy.short.drawdown_worst_ema_strategy_eq;
+        analysis_btc.drawdown_worst_mean_1pct_strategy_eq =
+            strategy.overall.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_btc.drawdown_worst_mean_1pct_strategy_eq_long =
+            strategy.long.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_btc.drawdown_worst_mean_1pct_strategy_eq_short =
+            strategy.short.drawdown_worst_mean_1pct_strategy_eq;
+        analysis_btc.drawdown_worst_mean_1pct_ema_strategy_eq = strategy
+            .long
+            .drawdown_worst_mean_1pct_ema_strategy_eq
+            .max(strategy.short.drawdown_worst_mean_1pct_ema_strategy_eq);
+        analysis_btc.drawdown_worst_mean_1pct_ema_strategy_eq_long =
+            strategy.long.drawdown_worst_mean_1pct_ema_strategy_eq;
+        analysis_btc.drawdown_worst_mean_1pct_ema_strategy_eq_short =
+            strategy.short.drawdown_worst_mean_1pct_ema_strategy_eq;
+        analysis_btc.peak_recovery_hours_strategy_eq =
+            strategy.overall.peak_recovery_hours_strategy_eq;
+        analysis_btc.peak_recovery_hours_strategy_eq_long =
+            strategy.long.peak_recovery_hours_strategy_eq;
+        analysis_btc.peak_recovery_hours_strategy_eq_short =
+            strategy.short.peak_recovery_hours_strategy_eq;
+        analysis_btc.peak_recovery_days_strategy_eq =
+            strategy.overall.peak_recovery_days_strategy_eq;
+        analysis_btc.peak_recovery_days_strategy_eq_long =
+            strategy.long.peak_recovery_days_strategy_eq;
+        analysis_btc.peak_recovery_days_strategy_eq_short =
+            strategy.short.peak_recovery_days_strategy_eq;
+        analysis_btc.gain_strategy_eq = strategy.overall.gain_strategy_eq;
+        analysis_btc.adg_strategy_eq = strategy.overall.adg_strategy_eq;
+        analysis_btc.mdg_strategy_eq = strategy.overall.mdg_strategy_eq;
+        analysis_btc.sharpe_ratio_strategy_eq = strategy.overall.sharpe_ratio_strategy_eq;
+        analysis_btc.sortino_ratio_strategy_eq = strategy.overall.sortino_ratio_strategy_eq;
+        analysis_btc.omega_ratio_strategy_eq = strategy.overall.omega_ratio_strategy_eq;
+        analysis_btc.expected_shortfall_1pct_strategy_eq =
+            strategy.overall.expected_shortfall_1pct_strategy_eq;
+        analysis_btc.calmar_ratio_strategy_eq = strategy.overall.calmar_ratio_strategy_eq;
+        analysis_btc.sterling_ratio_strategy_eq = strategy.overall.sterling_ratio_strategy_eq;
+        analysis_btc.adg_strategy_eq_w = strategy.overall.adg_strategy_eq_w;
+        analysis_btc.mdg_strategy_eq_w = strategy.overall.mdg_strategy_eq_w;
+        analysis_btc.sharpe_ratio_strategy_eq_w = strategy.overall.sharpe_ratio_strategy_eq_w;
+        analysis_btc.sortino_ratio_strategy_eq_w = strategy.overall.sortino_ratio_strategy_eq_w;
+        analysis_btc.omega_ratio_strategy_eq_w = strategy.overall.omega_ratio_strategy_eq_w;
+        analysis_btc.calmar_ratio_strategy_eq_w = strategy.overall.calmar_ratio_strategy_eq_w;
+        analysis_btc.sterling_ratio_strategy_eq_w = strategy.overall.sterling_ratio_strategy_eq_w;
 
         // Create a dictionary to store analysis results using a more concise approach
         let py_analysis_usd = struct_to_py_dict(py, &analysis_usd)?;
@@ -727,9 +1110,55 @@ fn run_backtest_core<'py>(
                 py.None().into_py(py),
                 py_analysis_usd,
                 py_analysis_btc,
+                py.None().into_py(py),
             ));
         }
-        let mut py_fills = Array2::from_elem((fills.len(), 18), py.None());
+        let hard_stop_plot_data = backtest.hard_stop_plot_data();
+        let py_events_long = PyList::empty_bound(py);
+        for event in hard_stop_plot_data.events_long {
+            let py_event = PyDict::new_bound(py);
+            py_event.set_item("kind", event.kind)?;
+            py_event.set_item("timestamp_ms", event.timestamp_ms)?;
+            if let Some(cooldown_until_ms) = event.cooldown_until_ms {
+                py_event.set_item("cooldown_until_ms", cooldown_until_ms)?;
+            }
+            py_event.set_item("terminal", event.terminal)?;
+            py_events_long.append(py_event)?;
+        }
+        let py_events_short = PyList::empty_bound(py);
+        for event in hard_stop_plot_data.events_short {
+            let py_event = PyDict::new_bound(py);
+            py_event.set_item("kind", event.kind)?;
+            py_event.set_item("timestamp_ms", event.timestamp_ms)?;
+            if let Some(cooldown_until_ms) = event.cooldown_until_ms {
+                py_event.set_item("cooldown_until_ms", cooldown_until_ms)?;
+            }
+            py_event.set_item("terminal", event.terminal)?;
+            py_events_short.append(py_event)?;
+        }
+        let py_hard_stop_plot = PyDict::new_bound(py);
+        py_hard_stop_plot.set_item("timestamps_ms", hard_stop_plot_data.timestamps_ms)?;
+        py_hard_stop_plot.set_item("drawdown_raw", hard_stop_plot_data.drawdown_raw)?;
+        py_hard_stop_plot.set_item("timestamps_ms_long", hard_stop_plot_data.timestamps_ms_long)?;
+        py_hard_stop_plot.set_item("drawdown_raw_long", hard_stop_plot_data.drawdown_raw_long)?;
+        py_hard_stop_plot.set_item("drawdown_ema_long", hard_stop_plot_data.drawdown_ema_long)?;
+        py_hard_stop_plot.set_item(
+            "drawdown_score_long",
+            hard_stop_plot_data.drawdown_score_long,
+        )?;
+        py_hard_stop_plot.set_item("events_long", py_events_long)?;
+        py_hard_stop_plot.set_item(
+            "timestamps_ms_short",
+            hard_stop_plot_data.timestamps_ms_short,
+        )?;
+        py_hard_stop_plot.set_item("drawdown_raw_short", hard_stop_plot_data.drawdown_raw_short)?;
+        py_hard_stop_plot.set_item("drawdown_ema_short", hard_stop_plot_data.drawdown_ema_short)?;
+        py_hard_stop_plot.set_item(
+            "drawdown_score_short",
+            hard_stop_plot_data.drawdown_score_short,
+        )?;
+        py_hard_stop_plot.set_item("events_short", py_events_short)?;
+        let mut py_fills = Array2::from_elem((fills.len(), 19), py.None());
         for (i, fill) in fills.iter().enumerate() {
             py_fills[(i, 0)] = fill.index.into_py(py);
             py_fills[(i, 1)] = (fill.timestamp_ms as i64).into_py(py);
@@ -745,17 +1174,23 @@ fn run_backtest_core<'py>(
             py_fills[(i, 11)] = fill.position_size.into_py(py);
             py_fills[(i, 12)] = fill.position_price.into_py(py);
             py_fills[(i, 13)] = fill.order_type.to_string().into_py(py);
-            py_fills[(i, 14)] = fill.wallet_exposure.into_py(py);
-            py_fills[(i, 15)] = fill.twe_long.into_py(py);
-            py_fills[(i, 16)] = fill.twe_short.into_py(py);
-            py_fills[(i, 17)] = fill.twe_net.into_py(py);
+            py_fills[(i, 14)] = fill.liquidity.clone().into_py(py);
+            py_fills[(i, 15)] = fill.wallet_exposure.into_py(py);
+            py_fills[(i, 16)] = fill.twe_long.into_py(py);
+            py_fills[(i, 17)] = fill.twe_short.into_py(py);
+            py_fills[(i, 18)] = fill.twe_net.into_py(py);
         }
 
+        let strategy_equity_series = backtest.strategy_equity_series_for_artifacts();
         let equities_array =
-            Array2::from_shape_fn((equities.timestamps_ms.len(), 3), |(i, j)| match j {
+            Array2::from_shape_fn((equities.timestamps_ms.len(), 4), |(i, j)| match j {
                 0 => equities.timestamps_ms[i] as f64,
                 1 => equities.usd_total_equity[i],
                 2 => equities.btc_total_equity[i],
+                3 => strategy_equity_series
+                    .get(i)
+                    .copied()
+                    .unwrap_or(equities.usd_total_equity[i]),
                 _ => 0.0,
             })
             .into_pyarray_bound(py)
@@ -766,6 +1201,7 @@ fn run_backtest_core<'py>(
             equities_array.into_py(py),
             py_analysis_usd,
             py_analysis_btc,
+            py_hard_stop_plot.into_py(py),
         ))
     })
 }
@@ -789,40 +1225,64 @@ fn struct_to_py_dict<T: Serialize + ?Sized>(py: Python<'_>, obj: &T) -> PyResult
 }
 
 fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
+    let parse_hsl_cfg = |parent: &PyDict, key: &str| -> PyResult<EquityHardStopLossConfig> {
+        let item = parent
+            .get_item(key)?
+            .ok_or_else(|| PyValueError::new_err(format!("missing required key: {key}")))?;
+        let cfg = item
+            .downcast::<PyDict>()
+            .map_err(|_| PyValueError::new_err(format!("{key} must be a dict")))?;
+        let ratios_item = cfg.get_item("tier_ratios")?.ok_or_else(|| {
+            PyValueError::new_err(format!("missing required key: {key}.tier_ratios"))
+        })?;
+        let ratios = ratios_item
+            .downcast::<PyDict>()
+            .map_err(|_| PyValueError::new_err(format!("{key}.tier_ratios must be a dict")))?;
+        let signal_mode = cfg
+            .get_item("signal_mode")?
+            .map(|item| item.extract::<String>())
+            .transpose()?
+            .unwrap_or_else(|| "unified".to_string());
+        if signal_mode != "pside" && signal_mode != "unified" {
+            return Err(PyValueError::new_err(format!(
+                "{key}.signal_mode must be one of {{pside, unified}}, got {:?}",
+                signal_mode
+            )));
+        }
+        Ok(EquityHardStopLossConfig {
+            enabled: extract_value(cfg, "enabled")?,
+            signal_mode,
+            red_threshold: extract_value(cfg, "red_threshold")?,
+            ema_span_minutes: extract_value(cfg, "ema_span_minutes")?,
+            cooldown_minutes_after_red: extract_value(cfg, "cooldown_minutes_after_red")?,
+            no_restart_drawdown_threshold: extract_value(cfg, "no_restart_drawdown_threshold")?,
+            tier_ratios: EquityHardStopLossTierRatios {
+                yellow: extract_value(ratios, "yellow")?,
+                orange: extract_value(ratios, "orange")?,
+            },
+            orange_tier_mode: extract_value(cfg, "orange_tier_mode")?,
+            panic_close_order_type: extract_value(cfg, "panic_close_order_type")?,
+        })
+    };
+    let hard_stop_cfg = parse_hsl_cfg(dict, "equity_hard_stop_loss")?;
+
     Ok(BacktestParams {
-        starting_balance: extract_value(dict, "starting_balance").unwrap_or_default(),
-        maker_fee: extract_value(dict, "maker_fee").unwrap_or_default(),
-        coins: extract_value(dict, "coins").unwrap_or_default(),
-        active_coin_indices: dict
-            .get_item("active_coin_indices")?
-            .map(|item| item.extract::<Vec<usize>>())
-            .transpose()?,
-        // First timestamp (ms); default to 0 if not provided
-        first_timestamp_ms: extract_value(dict, "first_timestamp_ms").unwrap_or(0u64),
-        requested_start_timestamp_ms: extract_value(dict, "requested_start_timestamp_ms")
-            .unwrap_or(0u64),
-        first_valid_indices: dict
-            .get_item("first_valid_indices")?
-            .map(|item| item.extract::<Vec<usize>>())
-            .transpose()?
-            .unwrap_or_default(),
-        last_valid_indices: dict
-            .get_item("last_valid_indices")?
-            .map(|item| item.extract::<Vec<usize>>())
-            .transpose()?
-            .unwrap_or_default(),
-        warmup_minutes: dict
-            .get_item("warmup_minutes")?
-            .map(|item| item.extract::<Vec<usize>>())
-            .transpose()?
-            .unwrap_or_default(),
-        trade_start_indices: dict
-            .get_item("trade_start_indices")?
-            .map(|item| item.extract::<Vec<usize>>())
-            .transpose()?
-            .unwrap_or_default(),
-        global_warmup_bars: extract_value(dict, "global_warmup_bars").unwrap_or(0usize),
-        btc_collateral_cap: extract_value(dict, "btc_collateral_cap").unwrap_or(0.0f64),
+        starting_balance: extract_value(dict, "starting_balance")?,
+        maker_fee: extract_value(dict, "maker_fee")?,
+        taker_fee: extract_value(dict, "taker_fee")?,
+        coins: extract_value(dict, "coins")?,
+        active_coin_indices: match dict.get_item("active_coin_indices")? {
+            Some(item) if !item.is_none() => Some(item.extract::<Vec<usize>>()?),
+            _ => None,
+        },
+        first_timestamp_ms: extract_value(dict, "first_timestamp_ms")?,
+        requested_start_timestamp_ms: extract_value(dict, "requested_start_timestamp_ms")?,
+        first_valid_indices: extract_value(dict, "first_valid_indices")?,
+        last_valid_indices: extract_value(dict, "last_valid_indices")?,
+        warmup_minutes: extract_value(dict, "warmup_minutes")?,
+        trade_start_indices: extract_value(dict, "trade_start_indices")?,
+        global_warmup_bars: extract_value(dict, "global_warmup_bars")?,
+        btc_collateral_cap: extract_value(dict, "btc_collateral_cap")?,
         btc_collateral_ltv_cap: match dict.get_item("btc_collateral_ltv_cap")? {
             Some(item) if !item.is_none() => Some(item.extract::<f64>()?),
             _ => None,
@@ -837,11 +1297,49 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<bool>())
             .transpose()?
             .unwrap_or(false),
+        dynamic_wel_by_tradability: extract_value(dict, "dynamic_wel_by_tradability")?,
         hedge_mode: dict
             .get_item("hedge_mode")?
             .map(|item| item.extract::<bool>())
             .transpose()?
             .unwrap_or(true),
+        max_realized_loss_pct: dict
+            .get_item("max_realized_loss_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(1.0),
+        pnls_max_lookback_days: extract_value(dict, "pnls_max_lookback_days")?,
+        liquidation_threshold: dict
+            .get_item("liquidation_threshold")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.05),
+        equity_hard_stop_loss: hard_stop_cfg,
+        market_orders_allowed: dict
+            .get_item("market_orders_allowed")?
+            .map(|item| item.extract::<bool>())
+            .transpose()?
+            .unwrap_or(false),
+        market_order_near_touch_threshold: dict
+            .get_item("market_order_near_touch_threshold")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.001),
+        market_order_slippage_pct: dict
+            .get_item("market_order_slippage_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.0005),
+        forager_score_hysteresis_pct: dict
+            .get_item("forager_score_hysteresis_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.02),
+        candle_interval_minutes: dict
+            .get_item("candle_interval_minutes")?
+            .map(|item| item.extract::<u64>())
+            .transpose()?
+            .unwrap_or(1), // default to 1m candles
     })
 }
 
@@ -852,6 +1350,8 @@ fn exchange_params_from_dict(dict: &PyDict) -> PyResult<ExchangeParams> {
         min_qty: extract_value(dict, "min_qty").unwrap_or_default(),
         min_cost: extract_value(dict, "min_cost").unwrap_or_default(),
         c_mult: extract_value(dict, "c_mult").unwrap_or_default(),
+        maker_fee: extract_value(dict, "maker_fee").unwrap_or(0.0002),
+        taker_fee: extract_value(dict, "taker_fee").unwrap_or(0.00055),
     })
 }
 
@@ -871,28 +1371,32 @@ fn extract_grid_spacing_we_weight(dict: &PyDict) -> PyResult<f64> {
 }
 
 fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
-    let risk_wel_enforcer_threshold = match dict.get_item("risk_wel_enforcer_threshold")? {
-        Some(item) => item.extract::<f64>()?,
-        None => 1.0,
-    };
-    let risk_twel_enforcer_threshold = match dict.get_item("risk_twel_enforcer_threshold")? {
-        Some(item) => item.extract::<f64>()?,
-        None => 1.0,
-    };
+    let risk_wel_enforcer_threshold: f64 = extract_value(dict, "risk_wel_enforcer_threshold")?;
+    let risk_twel_enforcer_threshold: f64 = extract_value(dict, "risk_twel_enforcer_threshold")?;
     let risk_we_excess_allowance_pct: f64 = extract_value(dict, "risk_we_excess_allowance_pct")?;
     let total_wallet_exposure_limit: f64 = extract_value(dict, "total_wallet_exposure_limit")?;
     let wallet_exposure_limit_raw: f64 = extract_value(dict, "wallet_exposure_limit")?;
     let n_positions_float: f64 = extract_value(dict, "n_positions")?;
     let n_positions = n_positions_float.round() as usize;
-    let wallet_exposure_limit = if wallet_exposure_limit_raw < 0.0 {
-        wallet_exposure_limit_raw
-    } else if wallet_exposure_limit_raw > 0.0 {
-        wallet_exposure_limit_raw
-    } else if n_positions > 0 {
-        total_wallet_exposure_limit / n_positions as f64
-    } else {
-        0.0
-    };
+    let hsl_enabled: bool = extract_value(dict, "hsl_enabled")?;
+    let hsl_red_threshold: f64 = extract_value(dict, "hsl_red_threshold")?;
+    let hsl_ema_span_minutes: f64 = extract_value(dict, "hsl_ema_span_minutes")?;
+    let hsl_cooldown_minutes_after_red: f64 =
+        extract_value(dict, "hsl_cooldown_minutes_after_red")?;
+    let hsl_no_restart_drawdown_threshold: f64 =
+        extract_value(dict, "hsl_no_restart_drawdown_threshold")?;
+    let hsl_tier_ratios = dict
+        .get_item("hsl_tier_ratios")?
+        .ok_or_else(|| PyValueError::new_err("position missing 'hsl_tier_ratios'"))?
+        .downcast::<PyDict>()
+        .map_err(|_| PyValueError::new_err("hsl_tier_ratios must be a dict"))?;
+    let hsl_tier_ratio_yellow: f64 = extract_value(hsl_tier_ratios, "yellow")?;
+    let hsl_tier_ratio_orange: f64 = extract_value(hsl_tier_ratios, "orange")?;
+    let hsl_orange_tier_mode: String = extract_value(dict, "hsl_orange_tier_mode")?;
+    let hsl_panic_close_order_type: String = extract_value(dict, "hsl_panic_close_order_type")?;
+    // Callers resolve live fixed denominators before building orchestrator input.
+    // Preserve zero here: per-symbol zero is the explicit side-disable sentinel.
+    let wallet_exposure_limit = wallet_exposure_limit_raw;
 
     Ok(BotParams {
         close_grid_markup_end: extract_value(dict, "close_grid_markup_end")?,
@@ -941,14 +1445,45 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         )?,
         filter_volatility_ema_span: extract_value_with_fallback(
             dict,
+            "forager_volatility_ema_span",
             "filter_volatility_ema_span",
-            "filter_log_range_ema_span",
+        )
+        .or_else(|_| {
+            extract_value_with_fallback(
+                dict,
+                "filter_volatility_ema_span",
+                "filter_log_range_ema_span",
+            )
+        })?,
+        filter_volume_ema_span: extract_value_with_fallback(
+            dict,
+            "forager_volume_ema_span",
+            "filter_volume_ema_span",
         )?,
-        filter_volume_ema_span: extract_value(dict, "filter_volume_ema_span")?,
-        filter_volume_drop_pct: extract_value(dict, "filter_volume_drop_pct")?,
-        filter_volatility_drop_pct: extract_value(dict, "filter_volatility_drop_pct")?,
+        _legacy_filter_volatility_drop_pct: 0.0,
+        forager_volume_drop_pct: extract_value_with_fallback(
+            dict,
+            "forager_volume_drop_pct",
+            "filter_volume_drop_pct",
+        )?,
+        forager_score_weights: dict
+            .get_item("forager_score_weights")
+            .ok()
+            .flatten()
+            .map(|_| extract_forager_score_weights(dict))
+            .transpose()?
+            .unwrap_or_default(),
         ema_span_0: extract_value(dict, "ema_span_0")?,
         ema_span_1: extract_value(dict, "ema_span_1")?,
+        hsl_enabled,
+        hsl_red_threshold,
+        hsl_ema_span_minutes,
+        hsl_cooldown_minutes_after_red,
+        hsl_no_restart_drawdown_threshold,
+        hsl_tier_ratio_yellow,
+        hsl_tier_ratio_orange,
+        hsl_orange_tier_mode,
+        hsl_panic_close_order_type,
         n_positions,
         total_wallet_exposure_limit,
         wallet_exposure_limit,
@@ -960,6 +1495,35 @@ fn bot_params_from_dict(dict: &PyDict) -> PyResult<BotParams> {
         unstuck_loss_allowance_pct: extract_value(dict, "unstuck_loss_allowance_pct")?,
         unstuck_threshold: extract_value(dict, "unstuck_threshold")?,
     })
+}
+
+fn extract_forager_score_weights(dict: &PyDict) -> PyResult<ForagerScoreWeights> {
+    let weights_dict = dict
+        .get_item("forager_score_weights")
+        .map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>("Key 'forager_score_weights' not found")
+        })?
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Value for key 'forager_score_weights' is None",
+            )
+        })?
+        .downcast::<PyDict>()?;
+    let weights = ForagerScoreWeights {
+        volume: extract_value(weights_dict, "volume")?,
+        ema_readiness: extract_value(weights_dict, "ema_readiness")?,
+        volatility: extract_value(weights_dict, "volatility")?,
+    };
+    weights.canonicalize().map_err(PyValueError::new_err)
+}
+
+fn validate_forager_score_weights_pair(bot_params: &BotParamsPair) -> PyResult<()> {
+    for (pside, params) in [("long", &bot_params.long), ("short", &bot_params.short)] {
+        if let Err(err) = params.forager_score_weights.canonicalize() {
+            return Err(PyValueError::new_err(format!("bot.{pside}.{err}")));
+        }
+    }
+    Ok(())
 }
 
 fn extract_value<'a, T: pyo3::FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> PyResult<T> {
@@ -1033,6 +1597,7 @@ pub fn calc_next_entry_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1123,6 +1688,7 @@ pub fn calc_next_close_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1209,6 +1775,7 @@ pub fn calc_next_entry_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1299,6 +1866,7 @@ pub fn calc_next_close_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     let state_params = StateParams {
         balance,
@@ -1385,6 +1953,7 @@ pub fn calc_entries_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
@@ -1486,6 +2055,7 @@ pub fn calc_entries_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
@@ -1561,6 +2131,7 @@ pub fn calc_min_entry_qty_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
     crate::entries::calc_min_entry_qty(price, &exchange_params)
 }
@@ -1597,6 +2168,7 @@ pub fn calc_closes_long_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
@@ -1679,6 +2251,7 @@ pub fn calc_closes_short_py(
         min_qty,
         min_cost,
         c_mult,
+        ..Default::default()
     };
 
     let state_params = StateParams {
@@ -1731,7 +2304,7 @@ pub fn calc_closes_short_py(
 #[pyfunction]
 pub fn calc_twel_enforcer_orders_py(
     side: &str,
-    threshold: f64,
+    red_threshold: f64,
     total_wallet_exposure_limit: f64,
     effective_n_positions: usize,
     balance: f64,
@@ -1811,7 +2384,7 @@ pub fn calc_twel_enforcer_orders_py(
 
     let actions = calc_twel_enforcer_actions(
         side_code,
-        threshold,
+        red_threshold,
         total_wallet_exposure_limit,
         effective_n_positions,
         balance,
@@ -1865,6 +2438,7 @@ pub fn compute_ideal_orders_json(input_json: &str) -> PyResult<String> {
                 e
             ))
         })?;
+    validate_forager_score_weights_pair(&input.global.global_bot_params)?;
 
     let out = crate::orchestrator::compute_ideal_orders(&input).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!(
