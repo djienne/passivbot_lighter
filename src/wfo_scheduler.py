@@ -40,7 +40,7 @@ if str(SRC_ROOT) not in sys.path:
 from config_utils import load_hjson_config, load_config, dump_config  # noqa: E402
 from utils import ts_to_date, utc_ms  # noqa: E402
 from logging_setup import configure_logging  # noqa: E402
-from tools.wfo_utils import generate_windows  # noqa: E402
+from tools.wfo_utils import generate_windows, pareto_trade_rate, select_with_trade_guard  # noqa: E402
 from tools.wfo_handoff import current_live_window  # noqa: E402
 from tools.wfo_meta import WF_DEFAULTS, merge_wf_params, load_wf_meta  # noqa: E402,F401
 from walkforward import (  # noqa: E402
@@ -178,6 +178,11 @@ def run_once(
         return 0
 
     work_dir = active_dir / "_work"
+    # Trade-count overfit guard along the chain (same rule the backtest uses): reject a
+    # window's chosen config if its in-sample trade rate dropped below min_trade_ratio of
+    # the previous window's chosen config (walks down the Pareto front to the next-best).
+    min_trade_ratio = float(wf.get("min_trade_ratio", 0.0) or 0.0)
+    prev_trade_rate: Optional[float] = None
     prev_config_path: Optional[str] = None
     last_choice = None
     last_window = None
@@ -192,7 +197,7 @@ def run_once(
 
         wdir = work_dir / f"window_{w.index:02d}"
         try:
-            choice, cache_key, cache_hit = optimize_one_window(
+            candidates, cache_key, cache_hit = optimize_one_window(
                 base_config, w,
                 seed=seed,
                 stop_cfg=wf["stop"],
@@ -212,15 +217,29 @@ def run_once(
             logger.error("window %02d | %s", w.index, exc)
             return exc.code
 
+        choice, trade_guard = select_with_trade_guard(candidates, prev_trade_rate, min_trade_ratio)
+        if trade_guard.get("no_pass"):
+            logger.warning("window %02d | trade-guard: no candidate >= %.2f x prev rate; "
+                           "using highest-rate (rank %d)", w.index, min_trade_ratio,
+                           trade_guard.get("chosen_rank", 0))
+        elif trade_guard.get("applied") and trade_guard.get("chosen_rank"):
+            logger.warning("window %02d | trade-guard: rejected %d higher-ranked candidate(s); "
+                           "chose rank %d", w.index, len(trade_guard.get("rejected", [])),
+                           trade_guard.get("chosen_rank", 0))
+
         # Persist this window's chosen config so the NEXT window warm-starts from it
         # (the deterministic chain → stable cache keys for already-done windows).
         chain_path = wdir / "chosen.json"
         chain_path.parent.mkdir(parents=True, exist_ok=True)
         dump_config(choice.config, str(chain_path))
         prev_config_path = str(chain_path)
+        rate = pareto_trade_rate(choice)
+        if rate is not None:
+            prev_trade_rate = rate
         last_choice, last_window, last_cache_key = choice, w, cache_key
-        logger.info("window %02d | %s | chosen=%s",
-                    w.index, "cache HIT" if cache_hit else "optimized", choice.hash_id)
+        logger.info("window %02d | %s | chosen=%s | trade_rate=%s",
+                    w.index, "cache HIT" if cache_hit else "optimized", choice.hash_id,
+                    f"{rate:.4f}" if rate is not None else "n/a")
 
     # Publish the current (last) window as the active live config.
     pointer = {

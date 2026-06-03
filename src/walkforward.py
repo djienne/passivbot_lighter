@@ -47,7 +47,10 @@ from optimization.config_adapter import extract_bounds_tuple_list_from_config  #
 from tools.wfo_utils import (  # noqa: E402
     ParetoChoice,
     generate_windows,
-    select_best_from_pareto,
+    select_best_from_pareto,  # noqa: F401 (kept for back-compat / external callers)
+    rank_pareto_candidates,
+    pareto_trade_rate,
+    select_with_trade_guard,
     param_drift,
     stitch_oos_equity,
 )
@@ -87,6 +90,7 @@ def resolve_wf_params(wf_block: Dict[str, Any], args: argparse.Namespace) -> Dic
         "base_seed": args.base_seed,
         "proximity_weight": args.proximity_weight,
         "initial_config": args.initial_config,
+        "min_trade_ratio": getattr(args, "min_trade_ratio", None),
         "run_id": args.run_id,
     }
     for key, value in cli_map.items():
@@ -271,12 +275,8 @@ def window_cache_key(train_cfg: Dict[str, Any], warm_start_path: Optional[str]) 
     return calc_hash(key_payload)
 
 
-def _save_cached_choice(path: Path, choice: ParetoChoice, key: str, window, seed: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "cache_key": key,
-        "window": window.to_dict(),
-        "seed": seed,
+def _choice_to_dict(choice: ParetoChoice) -> Dict[str, Any]:
+    return {
         "hash_id": choice.hash_id,
         "objectives": list(choice.objectives),
         "violation": choice.violation,
@@ -285,6 +285,33 @@ def _save_cached_choice(path: Path, choice: ParetoChoice, key: str, window, seed
         "metrics": choice.metrics,
         "config": choice.config,
     }
+
+
+def _choice_from_dict(d: Dict[str, Any]) -> ParetoChoice:
+    return ParetoChoice(
+        hash_id=d["hash_id"],
+        config=d["config"],
+        objectives=tuple(d.get("objectives", [])),
+        violation=float(d.get("violation", 0.0)),
+        distance=float(d.get("distance", 0.0)),
+        metrics=d.get("metrics", {}) or {},
+        n_candidates=int(d.get("n_candidates", 0)),
+    )
+
+
+def _cache_header_ok(d: Dict[str, Any], expected_key, expected_window, expected_seed) -> bool:
+    if expected_key is not None and d.get("cache_key") != expected_key:
+        return False
+    if expected_window is not None and d.get("window") != expected_window:
+        return False
+    if expected_seed is not None and int(d.get("seed", -1)) != int(expected_seed):
+        return False
+    return True
+
+
+def _save_cached_choice(path: Path, choice: ParetoChoice, key: str, window, seed: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"cache_key": key, "window": window.to_dict(), "seed": seed, **_choice_to_dict(choice)}
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
 
@@ -298,21 +325,45 @@ def _load_cached_choice(
     try:
         with open(path, "r", encoding="utf-8") as fh:
             d = json.load(fh)
-        if expected_key is not None and d.get("cache_key") != expected_key:
+        if not _cache_header_ok(d, expected_key, expected_window, expected_seed):
             return None
-        if expected_window is not None and d.get("window") != expected_window:
+        return _choice_from_dict(d)
+    except Exception:
+        return None
+
+
+def _save_cached_candidates(
+    path: Path, candidates: List[ParetoChoice], key: str, window, seed: int
+) -> None:
+    """Cache the full ranked Pareto candidate list, so the trade-count overfit guard
+    (which depends on the previous window's chosen config) can re-select on a cache
+    hit without re-optimizing the front."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "cache_key": key,
+        "window": window.to_dict(),
+        "seed": seed,
+        "candidates": [_choice_to_dict(c) for c in candidates],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+
+
+def _load_cached_candidates(
+    path: Path,
+    expected_key: Optional[str] = None,
+    expected_window: Optional[Dict[str, Any]] = None,
+    expected_seed: Optional[int] = None,
+) -> Optional[List[ParetoChoice]]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if not _cache_header_ok(d, expected_key, expected_window, expected_seed):
             return None
-        if expected_seed is not None and int(d.get("seed", -1)) != int(expected_seed):
+        cands = d.get("candidates")
+        if not isinstance(cands, list) or not cands:
             return None
-        return ParetoChoice(
-            hash_id=d["hash_id"],
-            config=d["config"],
-            objectives=tuple(d.get("objectives", [])),
-            violation=float(d.get("violation", 0.0)),
-            distance=float(d.get("distance", 0.0)),
-            metrics=d.get("metrics", {}) or {},
-            n_candidates=int(d.get("n_candidates", 0)),
-        )
+        return [_choice_from_dict(c) for c in cands]
     except Exception:
         return None
 
@@ -356,7 +407,9 @@ def optimize_one_window(
     optimizer subprocess into ``results_dir`` (logging to ``log_path``) and stores the
     chosen result in the cache.
 
-    Returns ``(choice: ParetoChoice, cache_key: str, cache_hit: bool)``. Raises
+    Returns ``(candidates: List[ParetoChoice], cache_key: str, cache_hit: bool)`` — the
+    full Pareto front ranked best-first (``candidates[0]`` is the scalarized winner; the
+    caller applies the trade-count overfit guard to pick among them). Raises
     :class:`WindowOptimizeError` (code 2 optimizer failed, 3 empty Pareto front).
     """
     optimize_script = optimize_script or str(SRC_ROOT / "optimize.py")
@@ -368,25 +421,36 @@ def optimize_one_window(
     dump_config(train_cfg, str(train_cfg_path))
 
     cache_key = window_cache_key(train_cfg, warm_start)
-    cache_entry = (cache_dir / cache_key / "choice.json") if cache_dir else None
-    choice: Optional[ParetoChoice] = None
+    key_dir = (cache_dir / cache_key) if cache_dir else None
+    cand_entry = (key_dir / "candidates.json") if key_dir else None
+    legacy_entry = (key_dir / "choice.json") if key_dir else None
+    candidates: Optional[List[ParetoChoice]] = None
     cache_hit = False
-    if cache_entry is not None and not no_cache and cache_entry.exists():
-        choice = _load_cached_choice(
-            cache_entry,
-            expected_key=cache_key,
-            expected_window=window.to_dict(),
-            expected_seed=seed,
+    if cand_entry is not None and not no_cache and cand_entry.exists():
+        candidates = _load_cached_candidates(
+            cand_entry, expected_key=cache_key,
+            expected_window=window.to_dict(), expected_seed=seed,
         )
-        if choice is not None:
+        if candidates:
             cache_hit = True
-            logger.info("window %02d | cache HIT %s -> reusing optimization",
-                        window.index, cache_key[:12])
+            logger.info("window %02d | cache HIT %s -> reusing %d candidate(s)",
+                        window.index, cache_key[:12], len(candidates))
         else:
             logger.info("window %02d | cache entry invalid for %s -> recomputing",
                         window.index, cache_key[:12])
+    if candidates is None and legacy_entry is not None and not no_cache and legacy_entry.exists():
+        # Legacy single-choice cache entry: usable, but with no fall-back candidates.
+        legacy = _load_cached_choice(
+            legacy_entry, expected_key=cache_key,
+            expected_window=window.to_dict(), expected_seed=seed,
+        )
+        if legacy is not None:
+            candidates = [legacy]
+            cache_hit = True
+            logger.info("window %02d | cache HIT %s (legacy single choice)",
+                        window.index, cache_key[:12])
 
-    if choice is None:
+    if not candidates:
         opt_cmd = [
             sys.executable, optimize_script, str(train_cfg_path),
             "--results-dir", str(results_dir),
@@ -398,13 +462,13 @@ def optimize_one_window(
         rc = _run_subprocess(opt_cmd, Path(log_path))
         if rc != 0:
             raise WindowOptimizeError(2, f"optimizer failed (rc={rc}); see {log_path}")
-        choice = select_best_from_pareto(str(Path(results_dir) / "pareto"), scoring_keys)
-        if choice is None:
+        candidates = rank_pareto_candidates(str(Path(results_dir) / "pareto"), scoring_keys)
+        if not candidates:
             raise WindowOptimizeError(3, f"no usable Pareto front; see {log_path}")
-        if cache_entry is not None and not no_cache:
-            _save_cached_choice(cache_entry, choice, cache_key, window, seed)
+        if cand_entry is not None and not no_cache:
+            _save_cached_candidates(cand_entry, candidates, cache_key, window, seed)
 
-    return choice, cache_key, cache_hit
+    return candidates, cache_key, cache_hit
 
 
 def _find_latest(base_dir: str, filename: str) -> Optional[str]:
@@ -606,6 +670,12 @@ def run(args: argparse.Namespace) -> int:
     base_starting_balance = float(base_config.get("backtest", {}).get("starting_balance", 1.0) or 1.0)
     carry: Dict[str, Any] = {"balance": base_starting_balance, "positions": {}}
 
+    # Trade-count overfit guard: reject a window's chosen config if its in-sample trade
+    # rate dropped below min_trade_ratio of the previous window's chosen config, walking
+    # down the Pareto front to the next-best that holds up (see select_with_trade_guard).
+    min_trade_ratio = float(wf.get("min_trade_ratio", 0.0) or 0.0)
+    prev_trade_rate: Optional[float] = None
+
     for w in windows:
         wdir = run_dir / f"window_{w.index:02d}"
         train_dir = wdir / "train"
@@ -630,7 +700,7 @@ def run(args: argparse.Namespace) -> int:
         # (initial config, seed, period, stop criteria, base config) => identical
         # result, reused by any backtest or live rerun (see optimize_one_window).
         try:
-            choice, cache_key, cache_hit = optimize_one_window(
+            candidates, cache_key, cache_hit = optimize_one_window(
                 base_config, w,
                 seed=seed,
                 stop_cfg=wf["stop"],
@@ -652,6 +722,25 @@ def run(args: argparse.Namespace) -> int:
             if not args.keep_going:
                 return exc.code
             continue
+
+        # Trade-count overfit guard: pick the best-ranked candidate that does not trade
+        # far less than last month (falls back down the front; window 0 = top rank).
+        choice, trade_guard = select_with_trade_guard(candidates, prev_trade_rate, min_trade_ratio)
+        if trade_guard.get("no_pass"):
+            logger.warning(
+                "window %02d | trade-guard: NO candidate >= %.2f x prev rate %.4f; "
+                "falling back to highest-rate (rank %d, rate=%.4f)",
+                w.index, min_trade_ratio, prev_trade_rate or 0.0,
+                trade_guard.get("chosen_rank", 0), trade_guard.get("chosen_trade_rate") or 0.0,
+            )
+        elif trade_guard.get("applied") and trade_guard.get("chosen_rank"):
+            logger.warning(
+                "window %02d | trade-guard: rejected %d higher-ranked candidate(s) "
+                "(trade rate < %.2f x prev %.4f); chose rank %d (rate=%.4f)",
+                w.index, len(trade_guard.get("rejected", [])), min_trade_ratio,
+                prev_trade_rate or 0.0, trade_guard.get("chosen_rank", 0),
+                trade_guard.get("chosen_trade_rate") or 0.0,
+            )
 
         # Save the chosen config (a complete config: backtest- and live-ready).
         train_best_path = wdir / "train_best.json"
@@ -730,6 +819,7 @@ def run(args: argparse.Namespace) -> int:
         if prev_config_dict is not None:
             drift = param_drift(prev_config_dict, choice.config, bounds_ranges)
 
+        chosen_trade_rate = pareto_trade_rate(choice)
         record = {
             "index": w.index,
             "window": w.to_dict(),
@@ -742,6 +832,8 @@ def run(args: argparse.Namespace) -> int:
             "objectives": list(choice.objectives),
             "constraint_violation": choice.violation,
             "train_best_config": str(train_best_path),
+            "trade_rate": chosen_trade_rate,
+            "trade_guard": trade_guard,
             "overfit": overfit,
             "oos_analysis": oos_analysis,
             "param_drift": drift,
@@ -752,8 +844,13 @@ def run(args: argparse.Namespace) -> int:
 
         prev_config_path = str(train_best_path)
         prev_config_dict = choice.config
-        logger.info("window %02d done | chosen=%s | OOS points=%d",
-                    w.index, choice.hash_id, len(oos_segment.get("equity", [])))
+        # Baseline for next window's trade-count guard (the chosen config's in-sample rate).
+        if chosen_trade_rate is not None:
+            prev_trade_rate = chosen_trade_rate
+        logger.info("window %02d done | chosen=%s | trade_rate=%s | OOS points=%d",
+                    w.index, choice.hash_id,
+                    f"{chosen_trade_rate:.4f}" if chosen_trade_rate is not None else "n/a",
+                    len(oos_segment.get("equity", [])))
 
     # --- aggregation ---
     summary_dir = run_dir / "walkforward_summary"
@@ -851,6 +948,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", type=str, default=None)
     parser.add_argument("--base-seed", type=int, default=None)
     parser.add_argument("--proximity-weight", type=float, default=None)
+    parser.add_argument("--min-trade-ratio", dest="min_trade_ratio", type=float, default=None,
+                        help="Overfit guard: reject a chosen config whose in-sample trade rate "
+                             "drops below this fraction of the previous window (0 disables)")
     parser.add_argument("--initial-config", type=str, default=None,
                         help="Starting config to warm-start the first window (default hype_top.json)")
     parser.add_argument("--patience", type=int, default=None)

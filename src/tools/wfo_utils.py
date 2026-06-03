@@ -133,19 +133,22 @@ class ParetoChoice:
     n_candidates: int
 
 
-def select_best_from_pareto(
+def rank_pareto_candidates(
     pareto_dir: str,
     scoring_keys: Optional[Sequence[str]] = None,
-) -> Optional[ParetoChoice]:
-    """Deterministically pick the single best config from a Pareto front.
+) -> List[ParetoChoice]:
+    """Deterministically rank all configs on a Pareto front, best first.
 
     Strategy: among feasible members (constraint_violation == 0 when any exist),
-    min-max normalize each objective column to [0, 1] and pick the member with the
-    smallest Euclidean distance to the component-wise ideal (all-minimum) point.
-    Ties broken by (violation, distance, hash_id). Files are read in sorted order
-    so the result is reproducible.
+    min-max normalize each objective column to [0, 1] and order by Euclidean
+    distance to the component-wise ideal (all-minimum) point. Ties broken by
+    (violation, distance, hash_id). Files are read in sorted order so the order is
+    reproducible. ``ranked[0]`` is the single best (what ``select_best_from_pareto``
+    returns); later entries are the fall-back candidates used by the trade-count
+    overfit guard (see :func:`select_with_trade_guard`).
 
-    Returns ``None`` if the Pareto directory has no usable entries.
+    Returns ``[]`` if the Pareto directory has no usable entries. Every returned
+    ``ParetoChoice`` carries ``n_candidates`` = the total parsed (front size).
     """
     paths = sorted(glob.glob(os.path.join(pareto_dir, "*.json")))
     parsed: List[Tuple[str, Tuple[float, ...], float, Dict[str, Any]]] = []
@@ -169,7 +172,7 @@ def select_best_from_pareto(
         parsed.append((hash_id, objectives, violation, entry))
 
     if not parsed:
-        return None
+        return []
 
     feasible = [p for p in parsed if p[2] <= 0.0]
     pool = feasible if feasible else parsed
@@ -189,16 +192,123 @@ def select_best_from_pareto(
         scored.append((violation, distance, hash_id, objectives, entry))
 
     scored.sort(key=lambda item: (item[0], item[1], item[2]))
-    violation, distance, hash_id, objectives, entry = scored[0]
-    return ParetoChoice(
-        hash_id=hash_id,
-        config=_strip_metrics(entry),
-        objectives=objectives,
-        violation=violation,
-        distance=distance,
-        metrics=(entry.get("metrics") or {}),
-        n_candidates=len(parsed),
+    n_candidates = len(parsed)
+    return [
+        ParetoChoice(
+            hash_id=hash_id,
+            config=_strip_metrics(entry),
+            objectives=objectives,
+            violation=violation,
+            distance=distance,
+            metrics=(entry.get("metrics") or {}),
+            n_candidates=n_candidates,
+        )
+        for violation, distance, hash_id, objectives, entry in scored
+    ]
+
+
+def select_best_from_pareto(
+    pareto_dir: str,
+    scoring_keys: Optional[Sequence[str]] = None,
+) -> Optional[ParetoChoice]:
+    """Deterministically pick the single best config from a Pareto front.
+
+    Thin wrapper over :func:`rank_pareto_candidates` returning the top-ranked
+    candidate (or ``None`` if the front has no usable entries).
+    """
+    ranked = rank_pareto_candidates(pareto_dir, scoring_keys)
+    return ranked[0] if ranked else None
+
+
+# ---------------------------------------------------------------------------
+# Trade-count overfit guard
+# ---------------------------------------------------------------------------
+def pareto_trade_rate(choice: "ParetoChoice") -> Optional[float]:
+    """In-sample trade frequency of a candidate as positions held per day.
+
+    Reads ``metrics.stats.positions_held_per_day.mean`` (the only per-candidate
+    trade-frequency metric the optimizer emits), falling back to the weighted
+    ``positions_held_per_day_w`` variant, else ``None`` when neither is present.
+    A per-day rate is directly comparable across windows of different lengths.
+    """
+    stats = (getattr(choice, "metrics", {}) or {}).get("stats", {}) or {}
+    for key in ("positions_held_per_day", "positions_held_per_day_w"):
+        entry = stats.get(key)
+        if isinstance(entry, dict) and entry.get("mean") is not None:
+            try:
+                return float(entry["mean"])
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(entry, (int, float)):
+            return float(entry)
+    return None
+
+
+def select_with_trade_guard(
+    candidates: Sequence["ParetoChoice"],
+    prev_trade_rate: Optional[float],
+    min_trade_ratio: float = 0.5,
+) -> Tuple["ParetoChoice", Dict[str, Any]]:
+    """Pick a window's config, rejecting candidates that trade far less than last month.
+
+    Walks the ranked ``candidates`` (best first) and returns the first whose in-sample
+    trade rate is at least ``min_trade_ratio`` of the previous window's chosen config's
+    rate — an overfit guard against configs that profit from only a few trades.
+
+    - ``prev_trade_rate`` falsy/≤0 (window 0, or unknown) or ``min_trade_ratio`` ≤0
+      disables the guard: the top-ranked candidate is returned unchanged.
+    - If no candidate clears the threshold, the candidate with the **highest** trade
+      rate is returned (closest to passing), flagged ``no_pass``.
+
+    Returns ``(choice, info)`` where ``info`` records the decision for auditing
+    (``window_summary.json``).
+    """
+    candidates = list(candidates)
+    if not candidates:
+        raise ValueError("select_with_trade_guard called with no candidates")
+
+    top = candidates[0]
+    if not prev_trade_rate or prev_trade_rate <= 0 or min_trade_ratio <= 0:
+        return top, {
+            "applied": False,
+            "prev_trade_rate": prev_trade_rate,
+            "chosen_rank": 0,
+            "chosen_trade_rate": pareto_trade_rate(top),
+        }
+
+    threshold = float(min_trade_ratio) * float(prev_trade_rate)
+    rejected: List[Dict[str, Any]] = []
+    for rank, cand in enumerate(candidates):
+        rate = pareto_trade_rate(cand)
+        # A candidate with no trade-rate metric cannot be judged; accept it (rank order).
+        if rate is None or rate >= threshold:
+            return cand, {
+                "applied": True,
+                "prev_trade_rate": float(prev_trade_rate),
+                "threshold": threshold,
+                "min_trade_ratio": float(min_trade_ratio),
+                "chosen_rank": rank,
+                "chosen_trade_rate": rate,
+                "rejected": rejected,
+            }
+        rejected.append({"rank": rank, "hash_id": cand.hash_id, "trade_rate": rate})
+
+    # No candidate clears the threshold: fall back to the highest-trade-rate one.
+    best_rank, best_choice = max(
+        enumerate(candidates),
+        key=lambda rc: (pareto_trade_rate(rc[1]) or 0.0, -rc[0]),
     )
+    return best_choice, {
+        "applied": True,
+        "no_pass": True,
+        "fallback": "highest_trade_rate",
+        "prev_trade_rate": float(prev_trade_rate),
+        "threshold": threshold,
+        "min_trade_ratio": float(min_trade_ratio),
+        "chosen_rank": best_rank,
+        "chosen_trade_rate": pareto_trade_rate(best_choice),
+        "rejected": rejected,
+    }
 
 
 # ---------------------------------------------------------------------------

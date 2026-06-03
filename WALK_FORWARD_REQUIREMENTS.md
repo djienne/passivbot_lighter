@@ -405,6 +405,31 @@ live bot or re-backtest it directly.
 | R16 | Restart recovery (local + docker) | soft-restart in-process; positions re-read from exchange |
 | R17 | Stateful OOS carry (continuous equity) | `advance_carry` unit tests; carry-parity backtest |
 | R18 | Cross-platform VPS pickup | portable JSON artifacts; relative `config_path`; bot swaps `bot` only |
+| R19 | Trade-count overfit guard | `select_with_trade_guard` unit tests; real-front sanity check |
+
+---
+
+## R19 — Trade-count overfit guard at selection
+
+A window's optimizer returns a Pareto front and the scalarized winner can be **overfit to a
+few very profitable trades** — trading far less than the previous month. To guard against this,
+after the front is produced the chosen config is filtered on its **in-sample trade rate**
+(`positions_held_per_day`, the per-candidate trade-frequency metric): if the top candidate's rate
+is below `min_trade_ratio` (default **0.5**) of the **previous window's chosen config**, walk
+down the ranked front to the next-best candidate that holds up. If none qualify, the
+**highest-trade-rate** candidate is taken (closest to passing) with a logged warning. Window 0
+(no previous month) and `min_trade_ratio = 0` disable the guard.
+
+- **In-sample only** (no peek at the OOS month) — selection stays fully out-of-sample.
+- **Smart cache:** the Pareto **front** is cached (`candidates.json`), so the guard re-selects
+  cheaply on a cache hit; changing `min_trade_ratio` never re-optimizes a front, but a changed
+  choice cascades through the warm-start chain to re-optimize downstream windows.
+- The decision (`trade_guard`) and chosen `trade_rate` are recorded per window in
+  `window_summary.json`.
+
+**Where:** `wfo_utils.rank_pareto_candidates` / `pareto_trade_rate` / `select_with_trade_guard`;
+the per-window loop in `walkforward.run` and the chain replay in `wfo_scheduler.run_once`.
+**Meta-parameter:** `min_trade_ratio` (CLI `--min-trade-ratio`).
 
 ---
 
@@ -582,6 +607,7 @@ To instead run everything on one capable host, enable the bundled
 | `live.wfo_rolling.active_dir` | `runs/walkforward/live` | Where the bot reads `active.json` / `active_config.json` |
 | `live.wfo_rolling.max_loss_flatten_frac` | `0.05` | Boundary handoff threshold (R15) |
 | `live.wfo_rolling.check_interval_minutes` | `60.0` | How often the watcher polls `active.json` |
+| `walk_forward.min_trade_ratio` | `0.5` | Overfit guard: reject a chosen config trading below this fraction of last month (R19); 0 disables |
 | `walk_forward.stateful_oos` | `false` | Carry balance+positions across OOS seams (R17) |
 | `walk_forward.max_loss_flatten_frac` | `0.05` | Backtest copy of the handoff threshold |
 | `walk_forward.retrain_delay_days` | `0` | Intended month-start lag (knob exists; **not yet** modeled in the stitch) |

@@ -49,6 +49,11 @@ WF_DEFAULTS: Dict[str, Any] = {
     "proximity_weight": 0.0,
     "initial_config": "configs/hype_top.json",
     "stop": {"patience": 0, "min_rel_improvement": 0.0, "max_evals": 0},
+    # Overfit guard: reject a window's chosen config if its in-sample trade rate
+    # (positions/day) drops below this fraction of the previous window's chosen
+    # config, falling back down the Pareto front (see wfo_utils.select_with_trade_guard).
+    # 0 disables.
+    "min_trade_ratio": 0.5,
     "run_id": None,
     # Backtest fidelity: carry balance + open position across OOS windows and apply
     # the same boundary handoff rule live uses (see tools/wfo_handoff.should_flatten).

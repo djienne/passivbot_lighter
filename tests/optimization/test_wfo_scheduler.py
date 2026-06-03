@@ -93,8 +93,9 @@ def test_publishes_current_window_via_chain(tmp_path, monkeypatch):
         calls.append(window.index)
         cfg = {"bot": {"long": {"x": float(window.index)}, "short": {}},
                "backtest": {}, "optimize": {}}
+        # optimize_one_window now returns the ranked candidate LIST (best first).
         return (
-            ParetoChoice(f"h{window.index}", cfg, (1.0,), 0.0, 0.0, {}, 1),
+            [ParetoChoice(f"h{window.index}", cfg, (1.0,), 0.0, 0.0, {}, 1)],
             f"key{window.index}",
             False,
         )

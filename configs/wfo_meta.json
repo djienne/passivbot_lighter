@@ -40,6 +40,13 @@
   // --- parameter stickiness between months (0.0 = pure warm-start) ---
   "proximity_weight": 0.0,
 
+  // --- overfit guard: reject a chosen config whose in-sample trade rate
+  //     (positions/day) drops below this fraction of the previous month's chosen
+  //     config; the next-best Pareto candidate that holds up is used instead.
+  //     0 disables. (Carry/selection knob, like the threshold above — does not
+  //     re-optimize a window's front, but a changed choice cascades downstream.)
+  "min_trade_ratio": 0.5,
+
   // --- optimization stop criteria (convergence early-stop + hard cap) ---
   "stop": {
     "patience": 20,

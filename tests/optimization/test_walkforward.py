@@ -16,6 +16,10 @@ import pytest
 from tools.wfo_utils import (
     generate_windows,
     select_best_from_pareto,
+    rank_pareto_candidates,
+    pareto_trade_rate,
+    select_with_trade_guard,
+    ParetoChoice,
     stitch_oos_equity,
     param_drift,
     normalized_distance,
@@ -77,14 +81,17 @@ class TestGenerateWindows:
 # ---------------------------------------------------------------------------
 # Pareto selection
 # ---------------------------------------------------------------------------
-def _write_pareto_entry(directory, hash_id, w0, w1, violation=0.0):
+def _write_pareto_entry(directory, hash_id, w0, w1, violation=0.0, trade_rate=None):
+    stats = {"adg": {"mean": -w0}}
+    if trade_rate is not None:
+        stats["positions_held_per_day"] = {"mean": trade_rate}
     entry = {
         "bot": {"long": {"x": 1.0}, "short": {}},
         "optimize": {"scoring": ["adg", "sharpe"]},
         "metrics": {
             "objectives": {"w_0": w0, "w_1": w1},
             "constraint_violation": violation,
-            "stats": {"adg": {"mean": -w0}},
+            "stats": stats,
         },
     }
     with open(os.path.join(directory, f"{hash_id}.json"), "w", encoding="utf-8") as fh:
@@ -127,6 +134,108 @@ class TestSelectBestFromPareto:
         d = tmp_path / "pareto"
         d.mkdir()
         assert select_best_from_pareto(str(d), ["adg", "sharpe"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Ranking the full front (fall-back candidates for the trade guard)
+# ---------------------------------------------------------------------------
+class TestRankParetoCandidates:
+    def test_ranked_list_best_first_matches_select_best(self, tmp_path):
+        d = tmp_path / "pareto"
+        d.mkdir()
+        _write_pareto_entry(d, "a", -1.0, -0.5)
+        _write_pareto_entry(d, "b", -0.5, -1.0)
+        _write_pareto_entry(d, "c", -0.9, -0.9)  # closest to ideal corner
+        ranked = rank_pareto_candidates(str(d), ["adg", "sharpe"])
+        assert [c.hash_id for c in ranked][0] == "c"            # best first
+        assert set(c.hash_id for c in ranked) == {"a", "b", "c"}  # all present
+        assert ranked[0].hash_id == select_best_from_pareto(str(d), ["adg", "sharpe"]).hash_id
+        assert all(c.n_candidates == 3 for c in ranked)
+
+    def test_empty_dir_returns_empty_list(self, tmp_path):
+        d = tmp_path / "pareto"
+        d.mkdir()
+        assert rank_pareto_candidates(str(d), ["adg", "sharpe"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Trade-count overfit guard
+# ---------------------------------------------------------------------------
+def _choice(hash_id, rate):
+    metrics = {} if rate is None else {"stats": {"positions_held_per_day": {"mean": rate}}}
+    return ParetoChoice(hash_id, {"bot": {}}, (1.0,), 0.0, 0.0, metrics, 9)
+
+
+class TestParetoTradeRate:
+    def test_reads_positions_held_per_day(self):
+        assert pareto_trade_rate(_choice("a", 4.25)) == pytest.approx(4.25)
+
+    def test_weighted_fallback(self):
+        c = ParetoChoice("a", {}, (1.0,), 0.0, 0.0,
+                         {"stats": {"positions_held_per_day_w": {"mean": 3.1}}}, 1)
+        assert pareto_trade_rate(c) == pytest.approx(3.1)
+
+    def test_none_when_absent(self):
+        assert pareto_trade_rate(_choice("a", None)) is None
+
+
+class TestSelectWithTradeGuard:
+    def test_window0_no_prev_takes_top_rank(self):
+        cands = [_choice("top", 1.0), _choice("b", 9.0)]
+        choice, info = select_with_trade_guard(cands, None, 0.5)
+        assert choice.hash_id == "top"
+        assert info["applied"] is False
+
+    def test_rejects_big_drop_and_falls_to_next(self):
+        # prev rate 10, threshold = 5; rank-0 trades 2 (>50% drop) -> reject; rank-1 trades 6 -> ok.
+        cands = [_choice("r0", 2.0), _choice("r1", 6.0), _choice("r2", 1.0)]
+        choice, info = select_with_trade_guard(cands, 10.0, 0.5)
+        assert choice.hash_id == "r1"
+        assert info["applied"] is True
+        assert info["chosen_rank"] == 1
+        assert [r["hash_id"] for r in info["rejected"]] == ["r0"]
+
+    def test_all_fail_picks_highest_trade_rate(self):
+        cands = [_choice("r0", 1.0), _choice("r1", 3.0), _choice("r2", 2.0)]
+        choice, info = select_with_trade_guard(cands, 10.0, 0.5)  # threshold 5, none pass
+        assert choice.hash_id == "r1"        # highest rate (3.0)
+        assert info["no_pass"] is True
+        assert info["fallback"] == "highest_trade_rate"
+
+    def test_min_ratio_zero_disables(self):
+        cands = [_choice("top", 0.1), _choice("b", 9.0)]
+        choice, info = select_with_trade_guard(cands, 10.0, 0.0)
+        assert choice.hash_id == "top"
+        assert info["applied"] is False
+
+    def test_unjudgeable_candidate_accepted(self):
+        # rank-0 has no trade-rate metric -> cannot be judged -> accepted at its rank.
+        choice, info = select_with_trade_guard([_choice("r0", None), _choice("r1", 9.0)], 10.0, 0.5)
+        assert choice.hash_id == "r0"
+        assert info["chosen_rank"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Cache round-trip of the ranked candidate list
+# ---------------------------------------------------------------------------
+class TestCandidateCache:
+    def test_save_load_roundtrip_and_header_validation(self, tmp_path):
+        from walkforward import _save_cached_candidates, _load_cached_candidates
+        from tools.wfo_utils import Window
+
+        w = Window(0, "2025-01-01", "2025-07-01", "2025-07-01", "2025-08-01")
+        cands = [_choice("r0", 5.0), _choice("r1", 2.0)]
+        path = tmp_path / "candidates.json"
+        _save_cached_candidates(path, cands, "key-a", w, 7)
+
+        loaded = _load_cached_candidates(path, expected_key="key-a",
+                                         expected_window=w.to_dict(), expected_seed=7)
+        assert loaded is not None
+        assert [c.hash_id for c in loaded] == ["r0", "r1"]
+        assert pareto_trade_rate(loaded[0]) == pytest.approx(5.0)
+        # Header mismatches reject the entry.
+        assert _load_cached_candidates(path, expected_key="other") is None
+        assert _load_cached_candidates(path, expected_seed=8) is None
 
 
 # ---------------------------------------------------------------------------

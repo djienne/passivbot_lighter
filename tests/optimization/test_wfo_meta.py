@@ -22,6 +22,10 @@ def test_default_threshold_is_two_percent():
     assert WF_DEFAULTS["live_rolling"]["max_loss_flatten_frac"] == pytest.approx(0.02)
 
 
+def test_default_min_trade_ratio():
+    assert WF_DEFAULTS["min_trade_ratio"] == pytest.approx(0.5)
+
+
 def test_walkforward_and_scheduler_share_defaults():
     # Both modules must resolve to the one home in tools.wfo_meta.
     import walkforward
@@ -115,8 +119,9 @@ def test_shipped_meta_matches_embedded_block():
     for key in ("patience", "min_rel_improvement", "max_evals"):
         assert wf["stop"][key] == embedded["stop"][key], f"meta/stop.{key} diverges"
 
-    # New single-source threshold default.
+    # New single-source threshold + overfit-guard defaults.
     assert wf["max_loss_flatten_frac"] == pytest.approx(0.02)
+    assert wf["min_trade_ratio"] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
