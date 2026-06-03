@@ -590,30 +590,46 @@ def process_forager_fills(
     equities_array,
     balance_sample_divider: int = 60,
 ):
-    fdf = pd.DataFrame(
-        fills,
-        columns=[
-            "index",
-            "timestamp",
-            "coin",
-            "pnl",
-            "fee_paid",
-            "usd_total_balance",
-            "btc_cash_wallet",
-            "usd_cash_wallet",
-            "btc_price",
-            "qty",
-            "price",
-            "psize",
-            "pprice",
-            "type",
-            "liquidity",
-            "wallet_exposure",
-            "twe_long",
-            "twe_short",
-            "twe_net",
-        ],
-    )
+    fill_columns = [
+        "index",
+        "timestamp",
+        "coin",
+        "pnl",
+        "fee_paid",
+        "usd_total_balance",
+        "btc_cash_wallet",
+        "usd_cash_wallet",
+        "btc_price",
+        "qty",
+        "price",
+        "psize",
+        "pprice",
+        "type",
+        "liquidity",
+        "wallet_exposure",
+        "twe_long",
+        "twe_short",
+        "twe_net",
+    ]
+    fills_array = np.asarray(fills, dtype=object)
+    if fills_array.size == 0:
+        fdf = pd.DataFrame(columns=fill_columns)
+    else:
+        if fills_array.ndim == 1:
+            fills_array = fills_array.reshape(1, -1)
+        if fills_array.shape[1] == len(fill_columns):
+            fdf = pd.DataFrame(fills_array, columns=fill_columns)
+        elif fills_array.shape[1] == len(fill_columns) - 1:
+            fdf = pd.DataFrame(fills_array, columns=fill_columns[:-1])
+            fdf["twe_net"] = (
+                pd.to_numeric(fdf["twe_long"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(fdf["twe_short"], errors="coerce").fillna(0.0)
+            )
+        else:
+            raise ValueError(
+                f"Unsupported fills shape {fills_array.shape}; expected "
+                f"{len(fill_columns)} columns or legacy {len(fill_columns) - 1} columns"
+            )
     if not fdf.empty:
         fdf["timestamp"] = pd.to_datetime(fdf["timestamp"].astype(np.int64), unit="ms")
         fdf["index"] = fdf["index"].astype(int)

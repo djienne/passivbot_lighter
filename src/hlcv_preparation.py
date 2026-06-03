@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import pprint
+import subprocess
 import sys
 import time
 import traceback
@@ -83,6 +84,10 @@ from utils import (
     date_to_ts,
 )
 from warmup_utils import compute_backtest_warmup_minutes, compute_per_coin_warmup_minutes
+
+
+MS_PER_MINUTE = 60_000
+MS_PER_DAY = 86_400_000
 
 
 class HLCVManager:
@@ -514,16 +519,182 @@ class HLCVManager:
         return df.reset_index(drop=True)
 
 
+def _lighter_date_str(ts_ms: int) -> str:
+    return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _lighter_date_str_to_ts(date_str: str) -> int:
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _lighter_config_root(config) -> Path:
+    base_config_path = config.get("live", {}).get("base_config_path")
+    if base_config_path:
+        return Path(base_config_path).resolve().parent.parent
+    return _repo_root()
+
+
+def _lighter_day_start(ts_ms: int) -> int:
+    return (int(ts_ms) // MS_PER_DAY) * MS_PER_DAY
+
+
+def _resolve_lighter_data_dir(config) -> Path:
+    raw = Path(config.get("backtest", {}).get("lighter_data_dir", "caches/ohlcv/lighter/1m"))
+    if raw.is_absolute():
+        return raw
+    return (_lighter_config_root(config) / raw).resolve()
+
+
+def _lighter_coin_dir(data_dir: Path, coin: str) -> Path:
+    return data_dir / coin
+
+
+def _lighter_load_day(fpath: Path) -> np.ndarray:
+    arr = np.load(str(fpath), allow_pickle=False)
+    if getattr(arr.dtype, "fields", None):
+        out = np.empty((arr.shape[0], 6), dtype=np.float64)
+        out[:, 0] = arr["ts"].astype(np.float64)
+        out[:, 1] = arr["o"].astype(np.float64)
+        out[:, 2] = arr["h"].astype(np.float64)
+        out[:, 3] = arr["l"].astype(np.float64)
+        out[:, 4] = arr["c"].astype(np.float64)
+        out[:, 5] = arr["bv"].astype(np.float64)
+        return out
+    return arr.astype(np.float64, copy=False)
+
+
+def _lighter_coin_has_data_in_range(data_dir: Path, coin: str, start_ts: int, end_ts: int) -> bool:
+    coin_dir = data_dir / coin
+    if not coin_dir.exists():
+        return False
+
+    current_ms = _lighter_day_start(start_ts)
+    while current_ms <= end_ts:
+        fpath = coin_dir / f"{_lighter_date_str(current_ms)}.npy"
+        if fpath.exists():
+            try:
+                arr = _lighter_load_day(fpath)
+                mask = (arr[:, 0] >= start_ts) & (arr[:, 0] <= end_ts) & np.isfinite(arr[:, 4])
+                if mask.any():
+                    return True
+            except Exception as exc:
+                logging.warning(f"lighter: failed reading {fpath}: {exc}")
+        current_ms += MS_PER_DAY
+    return False
+
+
+def _lighter_fetched_until(coin_dir: Path) -> Optional[int]:
+    cursor = coin_dir / ".fetched_until"
+    if not cursor.exists():
+        return None
+    try:
+        return int(cursor.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _lighter_latest_file_ts(coin_dir: Path) -> Optional[int]:
+    files = sorted(f for f in coin_dir.glob("*.npy") if ".tmp" not in f.name)
+    if not files:
+        return None
+    try:
+        return _lighter_date_str_to_ts(files[-1].stem)
+    except ValueError:
+        return None
+
+
+def _lighter_coin_needs_collection(
+    data_dir: Path, coin: str, effective_start_ts: int, end_ts: int
+) -> Tuple[bool, str]:
+    coin_dir = data_dir / coin
+    if not _lighter_coin_has_data_in_range(data_dir, coin, effective_start_ts, end_ts):
+        return True, "missing local candles"
+
+    fetched_until = _lighter_fetched_until(coin_dir)
+    if fetched_until is not None:
+        if fetched_until + MS_PER_MINUTE < end_ts:
+            return True, f"stale cursor at {_lighter_date_str(fetched_until)}"
+        return False, ""
+
+    latest_file_ts = _lighter_latest_file_ts(coin_dir)
+    if latest_file_ts is not None and latest_file_ts < _lighter_day_start(end_ts):
+        return True, f"latest file is {_lighter_date_str(latest_file_ts)}"
+    return False, ""
+
+
+def _truthy_config_value(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "n", "off")
+    return bool(value)
+
+
+def _maybe_run_lighter_ohlcv_collector(config, data_dir: Path, coins, effective_start_ts: int, end_ts: int) -> None:
+    auto_collect = config.get("backtest", {}).get("auto_collect_lighter_ohlcvs", True)
+    if not _truthy_config_value(auto_collect):
+        return
+
+    needed = []
+    reasons = {}
+    for coin in sorted(set(coins)):
+        needs_collection, reason = _lighter_coin_needs_collection(
+            data_dir, coin, effective_start_ts, end_ts
+        )
+        if needs_collection:
+            needed.append(coin)
+            reasons[coin] = reason
+
+    if not needed:
+        return
+
+    src_dir = Path(__file__).resolve().parent
+    collector_path = src_dir / "tools" / "lighter_ohlcv_collector.py"
+    if not collector_path.exists():
+        raise FileNotFoundError(f"Lighter OHLCV collector not found at {collector_path}")
+
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(src_dir) if not existing_pythonpath else str(src_dir) + os.pathsep + existing_pythonpath
+    )
+    env["PYTHONUTF8"] = env.get("PYTHONUTF8", "1")
+    env["RUN_ONCE"] = "1"
+    env["SYMBOLS"] = ",".join(needed)
+    env["EARLIEST_DATE"] = _lighter_date_str(effective_start_ts)
+    env["LIGHTER_DATA_DIR"] = str(data_dir.resolve())
+
+    logging.info(
+        "lighter: running OHLCV collector for %s from %s (%s)",
+        ",".join(needed),
+        env["EARLIEST_DATE"],
+        ", ".join(f"{coin}: {reasons[coin]}" for coin in needed),
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(collector_path)],
+        cwd=str(_repo_root()),
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Lighter OHLCV collector failed with exit code {result.returncode}")
+
+
 async def _prepare_hlcvs_lighter(config, coins, effective_start_ts, requested_start_ts, end_ts):
     """Load pre-downloaded Lighter daily .npy files into backtest format.
 
-    Reads from ohlcvs_lighter/{COIN}/YYYY-MM-DD.npy (shape 1440x6: ts,o,h,l,c,v).
+    Reads from caches/ohlcv/lighter/1m/{COIN}/YYYY-MM-DD.npy.
     Returns (mss, timestamps, unified_array, btc_usd_prices).
     """
-    data_dir = Path(config.get("backtest", {}).get("lighter_data_dir", "ohlcvs_lighter"))
+    data_dir = _resolve_lighter_data_dir(config)
     interval_ms = 60_000
     per_coin_warmups = compute_per_coin_warmup_minutes(config)
     default_warm = int(per_coin_warmups.get("__default__", 0))
+
+    _maybe_run_lighter_ohlcv_collector(config, data_dir, coins, effective_start_ts, end_ts)
 
     # Lighter market defaults
     LIGHTER_MARKETS = {
@@ -556,7 +727,7 @@ async def _prepare_hlcvs_lighter(config, coins, effective_start_ts, requested_st
     global_end_time = float("-inf")
 
     for coin in coins:
-        coin_dir = data_dir / coin
+        coin_dir = _lighter_coin_dir(data_dir, coin)
         if not coin_dir.exists():
             logging.warning(f"lighter: no data directory for {coin} at {coin_dir}")
             continue
@@ -568,7 +739,7 @@ async def _prepare_hlcvs_lighter(config, coins, effective_start_ts, requested_st
             date_str = dt.strftime("%Y-%m-%d")
             fpath = coin_dir / f"{date_str}.npy"
             if fpath.exists():
-                arr = np.load(str(fpath), allow_pickle=False)
+                arr = _lighter_load_day(fpath)
                 # Filter to requested range
                 mask = (arr[:, 0] >= effective_start_ts) & (arr[:, 0] <= end_ts)
                 if mask.any():
