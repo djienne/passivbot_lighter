@@ -1739,7 +1739,22 @@ impl<'a> Backtest<'a> {
             coin_last_valid_idx: last_valid_idx,
             coin_trade_start_idx: trade_start_idx,
             trade_activation_logged,
-            positions: Positions::default(),
+            // Walk-forward stateful carry-over: seed inherited positions (empty by
+            // default => start flat, identical to historical behavior).
+            positions: {
+                let mut seeded = Positions::default();
+                for &(idx, size, price) in &backtest_params.initial_positions_long {
+                    if size != 0.0 && idx < n_coins {
+                        seeded.long.insert(idx, Position { size, price });
+                    }
+                }
+                for &(idx, size, price) in &backtest_params.initial_positions_short {
+                    if size != 0.0 && idx < n_coins {
+                        seeded.short.insert(idx, Position { size, price });
+                    }
+                }
+                seeded
+            },
             first_timestamp_ms: backtest_params.first_timestamp_ms,
             last_hour_boundary_ms: (backtest_params.first_timestamp_ms / 3_600_000) * 3_600_000,
             latest_hour: vec![HourBucket::default(); n_coins],

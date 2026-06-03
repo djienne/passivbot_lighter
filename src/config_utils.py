@@ -1059,6 +1059,7 @@ def _sync_with_template(
             ("coin_overrides",),
             ("backtest", "suite", "aggregate"),
             ("backtest", "suite", "scenarios"),
+            ("backtest", "initial_positions"),
         ],
         tracker=tracker,
     )
@@ -1968,6 +1969,7 @@ def get_template_config():
             "exchanges": ["binance", "bybit", "gateio", "bitget"],
             "filter_by_min_effective_cost": None,
             "gap_tolerance_ohlcvs_minutes": 120.0,
+            "initial_positions": {},
             "liquidation_threshold": 0.05,
             "lighter_data_dir": "caches/ohlcv/lighter/1m",
             "maker_fee_override": None,
@@ -2097,6 +2099,12 @@ def get_template_config():
             "warmup_ratio": 0.2,
             "warmup_concurrency": 0,
             "max_concurrent_api_requests": None,
+            "wfo_rolling": {
+                "enabled": False,
+                "active_dir": "runs/walkforward/live",
+                "max_loss_flatten_frac": 0.05,
+                "check_interval_minutes": 60.0,
+            },
         },
         "logging": {
             "level": 1,

@@ -1340,6 +1340,14 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<u64>())
             .transpose()?
             .unwrap_or(1), // default to 1m candles
+        initial_positions_long: match dict.get_item("initial_positions_long")? {
+            Some(item) if !item.is_none() => item.extract::<Vec<(usize, f64, f64)>>()?,
+            _ => Vec::new(),
+        },
+        initial_positions_short: match dict.get_item("initial_positions_short")? {
+            Some(item) if !item.is_none() => item.extract::<Vec<(usize, f64, f64)>>()?,
+            _ => Vec::new(),
+        },
     })
 }
 

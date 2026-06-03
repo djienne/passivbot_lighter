@@ -341,6 +341,85 @@ class TestWindowCacheKey:
 
 
 # ---------------------------------------------------------------------------
+# Per-window train config: proximity gating
+# ---------------------------------------------------------------------------
+class TestBuildTrainConfigProximity:
+    def _base(self):
+        return {"backtest": {}, "optimize": {}}
+
+    def _window(self):
+        from tools.wfo_utils import Window
+
+        return Window(0, "2025-01-01", "2025-07-01", "2025-07-01", "2025-08-01")
+
+    def test_window0_has_no_proximity_penalty(self):
+        from walkforward import build_train_config
+
+        cfg = build_train_config(
+            self._base(), self._window(), seed=0,
+            stop_cfg={"patience": 0, "min_rel_improvement": 0.0, "max_evals": 0},
+            proximity_weight=0.05, reference_config=None, iters=None, n_cpus=None,
+        )
+        # No previous window => no reference => penalty disabled even with weight > 0.
+        assert cfg["optimize"]["proximity"]["weight"] == 0.0
+        assert cfg["optimize"]["proximity"]["reference_config"] == ""
+
+    def test_later_window_has_proximity_penalty(self, tmp_path):
+        from walkforward import build_train_config
+
+        prev = tmp_path / "prev.json"
+        prev.write_text(json.dumps({"bot": {"long": {"x": 1.0}}}), encoding="utf-8")
+        cfg = build_train_config(
+            self._base(), self._window(), seed=1,
+            stop_cfg={"patience": 0, "min_rel_improvement": 0.0, "max_evals": 0},
+            proximity_weight=0.05, reference_config=str(prev), iters=None, n_cpus=None,
+        )
+        assert cfg["optimize"]["proximity"]["weight"] == pytest.approx(0.05)
+        assert cfg["optimize"]["proximity"]["reference_config"]  # resolved abs path
+
+    def test_zero_weight_never_sets_proximity(self, tmp_path):
+        from walkforward import build_train_config
+
+        prev = tmp_path / "prev.json"
+        prev.write_text(json.dumps({"bot": {"long": {"x": 1.0}}}), encoding="utf-8")
+        cfg = build_train_config(
+            self._base(), self._window(), seed=1,
+            stop_cfg={"patience": 0, "min_rel_improvement": 0.0, "max_evals": 0},
+            proximity_weight=0.0, reference_config=str(prev), iters=None, n_cpus=None,
+        )
+        assert cfg["optimize"]["proximity"]["weight"] == 0.0
+        assert cfg["optimize"]["proximity"]["reference_config"] == ""
+
+
+class TestOptimizeOneWindow:
+    def test_raises_window_error_on_optimizer_failure(self, tmp_path):
+        from walkforward import optimize_one_window, WindowOptimizeError
+        from tools.wfo_utils import Window
+
+        base = {"backtest": {}, "optimize": {}, "bot": {"long": {}, "short": {}}}
+        w = Window(0, "2025-01-01", "2025-07-01", "2025-07-01", "2025-08-01")
+        with pytest.raises(WindowOptimizeError) as ei:
+            optimize_one_window(
+                base, w,
+                seed=0,
+                stop_cfg={"patience": 0, "min_rel_improvement": 0.0, "max_evals": 0},
+                proximity_weight=0.0,
+                proximity_reference=None,
+                warm_start=None,
+                scoring_keys=["adg"],
+                train_cfg_path=str(tmp_path / "train.json"),
+                results_dir=str(tmp_path / "res"),
+                log_path=str(tmp_path / "opt.log"),
+                cache_dir=None,
+                no_cache=True,
+                optimize_script=str(tmp_path / "does_not_exist.py"),
+            )
+        assert ei.value.code == 2
+        # The train config is written before the optimizer runs (so it's reusable).
+        assert (tmp_path / "train.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # Optimizer early-stop convergence
 # ---------------------------------------------------------------------------
 import optimize  # noqa: E402

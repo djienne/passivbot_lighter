@@ -73,6 +73,19 @@ WF_DEFAULTS: Dict[str, Any] = {
     "initial_config": "configs/hype_top.json",
     "stop": {"patience": 0, "min_rel_improvement": 0.0, "max_evals": 0},
     "run_id": None,
+    # Backtest fidelity: carry balance + open position across OOS windows and apply
+    # the same boundary handoff rule live uses (see tools/wfo_handoff.should_flatten).
+    "stateful_oos": False,
+    "max_loss_flatten_frac": 0.05,
+    "retrain_delay_days": 0,
+    # Decoupled live scheduler / live-bot rolling parameters.
+    "live_rolling": {
+        "enabled": False,
+        "active_dir": "runs/walkforward/live",
+        "max_loss_flatten_frac": 0.05,
+        "retrain_delay_days": 0,
+        "check_interval_minutes": 60.0,
+    },
 }
 
 
@@ -84,8 +97,8 @@ def resolve_wf_params(wf_block: Dict[str, Any], args: argparse.Namespace) -> Dic
     wf = deepcopy(WF_DEFAULTS)
     if isinstance(wf_block, dict):
         for key, value in wf_block.items():
-            if key == "stop" and isinstance(value, dict):
-                wf["stop"].update(value)
+            if key in ("stop", "live_rolling") and isinstance(value, dict):
+                wf[key].update(value)
             elif value is not None:
                 wf[key] = value
 
@@ -313,6 +326,96 @@ def _load_cached_choice(
         return None
 
 
+class WindowOptimizeError(Exception):
+    """A single window's optimization could not produce a config.
+
+    ``code`` mirrors the orchestrator's historical exit codes: 2 => optimizer
+    subprocess failed; 3 => no usable Pareto front.
+    """
+
+    def __init__(self, code: int, message: str):
+        self.code = int(code)
+        super().__init__(message)
+
+
+def optimize_one_window(
+    base_config: Dict[str, Any],
+    window,
+    *,
+    seed: int,
+    stop_cfg: Dict[str, Any],
+    proximity_weight: float,
+    proximity_reference: Optional[str],
+    warm_start: Optional[str],
+    scoring_keys: List[str],
+    train_cfg_path: str,
+    results_dir: str,
+    log_path: str,
+    iters: Optional[int] = None,
+    n_cpus: Optional[int] = None,
+    cache_dir: Optional[Path] = None,
+    no_cache: bool = False,
+    optimize_script: Optional[str] = None,
+):
+    """Optimize one walk-forward window: build train cfg → cache → optimize → select.
+
+    Shared by the backtest orchestrator (:func:`run`) and the live scheduler
+    (``wfo_scheduler``) so both use one implementation and the same content-addressed
+    cache. Writes the train config to ``train_cfg_path``; on a cache miss runs the
+    optimizer subprocess into ``results_dir`` (logging to ``log_path``) and stores the
+    chosen result in the cache.
+
+    Returns ``(choice: ParetoChoice, cache_key: str, cache_hit: bool)``. Raises
+    :class:`WindowOptimizeError` (code 2 optimizer failed, 3 empty Pareto front).
+    """
+    optimize_script = optimize_script or str(SRC_ROOT / "optimize.py")
+    train_cfg = build_train_config(
+        base_config, window, seed, stop_cfg, float(proximity_weight),
+        proximity_reference, iters, n_cpus,
+    )
+    Path(train_cfg_path).parent.mkdir(parents=True, exist_ok=True)
+    dump_config(train_cfg, str(train_cfg_path))
+
+    cache_key = window_cache_key(train_cfg, warm_start)
+    cache_entry = (cache_dir / cache_key / "choice.json") if cache_dir else None
+    choice: Optional[ParetoChoice] = None
+    cache_hit = False
+    if cache_entry is not None and not no_cache and cache_entry.exists():
+        choice = _load_cached_choice(
+            cache_entry,
+            expected_key=cache_key,
+            expected_window=window.to_dict(),
+            expected_seed=seed,
+        )
+        if choice is not None:
+            cache_hit = True
+            logger.info("window %02d | cache HIT %s -> reusing optimization",
+                        window.index, cache_key[:12])
+        else:
+            logger.info("window %02d | cache entry invalid for %s -> recomputing",
+                        window.index, cache_key[:12])
+
+    if choice is None:
+        opt_cmd = [
+            sys.executable, optimize_script, str(train_cfg_path),
+            "--results-dir", str(results_dir),
+            "--seed", str(seed),
+            "--skip-rust-compile",
+        ]
+        if warm_start:
+            opt_cmd += ["--start", warm_start]
+        rc = _run_subprocess(opt_cmd, Path(log_path))
+        if rc != 0:
+            raise WindowOptimizeError(2, f"optimizer failed (rc={rc}); see {log_path}")
+        choice = select_best_from_pareto(str(Path(results_dir) / "pareto"), scoring_keys)
+        if choice is None:
+            raise WindowOptimizeError(3, f"no usable Pareto front; see {log_path}")
+        if cache_entry is not None and not no_cache:
+            _save_cached_choice(cache_entry, choice, cache_key, window, seed)
+
+    return choice, cache_key, cache_hit
+
+
 def _find_latest(base_dir: str, filename: str) -> Optional[str]:
     matches = glob.glob(os.path.join(base_dir, "**", filename), recursive=True)
     if not matches:
@@ -508,64 +611,38 @@ def run(args: argparse.Namespace) -> int:
             logger.warning("Warm-start config not found: %s (continuing without)", warm_start)
             warm_start = None
 
-        train_cfg = build_train_config(
-            base_config, w, seed, wf["stop"], float(wf["proximity_weight"]),
-            warm_start, args.iters, args.n_cpus,
-        )
-        train_cfg_path = train_dir / "train_config.json"
-        dump_config(train_cfg, str(train_cfg_path))
+        # Proximity reference is the PREVIOUS window's optimized config only (None on
+        # window 0). Window 0 is warm-started from the initial config but optimizes
+        # freely; the "don't drift far per slide" bias only applies between consecutive
+        # windows, not toward the hand-tuned initial config.
+        proximity_reference = prev_config_path  # None on window 0
 
         # Deterministic content-addressed cache: identical meta-parameters
         # (initial config, seed, period, stop criteria, base config) => identical
-        # result, so reuse a prior optimization instead of recomputing. The same
-        # key is reproduced by any backtest or live rerun.
-        cache_key = window_cache_key(train_cfg, warm_start)
-        cache_entry = (cache_dir / cache_key / "choice.json") if cache_dir else None
-        choice = None
-        cache_hit = False
-        if cache_entry is not None and not args.no_cache and cache_entry.exists():
-            choice = _load_cached_choice(
-                cache_entry,
-                expected_key=cache_key,
-                expected_window=w.to_dict(),
-                expected_seed=seed,
+        # result, reused by any backtest or live rerun (see optimize_one_window).
+        try:
+            choice, cache_key, cache_hit = optimize_one_window(
+                base_config, w,
+                seed=seed,
+                stop_cfg=wf["stop"],
+                proximity_weight=float(wf["proximity_weight"]),
+                proximity_reference=proximity_reference,
+                warm_start=warm_start,
+                scoring_keys=scoring_keys,
+                train_cfg_path=str(train_dir / "train_config.json"),
+                results_dir=str(train_dir / "optimize_results"),
+                log_path=str(train_dir / "optimize.log"),
+                iters=args.iters,
+                n_cpus=args.n_cpus,
+                cache_dir=cache_dir,
+                no_cache=args.no_cache,
+                optimize_script=optimize_script,
             )
-            if choice is not None:
-                cache_hit = True
-                logger.info("window %02d | cache HIT %s -> reusing optimization",
-                            w.index, cache_key[:12])
-            else:
-                logger.info("window %02d | cache entry invalid for %s -> recomputing",
-                            w.index, cache_key[:12])
-
-        if choice is None:
-            results_dir = train_dir / "optimize_results"
-            opt_cmd = [
-                sys.executable, optimize_script, str(train_cfg_path),
-                "--results-dir", str(results_dir),
-                "--seed", str(seed),
-                "--skip-rust-compile",
-            ]
-            if warm_start:
-                opt_cmd += ["--start", warm_start]
-            rc = _run_subprocess(opt_cmd, train_dir / "optimize.log")
-            if rc != 0:
-                logger.error("Optimizer failed for window %02d (rc=%d); see %s",
-                             w.index, rc, train_dir / "optimize.log")
-                if not args.keep_going:
-                    return 2
-                continue
-
-            choice = select_best_from_pareto(str(results_dir / "pareto"), scoring_keys)
-            if choice is None:
-                logger.error("No usable Pareto front for window %02d; see %s",
-                             w.index, train_dir / "optimize.log")
-                if not args.keep_going:
-                    return 3
-                continue
-
-            if cache_entry is not None and not args.no_cache:
-                _save_cached_choice(cache_entry, choice, cache_key, w, seed)
+        except WindowOptimizeError as exc:
+            logger.error("window %02d | %s", w.index, exc)
+            if not args.keep_going:
+                return exc.code
+            continue
 
         # Save the chosen config (a complete config: backtest- and live-ready).
         train_best_path = wdir / "train_best.json"

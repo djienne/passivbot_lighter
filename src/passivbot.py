@@ -403,6 +403,11 @@ class Passivbot:
         # Legacy EMA caches removed; use CandlestickManager EMA helpers
         # Legacy ohlcvs_1m fields removed in favor of CandlestickManager
         self.stop_signal_received = False
+        # Walk-forward live rolling: when set, the execution loop exits cleanly so
+        # main() can rebuild the bot with the freshly published config (in-process
+        # restart that works both locally and in docker). Unlike stop_signal_received,
+        # this does NOT exit the process.
+        self.soft_restart_requested = False
         self.cca = None
         self.ccp = None
         self.create_ccxt_sessions()
@@ -1193,7 +1198,7 @@ class Passivbot:
         """Main execution loop coordinating order generation and exchange interaction."""
         failed_update_pos_oos_pnls_ohlcvs_count = 0
         max_n_fails = 30
-        while not self.stop_signal_received:
+        while not self.stop_signal_received and not self.soft_restart_requested:
             try:
                 self.execution_scheduled = False
                 self.state_change_detected_by_symbol = set()
@@ -5124,6 +5129,128 @@ class Passivbot:
                 traceback.print_exc()
                 await asyncio.sleep(5)
 
+    async def maintain_wfo_rolling(self):
+        """Watch the scheduler's published config and roll the strategy monthly.
+
+        Decoupled from the heavy optimizer (which runs in a separate scheduler
+        process). This only reacts to the published active.json + the calendar:
+        adopt a newly published config (soft restart) or wind down trading at a month
+        boundary while the next month's optimization is still running. Opt-in via
+        live.wfo_rolling.enabled.
+        """
+        wr = (self.config.get("live", {}) or {}).get("wfo_rolling", {}) or {}
+        interval_s = max(60.0, float(wr.get("check_interval_minutes", 60.0) or 60.0) * 60.0)
+        active_path = Path(wr.get("active_dir", "runs/walkforward/live")) / "active.json"
+        logging.info("Starting wfo rolling watcher (active=%s, every %.0fs)", active_path, interval_s)
+        while not self.stop_signal_received and not self.soft_restart_requested:
+            try:
+                await self._wfo_rolling_tick(active_path, wr)
+            except Exception as e:
+                logging.error("wfo rolling watcher error: %s", e)
+                traceback.print_exc()
+            for _ in range(int(interval_s)):
+                if self.stop_signal_received or self.soft_restart_requested:
+                    break
+                await asyncio.sleep(1)
+
+    async def _wfo_rolling_tick(self, active_path: Path, wr: dict):
+        from tools.wfo_handoff import decide_rolling_state, current_live_window
+        from utils import ts_to_date
+
+        if not active_path.exists():
+            logging.debug("wfo: no active.json yet at %s", active_path)
+            return
+        try:
+            with open(active_path, "r", encoding="utf-8") as fh:
+                pub = json.load(fh)
+        except Exception as e:
+            logging.warning("wfo: could not read %s: %s", active_path, e)
+            return
+
+        published_period = pub.get("period")
+        loaded_period = self.config.get("_wfo_loaded_period")
+        params = pub.get("params", {}) or {}
+        anchor = pub.get("anchor_start")
+        tw = pub.get("train_window", {}) or {}
+        published_test_start = tw.get("test_start")
+        today = ts_to_date(utc_ms())[:10]
+        today_test_start = None
+        if anchor and params:
+            try:
+                cur = current_live_window(
+                    anchor, int(params["train_months"]), int(params["test_months"]),
+                    int(params["step_months"]), today, bool(params.get("calendar_months", True)),
+                )
+                today_test_start = cur.test_start if cur else None
+            except Exception as e:
+                logging.warning("wfo: could not compute current window: %s", e)
+
+        state = decide_rolling_state(
+            loaded_period, published_period, today_test_start, published_test_start
+        )
+        if state == "ADOPT":
+            logging.info(
+                "wfo: newly published config (%s != loaded %s) -> soft restart to adopt",
+                published_period, loaded_period,
+            )
+            self.soft_restart_requested = True
+            return
+        if state == "WIND_DOWN":
+            await self._wfo_wind_down(wr)
+        # NORMAL: nothing to do (a freshly (re)started process runs in normal modes).
+
+    async def _wfo_wind_down(self, wr: dict):
+        """Pause new entries and apply the month-boundary position-handoff rule.
+
+        Sets tp_only globally (no new entries; profitable take-profit closes kept) and
+        force-closes (panic / market) any position that is in profit or whose unrealized
+        loss is below ``max_loss_flatten_frac`` of total wallet equity. Larger losers are
+        kept for the next period's config to inherit (see tools/wfo_handoff.should_flatten).
+        """
+        from tools.wfo_handoff import should_flatten
+
+        max_frac = float(wr.get("max_loss_flatten_frac", 0.05) or 0.05)
+        self.config["live"]["forced_mode_long"] = "tp_only"
+        self.config["live"]["forced_mode_short"] = "tp_only"
+
+        positions = [p for p in (getattr(self, "fetched_positions", None) or []) if p.get("size")]
+        if not positions:
+            logging.info("wfo wind-down: tp_only engaged (no open positions to evaluate)")
+            return
+        try:
+            upnl_sum = await self.calc_upnl_sum()
+        except Exception:
+            upnl_sum = 0.0
+        equity = float(getattr(self, "balance", 0.0) or 0.0) + float(upnl_sum)
+
+        symbols = sorted({p["symbol"] for p in positions})
+        try:
+            last_prices = await self.cm.get_last_prices(set(symbols), max_age_ms=60_000)
+        except Exception as e:
+            logging.warning("wfo wind-down: could not fetch prices (%s); holding all positions", e)
+            return
+
+        n_flatten = 0
+        for p in positions:
+            sym = p["symbol"]
+            pside = p["position_side"]
+            mark = last_prices.get(sym)
+            if mark is None:
+                continue
+            upnl = calc_pnl(
+                pside, p["price"], mark, p["size"], self.inverse, self.c_mults.get(sym, 1.0)
+            )
+            if should_flatten(upnl, equity, max_frac):
+                self.coin_overrides.setdefault(sym, {}).setdefault("live", {})[
+                    f"forced_mode_{pside}"
+                ] = "panic"
+                n_flatten += 1
+        logging.info(
+            "wfo wind-down: tp_only (no new entries); flattening %d/%d position(s) "
+            "(profit or <%.1f%% TWE loss); keeping the rest for the new config",
+            n_flatten, len(positions), max_frac * 100.0,
+        )
+
     async def start_data_maintainers(self):
         """Spawn background tasks responsible for market metadata and order watching."""
         if hasattr(self, "maintainers"):
@@ -5133,6 +5260,9 @@ class Passivbot:
             maintainer_names.append("watch_orders")
         else:
             logging.info("Websocket maintainers skipped (ws disabled via custom endpoints).")
+        if bool((self.config.get("live", {}).get("wfo_rolling", {}) or {}).get("enabled")):
+            maintainer_names.append("maintain_wfo_rolling")
+            logging.info("Walk-forward live rolling enabled; starting wfo watcher.")
         self.maintainers = {
             name: asyncio.create_task(getattr(self, name)()) for name in maintainer_names
         }
@@ -5611,6 +5741,46 @@ async def shutdown_bot(bot):
         print(f"Error during shutdown: {e}")
 
 
+def _maybe_adopt_wfo_config(pristine_config: dict) -> dict:
+    """Build the run config for one main-loop iteration when walk-forward live rolling
+    is enabled: a fresh copy of the operator's pristine base config with the latest
+    *published* strategy (the ``bot`` section) swapped in.
+
+    Credentials and all live/operational settings stay from the operator's base config;
+    only the optimized strategy rolls. Rebuilding from the pristine base each iteration
+    guarantees wind-down mode mutations never leak across restarts. Falls back to the
+    base strategy if nothing has been published yet.
+    """
+    cfg = deepcopy(pristine_config)
+    wr = (cfg.get("live", {}) or {}).get("wfo_rolling", {}) or {}
+    active_dir = Path(wr.get("active_dir", "runs/walkforward/live"))
+    active_path = active_dir / "active.json"
+    if not active_path.exists():
+        logging.info("wfo: no published active config yet; running the base strategy.")
+        return cfg
+    try:
+        with open(active_path, "r", encoding="utf-8") as fh:
+            pub = json.load(fh)
+        # Resolve the published config co-located with active.json (portable across
+        # machines/OSes: a Windows-generated pointer is consumable on a Linux VPS).
+        cfg_name = pub.get("config_path") or "active_config.json"
+        cfg_path = cfg_name if os.path.isabs(cfg_name) else str(active_dir / os.path.basename(cfg_name))
+        if not os.path.exists(cfg_path):
+            cfg_path = str(active_dir / "active_config.json")
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            published = json.load(fh)
+        if isinstance(published.get("bot"), dict):
+            cfg["bot"] = deepcopy(published["bot"])
+        cfg["_wfo_loaded_period"] = pub.get("period")
+        logging.info(
+            "wfo: adopted strategy for period %s (hash %s)",
+            pub.get("period"), pub.get("chosen_hash"),
+        )
+    except Exception as e:
+        logging.error("wfo: failed to adopt published config (%s); running base strategy.", e)
+    return cfg
+
+
 async def main():
     """Entry point: parse CLI args, load config, and launch the bot lifecycle."""
     parser = argparse.ArgumentParser(prog="passivbot", description="run passivbot")
@@ -5748,9 +5918,14 @@ async def main():
     config = parse_overrides(config, verbose=True)
     cooldown_secs = 60
     restarts = []
+    # Walk-forward live rolling: rebuild each run from a pristine base so wind-down
+    # mode mutations never leak across restarts, and adopt the latest published config.
+    wfo_enabled = bool((config.get("live", {}) or {}).get("wfo_rolling", {}).get("enabled"))
+    pristine_config = deepcopy(config) if wfo_enabled else None
     while True:
+        run_config = _maybe_adopt_wfo_config(pristine_config) if wfo_enabled else config
 
-        bot = setup_bot(config)
+        bot = setup_bot(run_config)
         try:
             await bot.start_bot()
         except Exception as e:
@@ -5768,6 +5943,14 @@ async def main():
         if bot.stop_signal_received:
             logging.info("Bot stopped via signal; exiting main loop.")
             break
+
+        # Walk-forward soft restart (monthly roll / adopt new config): re-enter the loop
+        # promptly and rebuild from the freshly published config. Not an error, so it is
+        # not charged against the daily restart budget.
+        if getattr(bot, "soft_restart_requested", False):
+            logging.info("Soft restart (walk-forward roll): reloading active config...")
+            await asyncio.sleep(5)
+            continue
 
         logging.info(f"restarting bot...")
         print()

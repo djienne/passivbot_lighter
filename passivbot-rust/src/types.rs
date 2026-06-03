@@ -232,6 +232,11 @@ pub struct BacktestParams {
     pub market_order_slippage_pct: f64,
     pub forager_score_hysteresis_pct: f64,
     pub candle_interval_minutes: u64, // 1 for 1m candles (default), 5 for 5m, etc.
+    // Walk-forward stateful carry-over: positions inherited from the previous
+    // segment as (coin_index, size, price). Empty (default) => start flat, i.e.
+    // byte-identical to the historical behavior.
+    pub initial_positions_long: Vec<(usize, f64, f64)>,
+    pub initial_positions_short: Vec<(usize, f64, f64)>,
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]

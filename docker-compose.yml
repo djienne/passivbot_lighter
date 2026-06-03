@@ -24,3 +24,28 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # Decoupled walk-forward scheduler: runs the heavy monthly optimization out of the
+  # memory-limited live container and publishes the active config under runs/walkforward/live/.
+  # Enable per config via walk_forward.live_rolling; the live bot reads the published config.
+  passivbot-wfo-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile_live
+    image: passivbot-lighter:latest
+    container_name: passivbot-wfo-scheduler
+    restart: unless-stopped
+    volumes:
+      - ./:/app/
+    working_dir: /app
+    command: python src/wfo_scheduler.py --config configs/wfo_hype.json
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    profiles: ["wfo"]

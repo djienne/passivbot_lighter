@@ -181,6 +181,11 @@ breaks on the patience condition and logs the stop reason); `max_evals` caps `ng
 - `proximity_weight = 0` ⇒ **pure warm-start** (no penalty); higher values enforce more
   stickiness. The penalty is added to each minimized objective (not only the constraint
   term) to preserve NSGA-II front diversity.
+- **Window 0 is the exception:** it has no previous window, so it is only *warm-started*
+  from the initial config (R9) and optimizes **without** a proximity penalty (its
+  `proximity.weight` is forced to 0 regardless of `proximity_weight`). The penalty
+  applies from window 1 onward, biasing each window toward the previous *optimized*
+  window — not toward the hand-tuned initial config, which was fit on other data.
 
 **Meta-parameter:** `proximity_weight` (and, internally per window,
 `optimize.proximity.reference_config` pointing at the previous window's config).
@@ -253,9 +258,16 @@ pass the previous `train_best.json`.
 > completion criteria, …) are the same."
 
 - Because a window's result is fully determined by its meta-parameters, each window's
-  optimization is **content-addressed and cached**. A later run — whether triggered by
-  a backtest or by the live bot — that has the **same meta-parameters** must **detect
-  and reuse** the cached result instead of recomputing.
+  optimization is **content-addressed and cached**. Any later **walk-forward rerun**
+  with the **same meta-parameters** — whether you run it to produce a backtest track
+  record or to refresh the live config — **detects and reuses** the cached result
+  instead of recomputing. The chosen config is then deployed / re-backtested as an
+  ordinary config file; the **live bot loads that file** (`latest_config.json` or a
+  `configs_history/` entry) and does not query the cache directly. There is no
+  standalone "fetch this window from the cache" path because a window's key depends on
+  all prior windows via the warm-start chain — so reuse is realized by replaying the
+  chain through the cache, which is exactly what a rerun does (cheap: matched windows
+  are cache hits).
 - The **cache key** is a hash of the meta-parameters that determine the result:
   - the cleaned training config — bot **parameter bounds**, scoring, limits, **seed**,
     **stop criteria**, **proximity weight**, **training period dates**, exchanges,

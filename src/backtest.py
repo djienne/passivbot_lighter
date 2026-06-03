@@ -433,6 +433,34 @@ def build_backtest_payload(
         requested_start_ts = int(date_to_ts(require_config_value(config, "backtest.start_date")))
     backtest_params["requested_start_timestamp_ms"] = requested_start_ts
 
+    # Walk-forward stateful carry-over: positions inherited from the previous OOS
+    # segment, keyed by coin name and mapped to the engine's coin index. Absent =>
+    # start flat (default, byte-identical to historical behavior).
+    init_pos = (config.get("backtest", {}) or {}).get("initial_positions") or {}
+    ip_long: list = []
+    ip_short: list = []
+    if init_pos:
+        coin_to_idx = {c: i for i, c in enumerate(coins_order)}
+        for coin, sides in init_pos.items():
+            idx = coin_to_idx.get(coin)
+            if idx is None or not isinstance(sides, dict):
+                continue
+            for pside, target in (("long", ip_long), ("short", ip_short)):
+                leg = sides.get(pside)
+                if not leg:
+                    continue
+                if isinstance(leg, dict):
+                    size = float(leg.get("size", 0.0) or 0.0)
+                    price = float(leg.get("price", 0.0) or 0.0)
+                else:  # [size, price]
+                    size = float(leg[0])
+                    price = float(leg[1])
+                if size != 0.0 and price > 0.0:
+                    # Tuples (not lists): the Rust engine extracts Vec<(usize, f64, f64)>.
+                    target.append((int(idx), size, price))
+    backtest_params["initial_positions_long"] = ip_long
+    backtest_params["initial_positions_short"] = ip_short
+
     bundle = _build_hlcvs_bundle(
         hlcvs,
         btc_usd_prices,
