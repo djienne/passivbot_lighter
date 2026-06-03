@@ -52,6 +52,7 @@ from tools.wfo_utils import (  # noqa: E402
     stitch_oos_equity,
 )
 from tools.wfo_handoff import advance_carry  # noqa: E402
+from tools.wfo_meta import WF_DEFAULTS, merge_wf_params, load_wf_meta  # noqa: E402,F401
 
 logger = logging.getLogger("walkforward")
 
@@ -61,47 +62,21 @@ logger = logging.getLogger("walkforward")
 # shared path makes every window, OOS backtest, and future rerun reuse one cache.
 SHARED_LIGHTER_DATA_DIR = str((REPO_ROOT / "caches" / "ohlcv" / "lighter" / "1m").resolve())
 
-WF_DEFAULTS: Dict[str, Any] = {
-    "train_months": 6,
-    "test_months": 1,
-    "step_months": 1,
-    "start_date": None,
-    "end_date": None,
-    "base_seed": 0,
-    "calendar_months": True,
-    "min_test_days": 7,
-    "proximity_weight": 0.0,
-    "initial_config": "configs/hype_top.json",
-    "stop": {"patience": 0, "min_rel_improvement": 0.0, "max_evals": 0},
-    "run_id": None,
-    # Backtest fidelity: carry balance + open position across OOS windows and apply
-    # the same boundary handoff rule live uses (see tools/wfo_handoff.should_flatten).
-    "stateful_oos": False,
-    "max_loss_flatten_frac": 0.05,
-    "retrain_delay_days": 0,
-    # Decoupled live scheduler / live-bot rolling parameters.
-    "live_rolling": {
-        "enabled": False,
-        "active_dir": "runs/walkforward/live",
-        "max_loss_flatten_frac": 0.05,
-        "retrain_delay_days": 0,
-        "check_interval_minutes": 60.0,
-    },
-}
+# WF_DEFAULTS now lives in tools/wfo_meta.py (single home, shared with the scheduler
+# and the stand-alone meta-file loader); it is re-imported above for back-compat.
 
 
 # ---------------------------------------------------------------------------
 # Config / parameter resolution
 # ---------------------------------------------------------------------------
 def resolve_wf_params(wf_block: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    """Merge precedence: CLI > walk_forward block > defaults."""
-    wf = deepcopy(WF_DEFAULTS)
-    if isinstance(wf_block, dict):
-        for key, value in wf_block.items():
-            if key in ("stop", "live_rolling") and isinstance(value, dict):
-                wf[key].update(value)
-            elif value is not None:
-                wf[key] = value
+    """Merge precedence: CLI > walk_forward block (or meta file) > defaults.
+
+    ``wf_block`` may be a raw ``walk_forward`` config block or an already-merged
+    meta dict (re-merging a full dict is idempotent), so this also applies CLI
+    overrides on top of a ``--meta``-loaded param set.
+    """
+    wf = merge_wf_params(wf_block)
 
     cli_map = {
         "train_months": args.train_months,
@@ -276,6 +251,11 @@ def window_cache_key(train_cfg: Dict[str, Any], warm_start_path: Optional[str]) 
         bt.pop(key, None)  # machine-specific data location, not a meta-parameter
     live = cfg.get("live", {}) or {}
     live.pop("base_config_path", None)
+    # Live-only rolling/operational knobs (incl. the month-boundary loss threshold)
+    # affect OOS carry and live behavior, never the training result, so they must not
+    # invalidate the optimization cache ("Smart" reuse: editing the meta-file threshold
+    # re-runs only the cheap OOS evaluation, not the optimization).
+    live.pop("wfo_rolling", None)
     opt = cfg.get("optimize", {}) or {}
     opt.pop("n_cpus", None)  # cpu count does not affect the (index-assigned) result
     prox = opt.get("proximity", {}) or {}
@@ -516,10 +496,20 @@ def _is_metric_from_pareto(metrics: Dict[str, Any], key: str) -> Optional[float]
 # Main orchestration
 # ---------------------------------------------------------------------------
 def run(args: argparse.Namespace) -> int:
-    config_path = _abspath(args.config)
-    raw = load_hjson_config(config_path)
-    wf_block = raw.get("walk_forward", {}) if isinstance(raw, dict) else {}
-    wf = resolve_wf_params(wf_block, args)
+    if bool(args.meta) == bool(args.config):
+        logger.error("Provide exactly one of --meta (stand-alone meta file) or --config "
+                     "(config with an embedded walk_forward block).")
+        return 1
+
+    if args.meta:
+        # Stand-alone meta file: knobs from the meta, bounds/optimize/universe from base_config.
+        wf, config_path = load_wf_meta(args.meta)
+        wf = resolve_wf_params(wf, args)  # CLI overrides on top (re-merge is idempotent)
+    else:
+        config_path = _abspath(args.config)
+        raw = load_hjson_config(config_path)
+        wf_block = raw.get("walk_forward", {}) if isinstance(raw, dict) else {}
+        wf = resolve_wf_params(wf_block, args)
 
     # Clean, formatted base config for children (walk_forward stripped by format_config).
     base_config = load_config(config_path, verbose=False)
@@ -612,7 +602,7 @@ def run(args: argparse.Namespace) -> int:
     # previous segment's carried balance + open positions (handoff rule applied in
     # between), yielding one continuous equity curve instead of flat-restart segments.
     stateful_oos = bool(wf.get("stateful_oos"))
-    max_loss_flatten_frac = float(wf.get("max_loss_flatten_frac", 0.05) or 0.05)
+    max_loss_flatten_frac = float(wf.get("max_loss_flatten_frac", 0.02) or 0.02)
     base_starting_balance = float(base_config.get("backtest", {}).get("starting_balance", 1.0) or 1.0)
     carry: Dict[str, Any] = {"balance": base_starting_balance, "positions": {}}
 
@@ -848,7 +838,12 @@ def _maybe_plot(equity: List[float], out_path: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="walkforward", description="Walk-forward optimization")
-    parser.add_argument("--config", required=True, help="Path to WFO config (with walk_forward block)")
+    parser.add_argument("--meta", type=str, default=None,
+                        help="Path to a stand-alone walk-forward meta file (configs/wfo_meta.json); "
+                             "references a base_config for bot bounds / optimize / universe")
+    parser.add_argument("--config", default=None,
+                        help="Path to WFO config with an embedded walk_forward block "
+                             "(legacy; use --meta or --config)")
     parser.add_argument("--train-months", type=int, default=None)
     parser.add_argument("--test-months", type=int, default=None)
     parser.add_argument("--step-months", type=int, default=None)

@@ -5196,20 +5196,27 @@ class Passivbot:
             self.soft_restart_requested = True
             return
         if state == "WIND_DOWN":
-            await self._wfo_wind_down(wr)
+            await self._wfo_wind_down(wr, params)
         # NORMAL: nothing to do (a freshly (re)started process runs in normal modes).
 
-    async def _wfo_wind_down(self, wr: dict):
+    async def _wfo_wind_down(self, wr: dict, params: dict = None):
         """Pause new entries and apply the month-boundary position-handoff rule.
 
         Sets tp_only globally (no new entries; profitable take-profit closes kept) and
         force-closes (panic / market) any position that is in profit or whose unrealized
         loss is below ``max_loss_flatten_frac`` of total wallet equity. Larger losers are
         kept for the next period's config to inherit (see tools/wfo_handoff.should_flatten).
+
+        The threshold's single source is the walk-forward meta file, published into
+        ``active.json`` params by the scheduler; the bot's local ``live.wfo_rolling``
+        value is only a fallback for when the publisher predates this field.
         """
         from tools.wfo_handoff import should_flatten
 
-        max_frac = float(wr.get("max_loss_flatten_frac", 0.05) or 0.05)
+        params = params or {}
+        max_frac = float(
+            params.get("max_loss_flatten_frac", wr.get("max_loss_flatten_frac", 0.02)) or 0.02
+        )
         self.config["live"]["forced_mode_long"] = "tp_only"
         self.config["live"]["forced_mode_short"] = "tp_only"
 

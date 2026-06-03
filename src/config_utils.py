@@ -2103,7 +2103,7 @@ def get_template_config():
             "wfo_rolling": {
                 "enabled": False,
                 "active_dir": "runs/walkforward/live",
-                "max_loss_flatten_frac": 0.05,
+                "max_loss_flatten_frac": 0.02,
                 "check_interval_minutes": 60.0,
             },
         },

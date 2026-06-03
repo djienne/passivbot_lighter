@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - fallback when imported as a package
 def should_flatten(
     unrealized_pnl: float,
     total_wallet_equity: float,
-    max_loss_frac: float = 0.05,
+    max_loss_frac: float = 0.02,
 ) -> bool:
     """Decide whether to close a position at a month boundary.
 
@@ -41,7 +41,7 @@ def should_flatten(
 
     - ``unrealized_pnl``       signed uPnL in quote currency (>0 = profit).
     - ``total_wallet_equity``  balance + summed uPnL, in quote currency.
-    - ``max_loss_frac``        loss tolerance as a fraction of equity (default 5%).
+    - ``max_loss_frac``        loss tolerance as a fraction of equity (default 2%).
 
     Returns ``True`` to flatten (close), ``False`` to keep.
 
@@ -58,7 +58,7 @@ def should_flatten(
 # ---------------------------------------------------------------------------
 # Backtest stateful carry between OOS segments
 # ---------------------------------------------------------------------------
-def advance_carry(end_state: dict, max_loss_frac: float = 0.05) -> dict:
+def advance_carry(end_state: dict, max_loss_frac: float = 0.02) -> dict:
     """Compute the next OOS segment's seed (balance + positions) from this segment's
     end-state, applying the same handoff rule (``should_flatten``) the live bot uses.
 

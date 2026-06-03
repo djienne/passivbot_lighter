@@ -29,7 +29,6 @@ import logging
 import os
 import sys
 import time
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -43,8 +42,8 @@ from utils import ts_to_date, utc_ms  # noqa: E402
 from logging_setup import configure_logging  # noqa: E402
 from tools.wfo_utils import generate_windows  # noqa: E402
 from tools.wfo_handoff import current_live_window  # noqa: E402
+from tools.wfo_meta import WF_DEFAULTS, merge_wf_params, load_wf_meta  # noqa: E402,F401
 from walkforward import (  # noqa: E402
-    WF_DEFAULTS,
     optimize_one_window,
     WindowOptimizeError,
     _abspath,
@@ -57,13 +56,7 @@ logger = logging.getLogger("wfo_scheduler")
 # Param resolution (config block + a few CLI overrides; CLI > config > default)
 # ---------------------------------------------------------------------------
 def resolve_params(wf_block: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    wf = deepcopy(WF_DEFAULTS)
-    if isinstance(wf_block, dict):
-        for key, value in wf_block.items():
-            if key in ("stop", "live_rolling") and isinstance(value, dict):
-                wf[key].update(value)
-            elif value is not None:
-                wf[key] = value
+    wf = merge_wf_params(wf_block)
     if getattr(args, "initial_config", None):
         wf["initial_config"] = args.initial_config
     if getattr(args, "cache_dir", None):
@@ -248,6 +241,9 @@ def run_once(
             "base_seed": base_seed,
             "calendar_months": calendar_months,
             "proximity_weight": float(wf["proximity_weight"]),
+            # Single source of truth for the live month-boundary handoff threshold:
+            # meta file -> scheduler -> active.json -> bot (see passivbot._wfo_wind_down).
+            "max_loss_flatten_frac": float(wf["max_loss_flatten_frac"]),
         },
     }
     _publish(active_dir, last_choice.config, pointer)
@@ -264,10 +260,19 @@ def run_once(
 
 
 def run(args: argparse.Namespace) -> int:
-    config_path = _abspath(args.config)
-    raw = load_hjson_config(config_path)
-    wf_block = raw.get("walk_forward", {}) if isinstance(raw, dict) else {}
-    wf = resolve_params(wf_block, args)
+    if bool(args.meta) == bool(args.config):
+        logger.error("Provide exactly one of --meta (stand-alone meta file) or --config "
+                     "(config with an embedded walk_forward block).")
+        return 1
+
+    if args.meta:
+        wf, config_path = load_wf_meta(args.meta)
+        wf = resolve_params(wf, args)  # CLI overrides on top (re-merge is idempotent)
+    else:
+        config_path = _abspath(args.config)
+        raw = load_hjson_config(config_path)
+        wf_block = raw.get("walk_forward", {}) if isinstance(raw, dict) else {}
+        wf = resolve_params(wf_block, args)
     base_config = load_config(config_path, verbose=False)
 
     if args.once or args.dry_run:
@@ -287,7 +292,10 @@ def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wfo_scheduler", description="Walk-forward live scheduler")
-    p.add_argument("--config", required=True, help="WFO config (with walk_forward block)")
+    p.add_argument("--meta", type=str, default=None,
+                   help="Stand-alone walk-forward meta file (configs/wfo_meta.json)")
+    p.add_argument("--config", default=None,
+                   help="WFO config with an embedded walk_forward block (legacy)")
     p.add_argument("--once", action="store_true", help="Run a single tick and exit")
     p.add_argument("--dry-run", action="store_true", help="Print the current window plan and exit")
     p.add_argument("--initial-config", type=str, default=None,

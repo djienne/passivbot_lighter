@@ -1,0 +1,62 @@
+{
+  // ---------------------------------------------------------------------------
+  // Walk-forward META-PARAMETERS — single source of truth for the rolling schedule.
+  //
+  // Edit this one small file to experiment with the schedule. It is read by:
+  //   - src/walkforward.py   (backtest)   :  --meta configs/wfo_meta.json
+  //   - src/wfo_scheduler.py (live)       :  --meta configs/wfo_meta.json
+  //   - src/passivbot.py     (live bot)   :  via the published active.json
+  //
+  // CHANGE => RE-OPTIMIZE? Changing any TRAINING-affecting field below
+  // (train/test/step_months, dates, base_seed, stop.*, proximity_weight,
+  // initial_config, or the base_config's bounds/optimize) changes the per-window
+  // cache key, so ALL monthly optimizations are redone automatically on the next
+  // run. The carry-only fields (max_loss_flatten_frac, stateful_oos,
+  // retrain_delay_days) do NOT affect training: changing them re-runs only the
+  // fast OOS evaluation while reusing every cached optimization.
+  // ---------------------------------------------------------------------------
+
+  // Where the bot BOUNDS (search space), optimize budget (iters / population /
+  // scoring / limits) and the trading universe (exchanges / coins / starting
+  // balance) come from. This file does not duplicate those.
+  "base_config": "configs/wfo_hype.json",
+
+  // Warm-start seed for window 0 (the start of history). Later windows warm-start
+  // from the previous window's chosen config.
+  "initial_config": "configs/hype_top.json",
+
+  // --- rolling sets ---
+  "train_months": 6,
+  "test_months": 1,
+  "step_months": 1,
+  "calendar_months": true,
+  "min_test_days": 7,
+
+  // --- determinism & history span ---
+  "base_seed": 0,
+  "start_date": null,            // null => base_config backtest.start_date (start of HYPE history)
+  "end_date": null,              // null => base_config backtest.end_date ("now", pinned once per run)
+
+  // --- parameter stickiness between months (0.0 = pure warm-start) ---
+  "proximity_weight": 0.0,
+
+  // --- optimization stop criteria (convergence early-stop + hard cap) ---
+  "stop": {
+    "patience": 20,
+    "min_rel_improvement": 0.001,
+    "max_evals": 0
+  },
+
+  // --- end-of-month open-position handoff (cut if in profit or small drawdown) ---
+  "max_loss_flatten_frac": 0.02, // cut a position only if uPnL >= 0 or |loss| < 2% of equity
+
+  // --- backtest fidelity (carry balance + open positions across OOS seams) ---
+  "stateful_oos": false,
+  "retrain_delay_days": 0,
+
+  // --- live rolling (operational; enabled toggle stays in the bot's live config) ---
+  "live_rolling": {
+    "active_dir": "runs/walkforward/live",
+    "check_interval_minutes": 60.0
+  }
+}

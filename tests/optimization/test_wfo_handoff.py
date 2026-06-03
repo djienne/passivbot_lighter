@@ -27,12 +27,18 @@ class TestShouldFlatten:
         assert should_flatten(0.0, 1000.0) is True
 
     def test_small_loss_flattens(self):
-        # loss 40 < 5% of 1000 (=50) => flatten
-        assert should_flatten(-40.0, 1000.0) is True
+        # default tolerance is 2%: loss 15 < 2% of 1000 (=20) => flatten
+        assert should_flatten(-15.0, 1000.0) is True
 
     def test_loss_at_threshold_is_kept(self):
-        # loss 50 == 5% of 1000 => NOT < threshold => keep
-        assert should_flatten(-50.0, 1000.0) is False
+        # loss 20 == 2% of 1000 => NOT < threshold => keep
+        assert should_flatten(-20.0, 1000.0) is False
+
+    def test_default_fraction_is_two_percent(self):
+        # loss 30 is below 5% (=50) but above 2% (=20) of 1000:
+        # kept under the new 2% default, flattened only with an explicit 5%.
+        assert should_flatten(-30.0, 1000.0) is False
+        assert should_flatten(-30.0, 1000.0, max_loss_frac=0.05) is True
 
     def test_large_loss_is_kept(self):
         assert should_flatten(-200.0, 1000.0) is False
