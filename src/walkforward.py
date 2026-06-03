@@ -203,12 +203,29 @@ def build_test_config(
     return cfg
 
 
+def _strip_config_metadata(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop non-deterministic config metadata (e.g. _transform_log with per-run
+    timestamps, _raw) so hashes depend only on meaningful content."""
+    return {k: v for k, v in cfg.items() if not (isinstance(k, str) and k.startswith("_"))}
+
+
 def _hash_config_file(path: Optional[str]) -> Optional[str]:
+    """Hash a warm-start config by its strategy parameters only.
+
+    Only the bot section affects optimization (it seeds the initial population), so
+    hashing just that makes the key invariant to run-specific metadata/paths (e.g.
+    live.base_config_path) and therefore reusable across runs/backtests/live.
+    """
     if not path or not os.path.exists(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return calc_hash(json.load(fh))
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("bot"), dict):
+            return calc_hash(data["bot"])
+        if isinstance(data, dict):
+            return calc_hash(_strip_config_metadata(data))
+        return calc_hash(data)
     except Exception:
         return None
 
@@ -223,7 +240,7 @@ def window_cache_key(train_cfg: Dict[str, Any], warm_start_path: Optional[str]) 
     irrelevant fields (output dirs, cpu count, plotting, paths) are excluded so the
     same window reuses a cached result across runs, backtests, and live reruns.
     """
-    cfg = deepcopy(train_cfg)
+    cfg = _strip_config_metadata(deepcopy(train_cfg))  # drop _transform_log/_raw (per-run timestamps)
     cfg.pop("results_dir", None)
     cfg.pop("results_filename", None)
     cfg.pop("disable_plotting", None)

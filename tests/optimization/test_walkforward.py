@@ -235,6 +235,35 @@ class TestWindowCacheKey:
         variant["backtest"]["start_date"] = "2025-02-01"
         assert window_cache_key(base, None) != window_cache_key(variant, None)
 
+    def test_invariant_to_config_metadata_and_base_path(self):
+        from walkforward import window_cache_key
+
+        base = _train_cfg()
+        base.setdefault("live", {})["base_config_path"] = "/runs/A/train_config.json"
+        variant = _train_cfg()
+        # Per-run metadata that must NOT affect the cache key.
+        variant["_transform_log"] = [{"ts_ms": 123456789, "step": "load_config"}]
+        variant["_raw"] = {"whatever": 1}
+        variant.setdefault("live", {})["base_config_path"] = "/runs/B/train_config.json"
+        assert window_cache_key(base, None) == window_cache_key(variant, None)
+
+    def test_warm_start_hash_ignores_metadata_and_base_path(self, tmp_path):
+        from walkforward import window_cache_key
+
+        ws_a = tmp_path / "a.json"
+        ws_b = tmp_path / "b.json"
+        # Same bot params, different run-specific metadata/path => same effective warm-start.
+        ws_a.write_text(json.dumps({
+            "bot": {"long": {"x": 1.0}},
+            "live": {"base_config_path": "/runs/A/x.json"},
+        }))
+        ws_b.write_text(json.dumps({
+            "bot": {"long": {"x": 1.0}},
+            "live": {"base_config_path": "/runs/B/x.json"},
+            "_transform_log": [{"ts_ms": 999}],
+        }))
+        assert window_cache_key(_train_cfg(), str(ws_a)) == window_cache_key(_train_cfg(), str(ws_b))
+
     def test_warm_start_content_changes_key(self, tmp_path):
         from walkforward import window_cache_key
 
