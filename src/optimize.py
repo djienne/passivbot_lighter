@@ -118,6 +118,7 @@ except ImportError:  # pragma: no cover - allow import in minimal test envs
     creator = _DummyCreator()
     tools = algorithms = None
 import math
+import random
 import fcntl
 from optimizer_overrides import optimizer_overrides
 from opt_utils import make_json_serializable, generate_incremental_diff, round_floats, quantize_floats
@@ -355,9 +356,16 @@ def ea_mu_plus_lambda_stream(
     pool,
     duplicate_counter,
     pool_state,
+    stop_cfg=None,
 ):
     logbook = tools.Logbook()
     logbook.header = "gen", "evals", "min", "max"
+    # Convergence-based early stopping (no-op when patience <= 0).
+    stop_cfg = stop_cfg or {}
+    patience = int(stop_cfg.get("patience", 0) or 0)
+    min_rel_improvement = float(stop_cfg.get("min_rel_improvement", 0.0) or 0.0)
+    best_signal = None
+    stale_gens = 0
 
     start_time = time.time()
     total_evals = 0
@@ -493,6 +501,8 @@ def ea_mu_plus_lambda_stream(
         )
         return population, logbook
 
+    completed_gens = 0
+    stop_reason = "max generations reached"
     for gen in range(1, ngen + 1):
         offspring = algorithms.varOr(population, toolbox, lambda_, cxpb, mutpb)
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
@@ -506,12 +516,38 @@ def ea_mu_plus_lambda_stream(
         record = stats.compile(population) if stats is not None else {}
         logbook.record(gen=gen, nevals=nevals, **record)
         log_generation(gen, nevals, record)
+        completed_gens = gen
+
+        # Deterministic convergence check: the per-objective minimums vector is
+        # already compiled each generation; objectives are minimized, so a drop in
+        # their sum is an improvement. Stop after `patience` stale generations.
+        if patience > 0 and record and "min" in record:
+            current_signal = float(np.sum(record["min"]))
+            if best_signal is None:
+                best_signal = current_signal
+            else:
+                denom = abs(best_signal) if abs(best_signal) > 1e-12 else 1.0
+                rel_improvement = (best_signal - current_signal) / denom
+                if rel_improvement > min_rel_improvement:
+                    best_signal = current_signal
+                    stale_gens = 0
+                else:
+                    stale_gens += 1
+            if stale_gens >= patience:
+                stop_reason = (
+                    f"converged: no >{min_rel_improvement:g} relative improvement "
+                    f"for {patience} generations"
+                )
+                logging.info("Early stopping at generation %d (%s)", gen, stop_reason)
+                break
 
     logging.info(
-        "Optimization summary | generations=%d | total_evals=%d | front=%d | duration=%.1fs",
+        "Optimization summary | generations=%d/%d | total_evals=%d | front=%d | stop=%s | duration=%.1fs",
+        completed_gens,
         ngen,
         total_evals,
         len(halloffame) if halloffame is not None else 0,
+        stop_reason,
         time.time() - start_time,
     )
     return population, logbook
@@ -673,6 +709,57 @@ class Evaluator:
             self.scoring_weights.setdefault(f"btc_{metric}", weight)
 
         self.build_limit_checks()
+        self._init_proximity()
+
+    def _init_proximity(self) -> None:
+        """Resolve the optional proximity-penalty reference vector.
+
+        When optimize.proximity.weight > 0 and a reference config is given, candidates
+        are softly biased toward that config's parameters by adding
+        weight * normalized_distance to every objective. Used by walk-forward to keep
+        each window's parameters close to the previous window's chosen config.
+        """
+        prox = self.config.get("optimize", {}).get("proximity", {}) or {}
+        try:
+            self.proximity_weight = float(prox.get("weight", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self.proximity_weight = 0.0
+        self.proximity_reference = None
+        ref_path = prox.get("reference_config") or ""
+        if self.proximity_weight > 0.0 and ref_path:
+            try:
+                ref_cfg = format_config(load_config(ref_path, verbose=False), verbose=False)
+                self.proximity_reference = list(
+                    config_to_individual(ref_cfg, self.bounds, self.sig_digits)
+                )
+                logging.info(
+                    "Proximity penalty active | weight=%.6g | reference=%s",
+                    self.proximity_weight,
+                    ref_path,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "Failed to load proximity reference config %s (%s); disabling proximity penalty",
+                    ref_path,
+                    exc,
+                )
+                self.proximity_reference = None
+
+    def _proximity_penalty(self, individual) -> float:
+        """RMS of per-parameter distance, normalized by each bound's range."""
+        if not self.proximity_weight or self.proximity_reference is None:
+            return 0.0
+        total = 0.0
+        count = 0
+        for i, bound in enumerate(self.bounds):
+            rng = bound.high - bound.low
+            if rng > 0:
+                total += ((individual[i] - self.proximity_reference[i]) / rng) ** 2
+                count += 1
+        if count == 0:
+            return 0.0
+        dist = (total / count) ** 0.5
+        return self.proximity_weight * dist
 
     def _ensure_attached(self, exchange: str) -> None:
         if exchange not in self.shared_hlcvs_np:
@@ -843,6 +930,10 @@ class Evaluator:
         aggregate_stats = scenario_metrics.get("stats", {})
         flat_stats = flatten_metric_stats(aggregate_stats)
         objectives, total_penalty = self.calc_fitness(flat_stats)
+        prox = self._proximity_penalty(individual)
+        if prox:
+            objectives = tuple(o + prox for o in objectives)
+            total_penalty += prox
         objectives_map = {f"w_{i}": val for i, val in enumerate(objectives)}
         metrics_payload = {
             "stats": aggregate_stats,
@@ -1301,6 +1392,20 @@ async def main():
         default=None,
         help="Logging verbosity (warning, info, debug, trace or 0-3).",
     )
+    parser.add_argument(
+        "--seed",
+        dest="seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible optimization (overrides optimize.seed).",
+    )
+    parser.add_argument(
+        "--results-dir",
+        dest="results_dir_override",
+        type=str,
+        default=None,
+        help="Write optimization results to this directory instead of an auto-generated one.",
+    )
     template_config = get_template_config()
     del template_config["bot"]
     keep_live_keys = {
@@ -1325,6 +1430,8 @@ async def main():
         config = load_config(args.config_path, verbose=True)
     update_config_with_args(config, args, verbose=True)
     config = format_config(config, verbose=False)
+    if getattr(args, "seed", None) is not None:
+        config.setdefault("optimize", {})["seed"] = int(args.seed)
     config_logging_value = get_optional_config_value(config, "logging.level", None)
     effective_log_level = resolve_log_level(args.log_level, config_logging_value, fallback=1)
     if effective_log_level != initial_log_level:
@@ -1465,9 +1572,12 @@ async def main():
                 / (1000 * 60 * 60 * 24)
             )
         )
-        results_dir = make_get_filepath(
-            f"optimize_results/{date_fname}_{exchanges_fname}_{n_days}days_{coins_fname}_{hash_snippet}/"
-        )
+        if getattr(args, "results_dir_override", None):
+            results_dir = make_get_filepath(os.path.join(args.results_dir_override, ""))
+        else:
+            results_dir = make_get_filepath(
+                f"optimize_results/{date_fname}_{exchanges_fname}_{n_days}days_{coins_fname}_{hash_snippet}/"
+            )
         os.makedirs(results_dir, exist_ok=True)
         config["results_dir"] = results_dir
         results_filename = os.path.join(results_dir, "all_results.bin")
@@ -1643,6 +1753,17 @@ async def main():
             values = [bound.random_on_grid() for bound in bounds]
             return creator.Individual(values)
 
+        # Seed RNGs for reproducibility. All stochastic operations (population init,
+        # DEAP varOr/mate/mutate, np.random.choice seeding) run in this main process;
+        # per-candidate backtests are deterministic and assigned back by index, so
+        # seeding here makes the whole optimization run reproducible.
+        seed_value = config.get("optimize", {}).get("seed")
+        if seed_value is not None:
+            seed_int = int(seed_value)
+            random.seed(seed_int)
+            np.random.seed(seed_int & 0xFFFFFFFF)
+            logging.info("Optimization RNG seeded with %d", seed_int)
+
         population = [_make_random_individual() for _ in range(population_size)]
         if starting_individuals:
             evaluated_seeds = [creator.Individual(ind) for ind in starting_individuals]
@@ -1683,6 +1804,11 @@ async def main():
         # Run the optimization
         logging.info(f"Starting optimize...")
         lambda_size = max(1, int(round(config["optimize"]["population_size"] * offspring_multiplier)))
+        stop_cfg = config["optimize"].get("stop") or {}
+        ngen = max(1, int(config["optimize"]["iters"] / len(population)))
+        max_evals = int(stop_cfg.get("max_evals", 0) or 0)
+        if max_evals > 0:
+            ngen = min(ngen, max(1, int(max_evals / len(population))))
         population, logbook = ea_mu_plus_lambda_stream(
             population,
             toolbox,
@@ -1690,7 +1816,7 @@ async def main():
             lambda_=lambda_size,
             cxpb=config["optimize"]["crossover_probability"],
             mutpb=config["optimize"]["mutation_probability"],
-            ngen=max(1, int(config["optimize"]["iters"] / len(population))),
+            ngen=ngen,
             stats=stats,
             halloffame=hof,
             verbose=False,
@@ -1700,6 +1826,7 @@ async def main():
             pool=pool,
             duplicate_counter=duplicate_counter,
             pool_state=pool_state,
+            stop_cfg=stop_cfg,
         )
 
         logging.info("Optimization complete.")
