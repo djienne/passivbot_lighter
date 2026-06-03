@@ -270,36 +270,114 @@ def normalized_distance(
 # OOS equity stitching
 # ---------------------------------------------------------------------------
 def stitch_oos_equity(
-    segments: Sequence[Sequence[float]],
+    segments: Sequence[Any],
     starting_balance: float = 1.0,
 ) -> Dict[str, Any]:
     """Splice consecutive OOS equity segments into one continuous curve.
 
-    Each segment is a 1-D sequence of equity values for one OOS window. Segments
-    are chained by compounding each segment's *return* (last/first) onto the
-    running equity, so the stitched curve reflects sequential out-of-sample
-    trading starting from ``starting_balance``.
+    Each segment is either a 1-D sequence of equity values, or a mapping with
+    ``timestamps`` and ``equity`` sequences. Timestamped segments are sorted and
+    duplicate timestamps are skipped, preserving the return from the last
+    overlapping point into the first new point. Untimestamped segments keep the
+    historical behavior: each segment's return is chained onto the running
+    equity.
 
     Returns the stitched curve plus aggregate metrics derived from it.
     """
     stitched: List[float] = []
+    timestamps: List[Any] = []
+    timestamp_to_equity: Dict[Any, float] = {}
+    seen_timestamps = set()
     running = float(starting_balance)
     segment_returns: List[float] = []
     for seg in segments:
-        seg = [float(x) for x in seg if x is not None and math.isfinite(float(x))]
-        if len(seg) < 2 or seg[0] == 0:
+        points = _normalise_oos_segment(seg)
+        if len(points) < 2:
             continue
-        base = seg[0]
-        for value in seg:
-            stitched.append(running * (value / base))
-        seg_ret = seg[-1] / seg[0]
-        segment_returns.append(seg_ret)
-        running = running * seg_ret
+        if points[0][0] is None:
+            values = [value for _, value in points]
+            if values[0] == 0:
+                continue
+            base = values[0]
+            start_running = running
+            for value in values:
+                stitched.append(start_running * (value / base))
+            seg_ret = values[-1] / base
+            segment_returns.append(seg_ret)
+            running = start_running * seg_ret
+            continue
+
+        anchor_value: Optional[float] = None
+        anchor_running: Optional[float] = None
+        segment_start_running = running
+        first_value = points[0][1]
+        last_new_value: Optional[float] = None
+        last_new_equity: Optional[float] = None
+        for ts, value in points:
+            if ts in seen_timestamps:
+                anchor_value = value
+                anchor_running = timestamp_to_equity[ts]
+                continue
+            if anchor_value is None:
+                anchor_value = value
+                anchor_running = running
+            if anchor_value == 0:
+                continue
+            stitched_value = float(anchor_running) * (value / anchor_value)
+            stitched.append(stitched_value)
+            timestamps.append(ts)
+            seen_timestamps.add(ts)
+            timestamp_to_equity[ts] = stitched_value
+            running = stitched_value
+            last_new_value = value
+            last_new_equity = stitched_value
+        if last_new_value is not None and first_value != 0:
+            segment_returns.append(last_new_value / first_value)
+        elif last_new_equity is not None and segment_start_running != 0:
+            segment_returns.append(last_new_equity / segment_start_running)
     metrics = _equity_metrics(stitched)
     metrics["segment_returns"] = segment_returns
     metrics["final_equity"] = stitched[-1] if stitched else float(starting_balance)
     metrics["starting_balance"] = float(starting_balance)
-    return {"equity": stitched, "metrics": metrics}
+    result = {"equity": stitched, "metrics": metrics}
+    if timestamps and len(timestamps) == len(stitched):
+        result["timestamps"] = timestamps
+    return result
+
+
+def _normalise_oos_segment(segment: Any) -> List[Tuple[Optional[Any], float]]:
+    if isinstance(segment, dict):
+        values = segment.get("equity") or segment.get("values") or []
+        raw_timestamps = segment.get("timestamps") or segment.get("timestamp") or []
+        if not raw_timestamps:
+            points = []
+            for value in values:
+                try:
+                    value_float = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value_float):
+                    points.append((None, value_float))
+            return points
+        points = []
+        for ts, value in zip(raw_timestamps, values):
+            try:
+                value_float = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value_float):
+                points.append((ts, value_float))
+        return sorted(points, key=lambda item: item[0])
+
+    points: List[Tuple[Optional[Any], float]] = []
+    for value in segment or []:
+        try:
+            value_float = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value_float):
+            points.append((None, value_float))
+    return points
 
 
 def _equity_metrics(equity: Sequence[float]) -> Dict[str, Any]:

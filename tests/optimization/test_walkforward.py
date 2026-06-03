@@ -153,6 +153,26 @@ class TestStitchOosEquity:
         assert out["equity"] == []
         assert out["metrics"]["final_equity"] == pytest.approx(100.0)
 
+    def test_dict_segment_without_timestamps_uses_legacy_stitching(self):
+        out = stitch_oos_equity([{"equity": [100.0, 110.0]}], starting_balance=1000.0)
+        assert out["equity"] == pytest.approx([1000.0, 1100.0])
+        assert "timestamps" not in out
+
+    def test_timestamped_segments_dedupe_overlap(self):
+        seg1 = {"timestamps": [1, 2, 3], "equity": [100.0, 110.0, 121.0]}
+        # Starts at the same timestamp as seg1's last point. The duplicate timestamp
+        # is used as the anchor, then skipped, so the overlap is not double-counted.
+        seg2 = {"timestamps": [3, 4], "equity": [200.0, 220.0]}
+        out = stitch_oos_equity([seg1, seg2], starting_balance=1000.0)
+        assert out["timestamps"] == [1, 2, 3, 4]
+        assert out["equity"] == pytest.approx([1000.0, 1100.0, 1210.0, 1331.0])
+
+    def test_timestamped_segments_sorted_before_stitching(self):
+        seg = {"timestamps": [3, 1, 2], "equity": [121.0, 100.0, 110.0]}
+        out = stitch_oos_equity([seg], starting_balance=1000.0)
+        assert out["timestamps"] == [1, 2, 3]
+        assert out["equity"] == pytest.approx([1000.0, 1100.0, 1210.0])
+
 
 # ---------------------------------------------------------------------------
 # Parameter drift
@@ -235,6 +255,23 @@ class TestWindowCacheKey:
         variant["backtest"]["start_date"] = "2025-02-01"
         assert window_cache_key(base, None) != window_cache_key(variant, None)
 
+    def test_coin_universe_changes_key(self):
+        from walkforward import window_cache_key
+
+        base = _train_cfg()
+        variant = _train_cfg()
+        variant["backtest"]["coins"] = {"lighter": ["OTHER"]}
+        assert window_cache_key(base, None) != window_cache_key(variant, None)
+
+    def test_walk_forward_run_id_does_not_change_key(self):
+        from walkforward import window_cache_key
+
+        base = _train_cfg()
+        variant = _train_cfg()
+        base["walk_forward"] = {"run_id": "run-a", "train_months": 6}
+        variant["walk_forward"] = {"run_id": "run-b", "train_months": 6}
+        assert window_cache_key(base, None) == window_cache_key(variant, None)
+
     def test_invariant_to_config_metadata_and_base_path(self):
         from walkforward import window_cache_key
 
@@ -279,6 +316,29 @@ class TestWindowCacheKey:
         # Same content => same key.
         assert k1 == window_cache_key(_train_cfg(), str(ws1))
 
+    def test_cached_choice_rejects_mismatched_key_window_or_seed(self, tmp_path):
+        from walkforward import _load_cached_choice
+
+        payload = {
+            "cache_key": "key-a",
+            "window": {"index": 0},
+            "seed": 7,
+            "hash_id": "abc",
+            "objectives": [1.0],
+            "violation": 0.0,
+            "distance": 0.0,
+            "n_candidates": 1,
+            "metrics": {},
+            "config": {"bot": {"long": {}}},
+        }
+        path = tmp_path / "choice.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert _load_cached_choice(path, expected_key="key-a", expected_window={"index": 0}, expected_seed=7)
+        assert _load_cached_choice(path, expected_key="key-b", expected_window={"index": 0}, expected_seed=7) is None
+        assert _load_cached_choice(path, expected_key="key-a", expected_window={"index": 1}, expected_seed=7) is None
+        assert _load_cached_choice(path, expected_key="key-a", expected_window={"index": 0}, expected_seed=8) is None
+
 
 # ---------------------------------------------------------------------------
 # Optimizer early-stop convergence
@@ -292,6 +352,47 @@ def _valid_individual():
     ind = MagicMock()
     ind.fitness.valid = True
     return ind
+
+
+class _FakeFitness:
+    def __init__(self):
+        self._values = ()
+        self.constraint_violation = 0.0
+
+    @property
+    def valid(self):
+        return bool(self._values)
+
+    @property
+    def values(self):
+        return self._values
+
+    @values.setter
+    def values(self, values):
+        self._values = tuple(values)
+
+
+class _FakeIndividual(list):
+    def __init__(self):
+        super().__init__([0.0])
+        self.fitness = _FakeFitness()
+
+
+class _ImmediateResult:
+    def ready(self):
+        return True
+
+    def get(self):
+        return (1.0,), 0.0, None
+
+
+class _CountingPool:
+    def __init__(self):
+        self.calls = 0
+
+    def apply_async(self, fn, args):
+        self.calls += 1
+        return _ImmediateResult()
 
 
 @pytest.mark.skipif(optimize.algorithms is None, reason="deap not installed")
@@ -324,6 +425,77 @@ class TestEarlyStop:
     def test_patience_zero_runs_full(self, monkeypatch):
         varor = self._run(monkeypatch, ngen=3, stop_cfg={"patience": 0})
         assert varor.call_count == 3
+
+    def test_max_evals_caps_initial_population(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        pop = [_FakeIndividual() for _ in range(5)]
+        pool = _CountingPool()
+        stats = MagicMock()
+        stats.compile.return_value = {"min": np.array([1.0]), "max": np.array([1.0])}
+        varor = MagicMock(return_value=[])
+        monkeypatch.setattr(optimize.algorithms, "varOr", varor)
+        optimize.ea_mu_plus_lambda_stream(
+            population=pop, toolbox=MagicMock(), mu=5, lambda_=5, cxpb=0.5, mutpb=0.5,
+            ngen=10, stats=stats, halloffame=MagicMock(), verbose=False,
+            recorder=MagicMock(), evaluator_config={}, overrides_list=[],
+            pool=pool, duplicate_counter={"total": 0, "resolved": 0, "reused": 0},
+            pool_state={"terminated": False}, stop_cfg={"max_evals": 1},
+        )
+        assert pool.calls == 1
+        assert varor.call_count == 0
+
+    def test_max_evals_allows_only_initial_population_at_population_size(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        pop = [_FakeIndividual() for _ in range(3)]
+        pool = _CountingPool()
+        stats = MagicMock()
+        stats.compile.return_value = {"min": np.array([1.0]), "max": np.array([1.0])}
+        varor = MagicMock(return_value=[])
+        monkeypatch.setattr(optimize.algorithms, "varOr", varor)
+        optimize.ea_mu_plus_lambda_stream(
+            population=pop, toolbox=MagicMock(), mu=3, lambda_=3, cxpb=0.5, mutpb=0.5,
+            ngen=10, stats=stats, halloffame=MagicMock(), verbose=False,
+            recorder=MagicMock(), evaluator_config={}, overrides_list=[],
+            pool=pool, duplicate_counter={"total": 0, "resolved": 0, "reused": 0},
+            pool_state={"terminated": False}, stop_cfg={"max_evals": 3},
+        )
+        assert pool.calls == 3
+        assert varor.call_count == 0
+
+
+def test_proximity_penalty_does_not_increase_constraint_violation(monkeypatch):
+    class Individual(list):
+        pass
+
+    evaluator = optimize.Evaluator.__new__(optimize.Evaluator)
+    evaluator.bounds = []
+    evaluator.sig_digits = 5
+    evaluator.config = {"optimize": {"scoring": ["adg"]}}
+    evaluator.seen_hashes = {}
+    evaluator.duplicate_counter = {"total": 0, "resolved": 0, "reused": 0}
+    evaluator.exchanges = ["lighter"]
+    evaluator.shared_hlcvs_np = {"lighter": np.array([])}
+    evaluator.shared_btc_np = {"lighter": np.array([])}
+    evaluator.msss = {"lighter": {}}
+    evaluator.timestamps = {"lighter": np.array([])}
+    evaluator._ensure_attached = lambda exchange: None
+    evaluator.calc_fitness = lambda stats: ((1.0,), 0.0)
+    evaluator._proximity_penalty = lambda individual: 0.25
+    evaluator._attachments = {}
+
+    monkeypatch.setattr(optimize, "enforce_bounds", lambda individual, bounds, sig_digits: individual)
+    monkeypatch.setattr(optimize, "individual_to_config", lambda individual, overrides, overrides_list, config: config)
+    monkeypatch.setattr(optimize, "build_backtest_payload", lambda *args, **kwargs: {})
+    monkeypatch.setattr(optimize, "execute_backtest", lambda payload, config: ([], [], {}))
+    monkeypatch.setattr(optimize, "build_scenario_metrics", lambda analyses: {"stats": {}})
+
+    objectives, penalty, metrics = evaluator.evaluate(Individual([0.0]), [])
+    assert objectives == pytest.approx((1.25,))
+    assert penalty == pytest.approx(0.0)
+    assert metrics["constraint_violation"] == pytest.approx(0.0)
+    assert metrics["proximity_penalty"] == pytest.approx(0.25)
 
 
 # ---------------------------------------------------------------------------

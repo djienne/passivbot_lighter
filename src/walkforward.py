@@ -241,13 +241,14 @@ def window_cache_key(train_cfg: Dict[str, Any], warm_start_path: Optional[str]) 
     same window reuses a cached result across runs, backtests, and live reruns.
     """
     cfg = _strip_config_metadata(deepcopy(train_cfg))  # drop _transform_log/_raw (per-run timestamps)
+    cfg.pop("walk_forward", None)
     cfg.pop("results_dir", None)
     cfg.pop("results_filename", None)
     cfg.pop("disable_plotting", None)
     cfg.pop("analysis", None)
     cfg.pop("logging", None)
     bt = cfg.get("backtest", {}) or {}
-    for key in ("base_dir", "cache_dir", "coins", "lighter_data_dir"):
+    for key in ("base_dir", "cache_dir", "lighter_data_dir"):
         bt.pop(key, None)  # machine-specific data location, not a meta-parameter
     live = cfg.get("live", {}) or {}
     live.pop("base_config_path", None)
@@ -284,10 +285,21 @@ def _save_cached_choice(path: Path, choice: ParetoChoice, key: str, window, seed
         json.dump(payload, fh, indent=2, sort_keys=True)
 
 
-def _load_cached_choice(path: Path) -> Optional[ParetoChoice]:
+def _load_cached_choice(
+    path: Path,
+    expected_key: Optional[str] = None,
+    expected_window: Optional[Dict[str, Any]] = None,
+    expected_seed: Optional[int] = None,
+) -> Optional[ParetoChoice]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             d = json.load(fh)
+        if expected_key is not None and d.get("cache_key") != expected_key:
+            return None
+        if expected_window is not None and d.get("window") != expected_window:
+            return None
+        if expected_seed is not None and int(d.get("seed", -1)) != int(expected_seed):
+            return None
         return ParetoChoice(
             hash_id=d["hash_id"],
             config=d["config"],
@@ -308,18 +320,59 @@ def _find_latest(base_dir: str, filename: str) -> Optional[str]:
     return max(matches, key=os.path.getmtime)
 
 
-def _load_equity_segment(bal_eq_path: str) -> List[float]:
+def _load_equity_segment(bal_eq_path: str) -> Dict[str, List[Any]]:
     import pandas as pd
 
     df = pd.read_csv(bal_eq_path)
+    equity_col = None
     for col in ("usd_total_equity", "btc_total_equity"):
         if col in df.columns:
-            return [float(x) for x in df[col].tolist()]
+            equity_col = col
+            break
     # Fallback: last numeric column.
-    numeric_cols = [c for c in df.columns if df[c].dtype.kind in "fi"]
-    if numeric_cols:
-        return [float(x) for x in df[numeric_cols[-1]].tolist()]
-    return []
+    if equity_col is None:
+        numeric_cols = [c for c in df.columns if df[c].dtype.kind in "fi"]
+        if numeric_cols:
+            equity_col = numeric_cols[-1]
+    if equity_col is None:
+        return {"equity": []}
+
+    equity = [float(x) for x in df[equity_col].tolist()]
+    timestamp_col = _find_timestamp_column(df, equity_col)
+    if not timestamp_col:
+        return {"equity": equity}
+    timestamps = _parse_timestamp_values(df[timestamp_col])
+    if not timestamps or len(timestamps) != len(equity):
+        return {"equity": equity}
+    return {"timestamps": timestamps, "equity": equity}
+
+
+def _find_timestamp_column(df, equity_col: str) -> Optional[str]:
+    import pandas as pd
+
+    preferred = ["timestamp", "date", "datetime", "time", "Unnamed: 0"]
+    for col in preferred:
+        if col not in df.columns or col == equity_col:
+            continue
+        parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
+        if parsed.notna().any():
+            return col
+    for col in df.columns:
+        if col in preferred or col == equity_col or df[col].dtype.kind in "fiub":
+            continue
+        parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
+        if parsed.notna().any():
+            return col
+    return None
+
+
+def _parse_timestamp_values(values) -> List[int]:
+    import pandas as pd
+
+    parsed = pd.to_datetime(values, errors="coerce", utc=True)
+    if not parsed.notna().all():
+        return []
+    return [int(ts.value // 1_000_000) for ts in parsed]
 
 
 def _resolve_metric(analysis: Dict[str, Any], key: str) -> Optional[float]:
@@ -437,7 +490,7 @@ def run(args: argparse.Namespace) -> int:
     }
 
     window_records: List[Dict[str, Any]] = []
-    oos_segments: List[List[float]] = []
+    oos_segments: List[Any] = []
     prev_config_path: Optional[str] = None
     prev_config_dict: Optional[Dict[str, Any]] = None
 
@@ -471,10 +524,18 @@ def run(args: argparse.Namespace) -> int:
         choice = None
         cache_hit = False
         if cache_entry is not None and not args.no_cache and cache_entry.exists():
-            choice = _load_cached_choice(cache_entry)
+            choice = _load_cached_choice(
+                cache_entry,
+                expected_key=cache_key,
+                expected_window=w.to_dict(),
+                expected_seed=seed,
+            )
             if choice is not None:
                 cache_hit = True
                 logger.info("window %02d | cache HIT %s -> reusing optimization",
+                            w.index, cache_key[:12])
+            else:
+                logger.info("window %02d | cache entry invalid for %s -> recomputing",
                             w.index, cache_key[:12])
 
         if choice is None:
@@ -522,7 +583,7 @@ def run(args: argparse.Namespace) -> int:
         bt_cmd = [sys.executable, backtest_script, str(test_cfg_path), "-dp", "--skip-rust-compile"]
         rc = _run_subprocess(bt_cmd, test_dir / "backtest.log")
         oos_analysis: Dict[str, Any] = {}
-        oos_segment: List[float] = []
+        oos_segment: Dict[str, List[Any]] = {"equity": []}
         if rc != 0:
             logger.error("Backtest failed for window %02d (rc=%d); see %s",
                          w.index, rc, test_dir / "backtest.log")
@@ -543,7 +604,7 @@ def run(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     logger.warning("Failed to read OOS equity for window %02d: %s", w.index, exc)
 
-        if oos_segment:
+        if oos_segment.get("equity"):
             oos_segments.append(oos_segment)
 
         # --- per-window overfit (IS vs OOS) on the scoring keys ---
@@ -583,7 +644,7 @@ def run(args: argparse.Namespace) -> int:
         prev_config_path = str(train_best_path)
         prev_config_dict = choice.config
         logger.info("window %02d done | chosen=%s | OOS points=%d",
-                    w.index, choice.hash_id, len(oos_segment))
+                    w.index, choice.hash_id, len(oos_segment.get("equity", [])))
 
     # --- aggregation ---
     summary_dir = run_dir / "walkforward_summary"
@@ -593,9 +654,15 @@ def run(args: argparse.Namespace) -> int:
 
     # stitched equity CSV
     with open(summary_dir / "stitched_equity.csv", "w", encoding="utf-8") as fh:
-        fh.write("index,equity\n")
-        for i, value in enumerate(stitched["equity"]):
-            fh.write(f"{i},{value}\n")
+        timestamps = stitched.get("timestamps")
+        if timestamps and len(timestamps) == len(stitched["equity"]):
+            fh.write("timestamp,equity\n")
+            for ts, value in zip(timestamps, stitched["equity"]):
+                fh.write(f"{ts},{value}\n")
+        else:
+            fh.write("index,equity\n")
+            for i, value in enumerate(stitched["equity"]):
+                fh.write(f"{i},{value}\n")
 
     # mean overfit ratio per scoring key
     overfit_means: Dict[str, Any] = {}

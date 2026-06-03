@@ -357,6 +357,7 @@ def ea_mu_plus_lambda_stream(
     duplicate_counter,
     pool_state,
     stop_cfg=None,
+    initial_total_evals=0,
 ):
     logbook = tools.Logbook()
     logbook.header = "gen", "evals", "min", "max"
@@ -364,16 +365,23 @@ def ea_mu_plus_lambda_stream(
     stop_cfg = stop_cfg or {}
     patience = int(stop_cfg.get("patience", 0) or 0)
     min_rel_improvement = float(stop_cfg.get("min_rel_improvement", 0.0) or 0.0)
+    max_evals = int(stop_cfg.get("max_evals", 0) or 0)
     best_signal = None
     stale_gens = 0
 
     start_time = time.time()
-    total_evals = 0
+    total_evals = int(initial_total_evals or 0)
+    stop_reason = "max generations reached"
 
     def evaluate_and_record(individuals):
         nonlocal total_evals
         if not individuals:
             return 0
+        if max_evals > 0:
+            remaining = max_evals - total_evals
+            if remaining <= 0:
+                return 0
+            individuals = individuals[:remaining]
         logging.debug("Evaluating %d candidates", len(individuals))
         pending = {}
         for idx, ind in enumerate(individuals):
@@ -487,12 +495,40 @@ def ea_mu_plus_lambda_stream(
         logging.info("Evaluating initial population (%d candidates)...", len(invalid_ind))
     nevals = evaluate_and_record(invalid_ind)
 
+    evaluated_population = [ind for ind in population if ind.fitness.valid]
+    if not evaluated_population:
+        logging.info(
+            "Optimization summary | generations=%d/%d | total_evals=%d | front=%d | stop=%s | duration=%.1fs",
+            0,
+            ngen,
+            total_evals,
+            len(halloffame) if halloffame is not None else 0,
+            "max_evals reached" if max_evals > 0 and total_evals >= max_evals else "no valid evaluations",
+            time.time() - start_time,
+        )
+        return population, logbook
+    population[:] = evaluated_population
+
     if halloffame is not None:
         halloffame.update(population)
 
     record = stats.compile(population) if stats is not None else {}
     logbook.record(gen=0, nevals=nevals, **record)
     log_generation(0, nevals, record)
+
+    if max_evals > 0 and total_evals >= max_evals:
+        stop_reason = "max_evals reached"
+        logging.info("Stopping before evolution (%s)", stop_reason)
+        logging.info(
+            "Optimization summary | generations=%d/%d | total_evals=%d | front=%d | stop=%s | duration=%.1fs",
+            0,
+            ngen,
+            total_evals,
+            len(halloffame) if halloffame is not None else 0,
+            stop_reason,
+            time.time() - start_time,
+        )
+        return population, logbook
 
     if len(population) < 2:
         logging.warning(
@@ -502,8 +538,11 @@ def ea_mu_plus_lambda_stream(
         return population, logbook
 
     completed_gens = 0
-    stop_reason = "max generations reached"
     for gen in range(1, ngen + 1):
+        if max_evals > 0 and total_evals >= max_evals:
+            stop_reason = "max_evals reached"
+            logging.info("Stopping at generation %d (%s)", gen - 1, stop_reason)
+            break
         offspring = algorithms.varOr(population, toolbox, lambda_, cxpb, mutpb)
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
         nevals = evaluate_and_record(invalid_ind)
@@ -517,6 +556,11 @@ def ea_mu_plus_lambda_stream(
         logbook.record(gen=gen, nevals=nevals, **record)
         log_generation(gen, nevals, record)
         completed_gens = gen
+
+        if max_evals > 0 and total_evals >= max_evals:
+            stop_reason = "max_evals reached"
+            logging.info("Stopping after generation %d (%s)", gen, stop_reason)
+            break
 
         # Deterministic convergence check: the per-objective minimums vector is
         # already compiled each generation; objectives are minimized, so a drop in
@@ -933,13 +977,14 @@ class Evaluator:
         prox = self._proximity_penalty(individual)
         if prox:
             objectives = tuple(o + prox for o in objectives)
-            total_penalty += prox
         objectives_map = {f"w_{i}": val for i, val in enumerate(objectives)}
         metrics_payload = {
             "stats": aggregate_stats,
             "objectives": objectives_map,
             "constraint_violation": total_penalty,
         }
+        if prox:
+            metrics_payload["proximity_penalty"] = prox
         individual.evaluation_metrics = metrics_payload
         actual_hash = calc_hash(individual)
         self.seen_hashes[actual_hash] = (tuple(objectives), total_penalty)
@@ -1686,7 +1731,15 @@ async def main():
         # Create initial population
         logging.info(f"Creating initial population...")
 
-        def _evaluate_initial(individuals):
+        stop_cfg = config["optimize"].get("stop") or {}
+        max_evals = int(stop_cfg.get("max_evals", 0) or 0)
+        eval_budget_used = 0
+
+        def _evaluate_initial(individuals, max_count=None):
+            if not individuals:
+                return 0
+            if max_count is not None:
+                individuals = individuals[:max(0, int(max_count))]
             if not individuals:
                 return 0
             total = len(individuals)
@@ -1767,7 +1820,12 @@ async def main():
         population = [_make_random_individual() for _ in range(population_size)]
         if starting_individuals:
             evaluated_seeds = [creator.Individual(ind) for ind in starting_individuals]
-            eval_count = _evaluate_initial(evaluated_seeds)
+            remaining_budget = None
+            if max_evals > 0:
+                remaining_budget = max(0, max_evals - eval_budget_used)
+            eval_count = _evaluate_initial(evaluated_seeds, remaining_budget)
+            eval_budget_used += eval_count
+            evaluated_seeds = [ind for ind in evaluated_seeds if ind.fitness.valid]
             logging.info("Evaluated %d starting configs", eval_count)
             if len(evaluated_seeds) > population_size:
                 evaluated_seeds = tools.selNSGA2(evaluated_seeds, population_size)
@@ -1776,7 +1834,7 @@ async def main():
                     len(evaluated_seeds),
                 )
             for i, ind in enumerate(evaluated_seeds):
-                population[i] = creator.Individual(ind)
+                population[i] = deepcopy(ind)
 
             remaining = population_size - len(evaluated_seeds)
             seed_pool = evaluated_seeds if evaluated_seeds else []
@@ -1804,11 +1862,7 @@ async def main():
         # Run the optimization
         logging.info(f"Starting optimize...")
         lambda_size = max(1, int(round(config["optimize"]["population_size"] * offspring_multiplier)))
-        stop_cfg = config["optimize"].get("stop") or {}
         ngen = max(1, int(config["optimize"]["iters"] / len(population)))
-        max_evals = int(stop_cfg.get("max_evals", 0) or 0)
-        if max_evals > 0:
-            ngen = min(ngen, max(1, int(max_evals / len(population))))
         population, logbook = ea_mu_plus_lambda_stream(
             population,
             toolbox,
@@ -1827,6 +1881,7 @@ async def main():
             duplicate_counter=duplicate_counter,
             pool_state=pool_state,
             stop_cfg=stop_cfg,
+            initial_total_evals=eval_budget_used,
         )
 
         logging.info("Optimization complete.")
