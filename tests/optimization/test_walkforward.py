@@ -271,6 +271,7 @@ class TestSummarizeTradeGuards:
         assert _summarize_trade_guards([]) == {
             "min_trade_ratio": None,
             "windows_total": 0,
+            "windows_seeded": [],
             "windows_guard_walked": [],
             "windows_no_pass": [],
             "n_candidates_rejected_total": 0,
@@ -279,6 +280,54 @@ class TestSummarizeTradeGuards:
         out = _summarize_trade_guards([{"index": 0}])
         assert out["windows_total"] == 1
         assert out["windows_guard_walked"] == []
+
+    def test_seed_window_counted_separately(self):
+        from walkforward import _summarize_trade_guards
+
+        # Window 0 is the seed (initial config used as-is): it never walks the front and
+        # must not be counted as a guard action; it's reported under windows_seeded.
+        _, g_walked = select_with_trade_guard(
+            [_choice("r0", 2.0), _choice("r1", 6.0)], 10.0, 0.5)
+        records = [
+            {"index": 0, "trade_guard": {"applied": False, "seeded": True}},
+            {"index": 1, "trade_guard": g_walked},
+        ]
+        out = _summarize_trade_guards(records)
+        assert out["windows_seeded"] == [0]
+        assert out["windows_guard_walked"] == [1]
+        assert out["windows_no_pass"] == []
+        assert out["n_candidates_rejected_total"] == 1  # only window 1's rejection counts
+
+
+# ---------------------------------------------------------------------------
+# Seed window 0: initial config used as-is (no optimization)
+# ---------------------------------------------------------------------------
+class TestSeedChoiceFromConfig:
+    def test_builds_unoptimized_choice_from_initial_config(self):
+        from walkforward import seed_choice_from_config
+
+        choice = seed_choice_from_config("configs/hype_top.json")
+        # Carries the initial config's strategy parameters...
+        assert isinstance(choice.config.get("bot"), dict)
+        assert "long" in choice.config["bot"] and "short" in choice.config["bot"]
+        assert isinstance(choice.hash_id, str) and choice.hash_id
+        # ...but no optimization artifacts.
+        assert choice.metrics == {}
+        assert choice.n_candidates == 0
+        assert choice.objectives == ()
+        assert choice.violation == 0.0
+
+    def test_seed_choice_has_no_trade_rate_so_guard_stays_off_next_window(self):
+        from walkforward import seed_choice_from_config
+
+        seed = seed_choice_from_config("configs/hype_top.json")
+        # No in-sample metrics => unknown trade rate => prev_trade_rate stays None into
+        # window 1 => the trade-count guard is disabled there (activates from window 2).
+        assert pareto_trade_rate(seed) is None
+        choice, info = select_with_trade_guard([_choice("top", 1.0), _choice("b", 9.0)],
+                                               pareto_trade_rate(seed), 0.5)
+        assert choice.hash_id == "top"
+        assert info["applied"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -104,14 +104,20 @@ def test_publishes_current_window_via_chain(tmp_path, monkeypatch):
 
     rc = wfo_scheduler.run_once(_base_config(), wf, _args(), today="2025-08-15")
     assert rc == 0
-    # today in window 1 (live 2025-08-01..2025-09-01); chain replays windows 0 and 1.
-    assert calls == [0, 1]
+    # today in window 1 (live 2025-08-01..2025-09-01); chain replays windows 0 and 1, but
+    # window 0 is the SEED (initial config used as-is, no optimization), so the optimizer
+    # is only invoked for window 1.
+    assert calls == [1]
 
     pointer = json.loads((active / "active.json").read_text(encoding="utf-8"))
     assert pointer["window_index"] == 1
     assert pointer["period"] == "2025-08-01..2025-09-01"
     assert pointer["chosen_hash"] == "h1"
     assert pointer["anchor_start"] == "2025-01-01"
+
+    # Window 0 seeded the chain with the initial config as-is (no optimization).
+    chain0 = json.loads((active / "_work" / "window_00" / "chosen.json").read_text(encoding="utf-8"))
+    assert chain0["bot"] == {"long": {}, "short": {}}
 
     cfg = json.loads((active / "active_config.json").read_text(encoding="utf-8"))
     assert cfg["bot"]["long"]["x"] == 1.0  # last window's config is the active one

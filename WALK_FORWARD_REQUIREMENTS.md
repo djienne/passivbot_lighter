@@ -181,11 +181,12 @@ breaks on the patience condition and logs the stop reason); `max_evals` caps `ng
 - `proximity_weight = 0` ⇒ **pure warm-start** (no penalty); higher values enforce more
   stickiness. The penalty is added to each minimized objective (not only the constraint
   term) to preserve NSGA-II front diversity.
-- **Window 0 is the exception:** it has no previous window, so it is only *warm-started*
-  from the initial config (R9) and optimizes **without** a proximity penalty (its
-  `proximity.weight` is forced to 0 regardless of `proximity_weight`). The penalty
-  applies from window 1 onward, biasing each window toward the previous *optimized*
-  window — not toward the hand-tuned initial config, which was fit on other data.
+- **Window 0 is the exception:** it is **not optimized** at all — the hand-tuned initial
+  config (R9) is deployed **as-is** for the first OOS period. Optimization begins at
+  **window 1**, warm-started from that initial config (window 0 saves it as its
+  `train_best.json`). The proximity penalty likewise applies from window 1 onward,
+  biasing each window toward the previous chosen config — for window 1 that is the
+  initial config itself.
 
 **Meta-parameter:** `proximity_weight` (and, internally per window,
 `optimize.proximity.reference_config` pointing at the previous window's config).
@@ -203,17 +204,20 @@ the orchestrator sets the reference to the previous window's `train_best.json`.
 > `hype_top.json` for it by default. This is just a starting point, of course, and it
 > will change as periods rotate."
 
-- The **first** window has no "previous window", so it warm-starts from an explicit
-  **initial config**, default `configs/hype_top.json`.
-- This is only a seed for window 0; from window 1 on, the warm-start is the previous
-  window's chosen config, so the strategy "rotates" forward on its own.
+- The **first** window deploys the **initial config** as-is (default
+  `configs/hype_top.json`) — no optimization. Its OOS period is backtested with that
+  hand-tuned config, reflecting what is actually deployed at the start.
+- Optimization begins at window 1, warm-started from the initial config (window 0 saves
+  it as its chosen config). From window 2 on, the warm-start is the previous window's
+  optimized config, so the strategy "rotates" forward on its own.
 - The default history start is the **start of lighter HYPE history** (`2025-02-24`,
   inherited from `configs/config_hype.json`), overridable via `start_date`.
 
 **Meta-parameter:** `initial_config` (default `configs/hype_top.json`).
 
-**Where:** `walk_forward.initial_config`; window 0 passes it to `--start`; later windows
-pass the previous `train_best.json`.
+**Where:** `walk_forward.initial_config`; window 0 uses it directly as its chosen config
+(`seed_choice_from_config` in `walkforward.py`, mirrored in `wfo_scheduler.py`); window 1
+passes it to `--start`, later windows pass the previous `train_best.json`.
 
 ### R10 — Save every period's config (history)
 > "Of course the different configs after each month should all be saved one by one so we
@@ -305,7 +309,7 @@ CLI flags (CLI > config block > default). Precedence and names:
 | `calendar_months` | true | `--calendar-months` / `--fixed-30day` | Calendar-month vs fixed-30-day deltas |
 | `min_test_days` | 7 | — | Drop a trailing partial OOS window shorter than this |
 | `proximity_weight` | 0.0 | `--proximity-weight` | Strength of the bias toward the previous config (0 = pure warm-start) |
-| `initial_config` | `configs/hype_top.json` | `--initial-config` | Warm-start config for window 0 |
+| `initial_config` | `configs/hype_top.json` | `--initial-config` | Window 0 deploys this as-is (no optimization); window 1 warm-starts from it |
 | `stop.patience` | 0 | `--patience` | Generations without improvement before early-stop (0 = off) |
 | `stop.min_rel_improvement` | 0.0 | `--min-rel-improvement` | Relative-improvement threshold for "improved" |
 | `stop.max_evals` | 0 | `--max-evals` | Hard cap on evaluations per window (0 = no cap) |

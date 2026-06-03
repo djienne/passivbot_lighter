@@ -45,6 +45,7 @@ from tools.wfo_handoff import current_live_window  # noqa: E402
 from tools.wfo_meta import WF_DEFAULTS, merge_wf_params, load_wf_meta  # noqa: E402,F401
 from walkforward import (  # noqa: E402
     optimize_one_window,
+    seed_choice_from_config,
     WindowOptimizeError,
     _abspath,
 )
@@ -189,43 +190,53 @@ def run_once(
     last_cache_key = None
     for w in windows:
         seed = base_seed + w.index
-        warm_start = prev_config_path or _abspath(wf["initial_config"])
-        if not os.path.exists(warm_start):
-            logger.warning("Warm-start config not found: %s (continuing without)", warm_start)
-            warm_start = None
-        proximity_reference = prev_config_path  # None on window 0 (free optimization)
-
         wdir = work_dir / f"window_{w.index:02d}"
-        try:
-            candidates, cache_key, cache_hit = optimize_one_window(
-                base_config, w,
-                seed=seed,
-                stop_cfg=wf["stop"],
-                proximity_weight=float(wf["proximity_weight"]),
-                proximity_reference=proximity_reference,
-                warm_start=warm_start,
-                scoring_keys=scoring_keys,
-                train_cfg_path=str(wdir / "train_config.json"),
-                results_dir=str(wdir / "optimize_results"),
-                log_path=str(wdir / "optimize.log"),
-                iters=args.iters,
-                n_cpus=args.n_cpus,
-                cache_dir=cache_dir,
-                no_cache=args.no_cache,
-            )
-        except WindowOptimizeError as exc:
-            logger.error("window %02d | %s", w.index, exc)
-            return exc.code
 
-        choice, trade_guard = select_with_trade_guard(candidates, prev_trade_rate, min_trade_ratio)
-        if trade_guard.get("no_pass"):
-            logger.warning("window %02d | trade-guard: no candidate >= %.2f x prev rate; "
-                           "using highest-rate (rank %d)", w.index, min_trade_ratio,
-                           trade_guard.get("chosen_rank", 0))
-        elif trade_guard.get("applied") and trade_guard.get("chosen_rank"):
-            logger.warning("window %02d | trade-guard: rejected %d higher-ranked candidate(s); "
-                           "chose rank %d", w.index, len(trade_guard.get("rejected", [])),
-                           trade_guard.get("chosen_rank", 0))
+        if w.index == 0:
+            # Seed window: deploy the hand-tuned initial config as-is (no optimization).
+            # Optimization begins at window 1, warm-started from this config. Mirrors the
+            # backtest orchestrator (walkforward.run) so live and backtest stay in parity.
+            choice = seed_choice_from_config(_abspath(wf["initial_config"]))
+            cache_key, cache_hit = None, False
+            trade_guard = {"applied": False, "seeded": True}
+            logger.info("window 00 | seed: initial config as-is (no optimization)")
+        else:
+            warm_start = prev_config_path or _abspath(wf["initial_config"])
+            if not os.path.exists(warm_start):
+                logger.warning("Warm-start config not found: %s (continuing without)", warm_start)
+                warm_start = None
+            proximity_reference = prev_config_path
+
+            try:
+                candidates, cache_key, cache_hit = optimize_one_window(
+                    base_config, w,
+                    seed=seed,
+                    stop_cfg=wf["stop"],
+                    proximity_weight=float(wf["proximity_weight"]),
+                    proximity_reference=proximity_reference,
+                    warm_start=warm_start,
+                    scoring_keys=scoring_keys,
+                    train_cfg_path=str(wdir / "train_config.json"),
+                    results_dir=str(wdir / "optimize_results"),
+                    log_path=str(wdir / "optimize.log"),
+                    iters=args.iters,
+                    n_cpus=args.n_cpus,
+                    cache_dir=cache_dir,
+                    no_cache=args.no_cache,
+                )
+            except WindowOptimizeError as exc:
+                logger.error("window %02d | %s", w.index, exc)
+                return exc.code
+
+            choice, trade_guard = select_with_trade_guard(candidates, prev_trade_rate, min_trade_ratio)
+            if trade_guard.get("no_pass"):
+                logger.warning("window %02d | trade-guard: no candidate >= %.2f x prev rate; "
+                               "using highest-rate (rank %d)", w.index, min_trade_ratio,
+                               trade_guard.get("chosen_rank", 0))
+            elif trade_guard.get("applied") and trade_guard.get("chosen_rank"):
+                logger.warning("window %02d | trade-guard: rejected %d higher-ranked candidate(s); "
+                               "chose rank %d", w.index, len(trade_guard.get("rejected", [])),
+                               trade_guard.get("chosen_rank", 0))
 
         # Persist this window's chosen config so the NEXT window warm-starts from it
         # (the deterministic chain → stable cache keys for already-done windows).
@@ -237,8 +248,9 @@ def run_once(
         if rate is not None:
             prev_trade_rate = rate
         last_choice, last_window, last_cache_key = choice, w, cache_key
+        _status = "seed" if trade_guard.get("seeded") else ("cache HIT" if cache_hit else "optimized")
         logger.info("window %02d | %s | chosen=%s | trade_rate=%s",
-                    w.index, "cache HIT" if cache_hit else "optimized", choice.hash_id,
+                    w.index, _status, choice.hash_id,
                     f"{rate:.4f}" if rate is not None else "n/a")
 
     # Publish the current (last) window as the active live config.

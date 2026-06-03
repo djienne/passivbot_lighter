@@ -299,6 +299,35 @@ def _choice_from_dict(d: Dict[str, Any]) -> ParetoChoice:
     )
 
 
+def seed_choice_from_config(config_path: str) -> ParetoChoice:
+    """Non-optimized choice for the first walk-forward window.
+
+    The first window deploys the hand-tuned initial config (e.g. configs/hype_top.json)
+    as-is -- no optimization; optimization begins at window 1, warm-started from it. The
+    choice carries empty metrics, so its in-sample trade rate is unknown (``None``) and the
+    trade-count overfit guard naturally activates from window 2 onward. The live scheduler
+    applies the identical rule so live and backtest stay in parity.
+
+    ``hash_id`` hashes the strategy parameters only (the ``bot`` section), matching how
+    warm-start configs are keyed (see :func:`_hash_config_file`).
+
+    The initial config is a finished, deployable config, so it is loaded faithfully with
+    ``load_hjson_config`` (no ``format_config`` flavor transform) and used as-is.
+    """
+    cfg = load_hjson_config(config_path)
+    bot = cfg.get("bot", {}) or {}
+    hash_id = calc_hash(bot) if bot else calc_hash(_strip_config_metadata(cfg))
+    return ParetoChoice(
+        hash_id=hash_id,
+        config=cfg,
+        objectives=(),
+        violation=0.0,
+        distance=0.0,
+        metrics={},
+        n_candidates=0,
+    )
+
+
 def _cache_header_ok(d: Dict[str, Any], expected_key, expected_window, expected_seed) -> bool:
     if expected_key is not None and d.get("cache_key") != expected_key:
         return False
@@ -568,12 +597,16 @@ def _summarize_trade_guards(window_records: List[Dict[str, Any]]) -> Dict[str, A
     min_trade_ratio: Optional[float] = None
     walked: List[int] = []
     no_pass: List[int] = []
+    seeded: List[int] = []
     rejected_total = 0
     for rec in window_records:
         tg = rec.get("trade_guard") or {}
         if min_trade_ratio is None and tg.get("min_trade_ratio") is not None:
             min_trade_ratio = tg.get("min_trade_ratio")
         idx = rec.get("index")
+        if tg.get("seeded"):  # window 0: initial config used as-is, not optimized
+            seeded.append(idx)
+            continue
         if tg.get("no_pass"):
             no_pass.append(idx)
         elif tg.get("chosen_rank"):  # rank 0 / None => guard left the top pick alone
@@ -582,6 +615,7 @@ def _summarize_trade_guards(window_records: List[Dict[str, Any]]) -> Dict[str, A
     return {
         "min_trade_ratio": min_trade_ratio,
         "windows_total": len(window_records),
+        "windows_seeded": seeded,
         "windows_guard_walked": walked,
         "windows_no_pass": no_pass,
         "n_candidates_rejected_total": rejected_total,
@@ -716,66 +750,84 @@ def run(args: argparse.Namespace) -> int:
         test_dir.mkdir(parents=True, exist_ok=True)
 
         seed = int(wf["base_seed"]) + w.index
-        # Warm-start source: previous window's chosen config, else the initial config.
-        warm_start = prev_config_path or _abspath(wf["initial_config"])
-        if not os.path.exists(warm_start):
-            logger.warning("Warm-start config not found: %s (continuing without)", warm_start)
-            warm_start = None
 
-        # Proximity reference is the PREVIOUS window's optimized config only (None on
-        # window 0). Window 0 is warm-started from the initial config but optimizes
-        # freely; the "don't drift far per slide" bias only applies between consecutive
-        # windows, not toward the hand-tuned initial config.
-        proximity_reference = prev_config_path  # None on window 0
+        if w.index == 0:
+            # Seed window: deploy the hand-tuned initial config as-is (no optimization).
+            # Optimization begins at window 1, warm-started from this config. The live
+            # scheduler applies the identical rule, so live and backtest stay in parity.
+            init_path = _abspath(wf["initial_config"])
+            choice = seed_choice_from_config(init_path)
+            candidates = [choice]
+            cache_key, cache_hit = None, False
+            warm_start = init_path if os.path.exists(init_path) else None
+            trade_guard = {"applied": False, "seeded": True}
+            logger.info(
+                "window 00 | seed: using initial config as-is (no optimization) | %s",
+                init_path,
+            )
+        else:
+            # Warm-start source: previous window's chosen config (the initial config for
+            # window 1, since the seed window saved it as train_best.json).
+            warm_start = prev_config_path or _abspath(wf["initial_config"])
+            if not os.path.exists(warm_start):
+                logger.warning("Warm-start config not found: %s (continuing without)", warm_start)
+                warm_start = None
 
-        # Deterministic content-addressed cache: identical meta-parameters
-        # (initial config, seed, period, stop criteria, base config) => identical
-        # result, reused by any backtest or live rerun (see optimize_one_window).
-        try:
-            candidates, cache_key, cache_hit = optimize_one_window(
-                base_config, w,
-                seed=seed,
-                stop_cfg=wf["stop"],
-                proximity_weight=float(wf["proximity_weight"]),
-                proximity_reference=proximity_reference,
-                warm_start=warm_start,
-                scoring_keys=scoring_keys,
-                train_cfg_path=str(train_dir / "train_config.json"),
-                results_dir=str(train_dir / "optimize_results"),
-                log_path=str(train_dir / "optimize.log"),
-                iters=args.iters,
-                n_cpus=args.n_cpus,
-                cache_dir=cache_dir,
-                no_cache=args.no_cache,
-                optimize_script=optimize_script,
-            )
-        except WindowOptimizeError as exc:
-            logger.error("window %02d | %s", w.index, exc)
-            if not args.keep_going:
-                return exc.code
-            continue
+            # Proximity reference is the PREVIOUS window's chosen config (the initial config
+            # for window 1). The "don't drift far per slide" bias applies between consecutive
+            # windows along the chain.
+            proximity_reference = prev_config_path
 
-        # Trade-count overfit guard: pick the best-ranked candidate that does not trade
-        # far less than last month (falls back down the front; window 0 = top rank).
-        choice, trade_guard = select_with_trade_guard(candidates, prev_trade_rate, min_trade_ratio)
-        if trade_guard.get("no_pass"):
-            _r = trade_guard.get("chosen_trade_rate")
-            logger.warning(
-                "window %02d | trade-guard: NO candidate >= %.2f x prev rate %.4f; "
-                "falling back to highest-rate (rank %d, rate=%s)",
-                w.index, min_trade_ratio, prev_trade_rate or 0.0,
-                trade_guard.get("chosen_rank", 0),
-                f"{_r:.4f}" if _r is not None else "n/a",
-            )
-        elif trade_guard.get("applied") and trade_guard.get("chosen_rank"):
-            _r = trade_guard.get("chosen_trade_rate")
-            logger.warning(
-                "window %02d | trade-guard: rejected %d higher-ranked candidate(s) "
-                "(trade rate < %.2f x prev %.4f); chose rank %d (rate=%s)",
-                w.index, len(trade_guard.get("rejected", [])), min_trade_ratio,
-                prev_trade_rate or 0.0, trade_guard.get("chosen_rank", 0),
-                f"{_r:.4f}" if _r is not None else "n/a",
-            )
+            # Deterministic content-addressed cache: identical meta-parameters
+            # (initial config, seed, period, stop criteria, base config) => identical
+            # result, reused by any backtest or live rerun (see optimize_one_window).
+            try:
+                candidates, cache_key, cache_hit = optimize_one_window(
+                    base_config, w,
+                    seed=seed,
+                    stop_cfg=wf["stop"],
+                    proximity_weight=float(wf["proximity_weight"]),
+                    proximity_reference=proximity_reference,
+                    warm_start=warm_start,
+                    scoring_keys=scoring_keys,
+                    train_cfg_path=str(train_dir / "train_config.json"),
+                    results_dir=str(train_dir / "optimize_results"),
+                    log_path=str(train_dir / "optimize.log"),
+                    iters=args.iters,
+                    n_cpus=args.n_cpus,
+                    cache_dir=cache_dir,
+                    no_cache=args.no_cache,
+                    optimize_script=optimize_script,
+                )
+            except WindowOptimizeError as exc:
+                logger.error("window %02d | %s", w.index, exc)
+                if not args.keep_going:
+                    return exc.code
+                continue
+
+            # Trade-count overfit guard: pick the best-ranked candidate that does not trade
+            # far less than last month (falls back down the front). Inactive on window 1 --
+            # the seed window has no in-sample trade rate, so prev_trade_rate is still None;
+            # the guard begins comparing at window 2.
+            choice, trade_guard = select_with_trade_guard(candidates, prev_trade_rate, min_trade_ratio)
+            if trade_guard.get("no_pass"):
+                _r = trade_guard.get("chosen_trade_rate")
+                logger.warning(
+                    "window %02d | trade-guard: NO candidate >= %.2f x prev rate %.4f; "
+                    "falling back to highest-rate (rank %d, rate=%s)",
+                    w.index, min_trade_ratio, prev_trade_rate or 0.0,
+                    trade_guard.get("chosen_rank", 0),
+                    f"{_r:.4f}" if _r is not None else "n/a",
+                )
+            elif trade_guard.get("applied") and trade_guard.get("chosen_rank"):
+                _r = trade_guard.get("chosen_trade_rate")
+                logger.warning(
+                    "window %02d | trade-guard: rejected %d higher-ranked candidate(s) "
+                    "(trade rate < %.2f x prev %.4f); chose rank %d (rate=%s)",
+                    w.index, len(trade_guard.get("rejected", [])), min_trade_ratio,
+                    prev_trade_rate or 0.0, trade_guard.get("chosen_rank", 0),
+                    f"{_r:.4f}" if _r is not None else "n/a",
+                )
 
         # Save the chosen config (a complete config: backtest- and live-ready).
         train_best_path = wdir / "train_best.json"
@@ -869,6 +921,7 @@ def run(args: argparse.Namespace) -> int:
             "train_best_config": str(train_best_path),
             "trade_rate": chosen_trade_rate,
             "trade_guard": trade_guard,
+            "seeded": bool(trade_guard.get("seeded")),
             "overfit": overfit,
             "oos_analysis": oos_analysis,
             "param_drift": drift,
