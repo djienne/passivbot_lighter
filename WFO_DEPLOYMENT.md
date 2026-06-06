@@ -17,7 +17,7 @@ the things that have bitten us, and how to fix them.
 ## 1. The big picture
 
 ```
-        LOCAL (Windows + Docker Desktop)                 VPS (Linux, ubuntu@REDACTED-HOST)
+        LOCAL (Windows + Docker Desktop)                 VPS (Linux, ubuntu@<VPS_HOST>)
    ┌─────────────────────────────────────────┐      ┌──────────────────────────────────────┐
    │  passivbot-wfo-local-manager (container) │      │  passivbot-lighter-live (container)    │
    │  └ wfo_vps_manager.py watch              │      │  └ src/main.py  (live trading only)    │
@@ -51,7 +51,7 @@ finished configs; it is hard-blocked from optimizing.
 | **Scheduler** | `src/wfo_scheduler.py` (run as a subprocess by the manager) | Resolves the current live window, replays the warm-start chain through the cache, publishes `active.json` + `active_config.json`. |
 | **Optimization cache** | `runs/walkforward/_cache/<key>/candidates.json` | Content-addressed Pareto fronts. Shared by backtest **and** live. A cache HIT = no recompute. |
 | **Published artifacts** | `runs/walkforward/live/` (`active.json`, `active_config.json`, `configs_history/`) | The portable, deployable handoff. Uploaded to the VPS. |
-| **VPS live bot** | container `passivbot-lighter-live` on `REDACTED-HOST` | Trades live only. Watcher adopts new configs via soft-restart. Never optimizes. |
+| **VPS live bot** | container `passivbot-lighter-live` on `<VPS_HOST>` | Trades live only. Watcher adopts new configs via soft-restart. Never optimizes. |
 | **Dashboard** | `streaming_live_passibot-dashboard-1` (`C:\Users\david\Desktop\freqtrade\STREAMING_LIVE_PASSIBOT`) | Reads account-keyed files (`lighter_01_pnls.json`, `passivbot_debug.log`) over SSH. Unaffected by config rotation → history is continuous. |
 | **Health sweep** | `src/tools/wfo_status.py` | Read-only, no side effects. Checks the whole chain (local + remote) in one command. |
 | **Manager CLI** | `src/tools/wfo_vps_manager.py` | All the operator verbs (see §6). |
@@ -276,6 +276,9 @@ configs/wfo_profiles/hype_t{6,8,10,12}.json   train-length profiles (t8 is live)
 runs/walkforward/live/             published active.json / active_config.json / history
 runs/walkforward/_cache/<key>/     content-addressed optimization cache
 lighter.pem                        SSH key to the VPS (keep owner-only on the host)
+deploy_target.json                 gitignored VPS target (remote_host/user/path) — the real
+                                   <VPS_HOST> lives HERE, never in tracked code. Override with
+                                   env PASSIVBOT_REMOTE_HOST or the --remote-host CLI flag.
 ```
 
 See `WALK_FORWARD_REQUIREMENTS.md` for the feature design and `CLAUDE.md` for environment

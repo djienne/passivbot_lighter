@@ -31,9 +31,46 @@ from tools.wfo_utils import _advance, _parse_date  # noqa: E402
 
 
 DEFAULT_PROFILE = "hype_t8"
-DEFAULT_REMOTE_USER = "ubuntu"
-DEFAULT_REMOTE_HOST = "REDACTED-HOST"
-DEFAULT_REMOTE_PATH = "/home/ubuntu/passivbot_lighter"
+
+
+def _resolve_deploy_target() -> dict:
+    """Resolve the VPS connection target without hard-coding it in tracked code.
+
+    Precedence: environment variables (``PASSIVBOT_REMOTE_{HOST,USER,PATH}``) >
+    a gitignored ``deploy_target.json`` at the repo root > safe non-secret
+    fallbacks. The real host therefore lives only in the gitignored file (or the
+    environment), never in version control. The ``--remote-host`` / ``--remote-user``
+    / ``--remote-path`` CLI flags still override these defaults.
+    """
+    target = {
+        "remote_host": "",
+        "remote_user": "ubuntu",
+        "remote_path": "/home/ubuntu/passivbot_lighter",
+    }
+    cfg_path = REPO_ROOT / "deploy_target.json"
+    try:
+        if cfg_path.exists():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            for key in target:
+                if data.get(key):
+                    target[key] = data[key]
+    except (OSError, ValueError):
+        pass
+    for key, env in (
+        ("remote_host", "PASSIVBOT_REMOTE_HOST"),
+        ("remote_user", "PASSIVBOT_REMOTE_USER"),
+        ("remote_path", "PASSIVBOT_REMOTE_PATH"),
+    ):
+        val = os.environ.get(env)
+        if val:
+            target[key] = val
+    return target
+
+
+_DEPLOY_TARGET = _resolve_deploy_target()
+DEFAULT_REMOTE_USER = _DEPLOY_TARGET["remote_user"]
+DEFAULT_REMOTE_HOST = _DEPLOY_TARGET["remote_host"]
+DEFAULT_REMOTE_PATH = _DEPLOY_TARGET["remote_path"]
 DEFAULT_SSH_KEY = "lighter.pem"
 
 FORBIDDEN_REMOTE_PATTERNS = (

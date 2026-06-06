@@ -51,13 +51,33 @@ Usage:
 
 import os
 import sys
+import json
 import subprocess
 import platform
 from pathlib import Path
 
+
+def _resolve_remote_host() -> str:
+    """Remote host from env var or a gitignored deploy_target.json (never hard-coded).
+
+    Precedence: ``PASSIVBOT_REMOTE_HOST`` env var > ``deploy_target.json`` next to
+    this script > empty string. Keeps the VPS IP out of version control.
+    """
+    host = os.environ.get("PASSIVBOT_REMOTE_HOST")
+    if host:
+        return host
+    try:
+        cfg = Path(__file__).resolve().parent / "deploy_target.json"
+        if cfg.exists():
+            return str(json.loads(cfg.read_text(encoding="utf-8")).get("remote_host", "") or "")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 # Configuration
 REMOTE_USER = "ubuntu"
-REMOTE_HOST = "REDACTED-HOST"
+REMOTE_HOST = _resolve_remote_host()
 REMOTE_PATH = "/home/ubuntu/passivbot"
 LOCAL_PATH = "."
 SSH_KEY_NAME = "lighter.pem"  # SSH key filename

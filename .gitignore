@@ -390,6 +390,7 @@ Cargo.lock
 
 # Local secrets
 *.pem
+deploy_target.json
 
 # Git worktrees
 .worktrees/
