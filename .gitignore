@@ -385,7 +385,11 @@ Cargo.lock
 /api-keys.json
 /caches
 /backups/
+/runs/
 /optimize_results
+
+# Local secrets
+*.pem
 
 # Git worktrees
 .worktrees/
