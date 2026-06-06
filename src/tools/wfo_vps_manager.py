@@ -27,6 +27,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from tools.wfo_meta import load_wf_meta  # noqa: E402
+from tools.wfo_utils import _advance, _parse_date  # noqa: E402
 
 
 DEFAULT_PROFILE = "hype_t8"
@@ -183,6 +184,20 @@ def _select_run_window(windows: list[dict[str, Any]], window_index: Optional[int
     return (containing or eligible)[-1]
 
 
+def live_period_end(test_start: str, wf: dict[str, Any]) -> str:
+    """Return the intended live slot end for a published window.
+
+    Historical WFO runs may clamp the final OOS ``test_end`` to the available data
+    cutoff. Live deployment should still keep the chosen config active until the
+    next rolling boundary, e.g. 2026-05-24..2026-06-24.
+    """
+    return _advance(
+        _parse_date(test_start),
+        int(wf["test_months"]),
+        bool(wf["calendar_months"]),
+    ).isoformat()
+
+
 def publish_from_run_dir(
     profile: str,
     run_dir: str | Path,
@@ -215,8 +230,9 @@ def publish_from_run_dir(
         raise ValueError(f"{summary_path} is missing chosen_hash")
 
     active_dir = active_dir_for(profile)
+    period_end = live_period_end(str(window["test_start"]), wf)
     pointer = {
-        "period": f"{window['test_start']}..{window['test_end']}",
+        "period": f"{window['test_start']}..{period_end}",
         "window_index": idx,
         "train_window": window,
         "config_path": "active_config.json",

@@ -106,7 +106,7 @@ def test_upload_active_backs_up_then_publishes_pointer_last(tmp_path, monkeypatc
     assert publish_cmd.index("active_config.json") < publish_cmd.index("active.json")
 
 
-def _write_run_dir(run: Path, *, complete: bool = True) -> None:
+def _write_run_dir(run: Path, *, complete: bool = True, test_end: str = "2026-06-24") -> None:
     run.mkdir(parents=True)
     windows = {
         "span": {"start_date": "2025-02-24"},
@@ -116,7 +116,7 @@ def _write_run_dir(run: Path, *, complete: bool = True) -> None:
                 "train_start": "2025-09-24",
                 "train_end": "2026-05-24",
                 "test_start": "2026-05-24",
-                "test_end": "2026-06-24",
+                "test_end": test_end,
             }
         ],
     }
@@ -165,6 +165,18 @@ def test_publish_from_run_dir_writes_active_artifacts(tmp_path):
     assert (active / "active.json").exists()
     assert (active / "active_config.json").exists()
     assert (active / "configs_history" / "window_07_2026-05-24.json").exists()
+
+
+def test_publish_from_truncated_run_uses_full_live_slot(tmp_path):
+    active = tmp_path / "live"
+    profile = _profile(tmp_path, active)
+    run = tmp_path / "run"
+    _write_run_dir(run, test_end="2026-06-04")
+
+    _, pointer = mgr.publish_from_run_dir(str(profile), run, window_index=7)
+
+    assert pointer["train_window"]["test_end"] == "2026-06-04"
+    assert pointer["period"] == "2026-05-24..2026-06-24"
 
 
 @pytest.mark.parametrize("entrypoint", ["src/optimize.py", "src/walkforward.py", "src/wfo_scheduler.py"])
