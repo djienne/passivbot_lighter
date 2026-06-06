@@ -1,0 +1,76 @@
+# WFO local manager image.
+#
+# Same Rust-wheel builder as Dockerfile_live, but the runtime stage installs the
+# FULL requirements.txt (deap / matplotlib / msgpack and the rest) so the local
+# walk-forward manager can actually run optimize.py + backtest.py. The live image
+# (Dockerfile_live) deliberately ships only requirements-live.txt and is NOT
+# usable for optimization. This image is for the LOCAL machine only and never
+# deployed to the VPS (the VPS is guarded against running the optimizer).
+
+# Stage 1: Build Rust extension (identical to Dockerfile_live builder)
+FROM python:3.12-slim-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
+    pkg-config \
+    libssl-dev \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+
+WORKDIR /app
+
+# Copy only files needed for building the Rust extension
+COPY requirements-rust.txt requirements-rust.txt
+COPY passivbot-rust/Cargo.toml passivbot-rust/Cargo.toml
+COPY passivbot-rust/src passivbot-rust/src
+
+RUN pip install --no-cache-dir -r requirements-rust.txt \
+    && cd passivbot-rust \
+    && maturin build --release
+
+# Stage 2: WFO manager runtime (full optimizer deps)
+FROM python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SKIP_RUST_COMPILE=true
+
+WORKDIR /app
+
+# openssh-client: the manager scp/ssh-es the optimized config to the VPS.
+# build-essential/python3-dev: safety net for any sdist (e.g. deap) that lacks a
+# cp312 wheel, so the build cannot fail at install time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       openssh-client \
+       build-essential \
+       python3-dev \
+       pkg-config \
+       libssl-dev \
+       git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Requirements (requirements.txt pulls in requirements-rust.txt + requirements-live.txt)
+COPY requirements-rust.txt requirements-rust.txt
+COPY requirements-live.txt requirements-live.txt
+COPY requirements.txt requirements.txt
+COPY broker_codes.hjson broker_codes.hjson
+COPY src src
+
+# Copy prebuilt Rust wheel from the builder stage
+COPY --from=builder /app/passivbot-rust/target/wheels/*.whl /tmp/
+
+# Install the Rust extension wheel first, then the full Python dependency set.
+RUN pip install --no-cache-dir /tmp/*.whl \
+    && pip install --no-cache-dir -r requirements.txt \
+    && rm -rf /tmp/* ~/.cache/pip
+
+# Default: run the local WFO watch loop (overridden by docker-compose command).
+CMD ["python", "src/tools/wfo_vps_manager.py", "watch", "--profile", "hype_t8", "--check-interval-minutes", "15"]

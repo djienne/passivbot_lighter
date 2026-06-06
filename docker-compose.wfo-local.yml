@@ -2,8 +2,8 @@ services:
   passivbot-wfo-local-manager:
     build:
       context: .
-      dockerfile: Dockerfile_live
-    image: passivbot-lighter:latest
+      dockerfile: Dockerfile_wfo
+    image: passivbot-lighter-wfo:latest
     container_name: passivbot-wfo-local-manager
     restart: unless-stopped
     volumes:
