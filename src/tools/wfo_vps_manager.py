@@ -295,6 +295,19 @@ def run_ssh(remote: Remote, command: str, *, dry_run: bool = False, capture: boo
     return run_local(argv, dry_run=dry_run, capture=capture)
 
 
+def print_remote_output(text: str, *, file=None) -> None:
+    """Print remote UTF-8 output on Windows consoles with narrow encodings."""
+    file = file or sys.stdout
+    try:
+        print(text.rstrip(), file=file)
+    except UnicodeEncodeError:
+        safe = text.rstrip().encode(getattr(file, "encoding", None) or "utf-8", errors="replace").decode(
+            getattr(file, "encoding", None) or "utf-8",
+            errors="replace",
+        )
+        print(safe, file=file)
+
+
 def run_scp(
     remote: Remote,
     source: str | Path,
@@ -473,9 +486,9 @@ def preflight_remote(remote: Remote, *, dry_run: bool = False) -> int:
         res = run_ssh(remote, cmd, dry_run=dry_run, capture=True)
         rc = max(rc, res.returncode)
         if res.stdout:
-            print(res.stdout.rstrip())
+            print_remote_output(res.stdout)
         if res.stderr:
-            print(res.stderr.rstrip(), file=sys.stderr)
+            print_remote_output(res.stderr, file=sys.stderr)
     return rc
 
 
