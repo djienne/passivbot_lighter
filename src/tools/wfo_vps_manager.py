@@ -276,7 +276,7 @@ def run_local(argv: list[str], *, dry_run: bool = False, capture: bool = False) 
     if dry_run:
         print("[dry-run]", " ".join(argv))
         return CmdResult(0)
-    proc = subprocess.run(argv, text=True, capture_output=capture)
+    proc = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=capture)
     return CmdResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
 
