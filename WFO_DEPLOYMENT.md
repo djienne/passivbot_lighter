@@ -77,8 +77,9 @@ What *should* happen automatically, with no human action:
    runs a real local optimize (~10–20 min, full CPU).
 3. The new config is published locally and **uploaded** to the VPS (config changed → no skip).
 4. The VPS watcher sees the new `active.json`, runs the state machine, and **ADOPTs** via
-   soft-restart. During the seam it is in **WIND_DOWN** (no new entries; small winners/losers
-   flattened, larger drawdowns carried — R15), then NORMAL on the new month.
+   soft-restart. During the seam (before the upload lands) it is in **WIND_DOWN** (no new
+   entries; small winners/losers flattened, larger drawdowns carried — R15), then NORMAL on
+   the new month. **See §3.1 for exactly what the trader does during that gap.**
 
 **How to confirm it landed (run the sweep, or check logs):**
 - `docker logs passivbot-wfo-local-manager` shows `window 08 | optimized` then an upload
@@ -89,6 +90,43 @@ What *should* happen automatically, with no human action:
 
 > Until then, every 15-min tick is a no-op: all windows cache-HIT, config unchanged,
 > `Remote already has … skipping upload`. That is the correct idle state.
+
+### 3.1 What the live trader does during the seam (no fresh config yet)
+
+There is a gap on the 24th between *the calendar rolling into the new month* (00:00 UTC)
+and *the new config being uploaded* (after the local optimize finishes — typically
+~10–30 min, occasionally longer). **The VPS bot never goes dark and never needs the new
+config to keep itself safe.** It keeps running the *old* (e.g. window-7) config but flips
+into a deliberately conservative mode. The watcher ticks every **1 minute** on the VPS
+(`--live.wfo_rolling.check_interval_minutes 1`) and runs a 3-state machine
+(`decide_rolling_state`, `src/tools/wfo_handoff.py`):
+
+| Phase | When | Comparison | State | Behaviour |
+|---|---|---|---|---|
+| **Before** | up to 00:00 UTC Jun 24 | calendar window == published window | **NORMAL** | trades the window-7 config normally |
+| **The gap** | 00:00 Jun 24 → window-8 upload | calendar (`today_test_start`) **>** published (`published_test_start`), but `active.json` still window 7 | **WIND_DOWN** | runs window-7 config in safe mode (below) |
+| **Adopted** | window-8 `active.json` arrives | published period **!=** loaded period | **ADOPT** | soft-restart, swap in new `bot` section → back to NORMAL |
+
+**What WIND_DOWN does to the account** (`_wfo_wind_down`, `src/passivbot.py`):
+
+1. **No new entries** — `forced_mode_long/short = "tp_only"`. Existing positions can still
+   take profit; nothing new opens. This is the point: it will **not** put on fresh exposure
+   into the un-trained new month using a stale config.
+2. **Closes winners and small losers** — per position, `should_flatten` (`wfo_handoff.py`):
+   in profit **OR** unrealized loss **< `max_loss_flatten_frac` (2%) of equity** → market-close.
+3. **Keeps big losers** — anything losing **> 2% of equity** is held and handed off so the
+   incoming window-8 config inherits and manages it. (Mirrors the backtest's stateful carry,
+   so live ≈ sim — R15.)
+
+So during the seam: profits are taken, small losers cleared, large drawdowns parked, and no
+new positions open — until the new config lands and the bot ADOPTs it.
+
+**The one real risk:** the gap closes **only if the local manager publishes the new window.**
+If `passivbot-wfo-local-manager` is down/crashed on the 24th, the bot stays in **WIND_DOWN
+indefinitely** — which is *safe* (no new trades, sits on any held losers) but means **no
+trading until the optimizer is fixed**. The failure mode is "stuck in tp_only," never "trades
+the wrong config." On the 24th, if the sweep's `remote == local config` row is still
+`window 7` more than ~30–45 min past 00:00 UTC, the manager didn't deliver — see §8.
 
 ---
 
@@ -218,7 +256,7 @@ No VPS-side edits are needed. The VPS just adopts the new `active_config.json`.
 | `VPS debug log` stale (>10 min) | Bot lost the websocket / crashed | Check `docker logs passivbot-lighter-live`; restart if needed |
 | `ModuleNotFoundError: deap` in manager | Manager built from `Dockerfile_live` (live deps only) | Build/run from `Dockerfile_wfo` (full deps) — `docker compose -f docker-compose.wfo-local.yml build` |
 | Manager `up -d` fails: "all predefined address pools … fully subnetted" | Too many docker networks on the host | `network_mode: bridge` is set in the compose file; keep it |
-| The 24th passed but no new config on the VPS | Manager down, or upload blocked (key), or optimize failed | Check manager logs around the 24th; run `optimize-once` then `upload-active` manually |
+| The 24th passed but no new config on the VPS | Manager down, or upload blocked (key), or optimize failed | **Bot is safe meanwhile — stuck in WIND_DOWN/tp_only, no new entries (§3.1), not trading the wrong config.** Check manager logs around the 24th; run `optimize-once` then `upload-active` manually. Bot ADOPTs within ~1 min of the upload. |
 
 **Never touch `passivbot-hype-live`** — that's a separate strategy (per `CLAUDE.md`).
 
