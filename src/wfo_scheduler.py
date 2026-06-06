@@ -37,6 +37,10 @@ REPO_ROOT = SRC_ROOT.parent
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from tools.runtime_guards import abort_if_remote_live  # noqa: E402
+
+abort_if_remote_live("wfo_scheduler.py")
+
 from config_utils import load_hjson_config, load_config, dump_config  # noqa: E402
 from utils import ts_to_date, utc_ms  # noqa: E402
 from logging_setup import configure_logging  # noqa: E402

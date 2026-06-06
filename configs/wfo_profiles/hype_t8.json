@@ -1,0 +1,26 @@
+{
+  "base_config": "configs/wfo_hype.json",
+  "initial_config": "configs/config_hype.json",
+  "train_months": 8,
+  "test_months": 1,
+  "step_months": 1,
+  "calendar_months": true,
+  "min_test_days": 7,
+  "base_seed": 0,
+  "start_date": null,
+  "end_date": null,
+  "proximity_weight": 0.0,
+  "min_trade_ratio": 0.5,
+  "stop": {
+    "patience": 20,
+    "min_rel_improvement": 0.001,
+    "max_evals": 200000
+  },
+  "max_loss_flatten_frac": 0.02,
+  "stateful_oos": true,
+  "retrain_delay_days": 0,
+  "live_rolling": {
+    "active_dir": "runs/walkforward/live",
+    "check_interval_minutes": 60.0
+  }
+}

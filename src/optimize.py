@@ -2,6 +2,10 @@ import os
 import sys
 import argparse
 
+from tools.runtime_guards import abort_if_remote_live
+
+abort_if_remote_live("optimize.py")
+
 if sys.platform.startswith("win"):
     # ==== BEGIN fcntl stub for Windows ====
     try:

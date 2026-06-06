@@ -377,9 +377,14 @@ Cargo.lock
 /historical_data
 /results*
 /configs
+!/configs/
+/configs/*
+!/configs/wfo_profiles/
+!/configs/wfo_profiles/*.json
 /reports
 /api-keys.json
 /caches
+/backups/
 /optimize_results
 
 # Git worktrees

@@ -390,7 +390,7 @@
         "write_all_results": true
     },
     "walk_forward": {
-        "train_months": 6,
+        "train_months": 8,
         "test_months": 1,
         "step_months": 1,
         "start_date": null,
@@ -399,11 +399,19 @@
         "calendar_months": true,
         "min_test_days": 7,
         "proximity_weight": 0.0,
-        "initial_config": "configs/hype_top.json",
+        "initial_config": "configs/config_hype.json",
         "stop": {
             "patience": 20,
             "min_rel_improvement": 0.001,
-            "max_evals": 0
+            "max_evals": 200000
+        },
+        "min_trade_ratio": 0.5,
+        "max_loss_flatten_frac": 0.02,
+        "stateful_oos": true,
+        "retrain_delay_days": 0,
+        "live_rolling": {
+            "active_dir": "runs/walkforward/live",
+            "check_interval_minutes": 60.0
         },
         "run_id": null
     }

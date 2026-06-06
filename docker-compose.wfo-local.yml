@@ -1,0 +1,28 @@
+services:
+  passivbot-wfo-local-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile_live
+    image: passivbot-lighter:latest
+    container_name: passivbot-wfo-local-manager
+    restart: unless-stopped
+    volumes:
+      - ./:/app/
+    working_dir: /app
+    command:
+      - python
+      - src/tools/wfo_vps_manager.py
+      - watch
+      - --profile
+      - hype_t8
+      - --check-interval-minutes
+      - "15"
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -37,6 +37,10 @@ ENV SKIP_RUST_COMPILE=true
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy runtime source files
 COPY requirements-live.txt requirements-live.txt
 COPY requirements-rust.txt requirements-rust.txt

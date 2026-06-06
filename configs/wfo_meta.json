@@ -21,12 +21,13 @@
   // balance) come from. This file does not duplicate those.
   "base_config": "configs/wfo_hype.json",
 
-  // Warm-start seed for window 0 (the start of history). Later windows warm-start
-  // from the previous window's chosen config.
-  "initial_config": "configs/hype_top.json",
+  // Window 0 (start of history) deploys this config AS-IS (no optimization); its
+  // OOS month is backtested with it. Window 1 warm-starts from it, and later
+  // windows warm-start from the previous window's chosen config.
+  "initial_config": "configs/config_hype.json",
 
   // --- rolling sets ---
-  "train_months": 6,
+  "train_months": 8,
   "test_months": 1,
   "step_months": 1,
   "calendar_months": true,
@@ -51,14 +52,14 @@
   "stop": {
     "patience": 20,
     "min_rel_improvement": 0.001,
-    "max_evals": 0
+    "max_evals": 200000
   },
 
   // --- end-of-month open-position handoff (cut if in profit or small drawdown) ---
   "max_loss_flatten_frac": 0.02, // cut a position only if uPnL >= 0 or |loss| < 2% of equity
 
   // --- backtest fidelity (carry balance + open positions across OOS seams) ---
-  "stateful_oos": false,
+  "stateful_oos": true,
   "retrain_delay_days": 0,
 
   // --- live rolling (operational; enabled toggle stays in the bot's live config) ---
