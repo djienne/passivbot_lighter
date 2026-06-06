@@ -48,6 +48,11 @@ MS_PER_DAY = 86_400_000
 WINDOW_MS = 6 * MS_PER_HOUR  # 6 h = 360 min < 500 API limit
 SKIP_WINDOW_MS = 3 * MS_PER_DAY  # jump 3 days when no data found (short enough to not overshoot new listings)
 CANDLES_PER_DAY = 1440
+# A day whose final minutes are forward-filled (padding) was only partially fetched.
+# Tolerate a few genuine zero-volume minutes before treating the tail as padding.
+PARTIAL_DAY_TAIL_TOLERANCE_MIN = 10
+# Safety cap on how many trailing partial days to drop + re-fetch in one pass.
+MAX_HEAL_DAYS = 5
 MAX_RETRIES = 8
 BACKOFF_BASE = 2.0
 BACKOFF_CAP = 120.0
@@ -290,6 +295,69 @@ def cleanup_tmp_files(coin: str):
             pass
 
 
+def _trailing_padded_run(arr: np.ndarray) -> int:
+    """Count trailing minutes that look forward-filled (padding).
+
+    ``build_daily_array`` fills gaps and the not-yet-existing tail of the current
+    UTC day by repeating the last real close with zero base volume, so a padded
+    bar has ``bv == 0.0`` and ``o == h == l == c``. A run of such bars at the very
+    end of a day means the day was only partially fetched.
+    """
+    if arr.dtype.fields is None or "bv" not in arr.dtype.fields:
+        return 0
+    o, h, low, c, bv = arr["o"], arr["h"], arr["l"], arr["c"], arr["bv"]
+    run = 0
+    for i in range(len(arr) - 1, -1, -1):
+        if bv[i] == 0.0 and o[i] == h[i] == low[i] == c[i]:
+            run += 1
+        else:
+            break
+    return run
+
+
+def heal_partial_days(coin: str) -> int:
+    """Drop and queue a clean re-download of any trailing partially-fetched days.
+
+    Each fetch of the in-progress UTC day forward-fills its not-yet-existing tail
+    (padding). ``save_day`` would overlay fresh candles on a later run, but only if
+    the collector actually revisits that day; to make the correction unconditional
+    we delete every trailing padded day file and rewind the cursor to the earliest
+    dropped day's start, so the normal backfill re-fetches it from scratch (no
+    leading back-fill, since fetching resumes at the day boundary).
+
+    Returns the number of day files dropped (capped at ``MAX_HEAL_DAYS``).
+    """
+    d = coin_dir(coin)
+    dropped = 0
+    earliest_start: int | None = None
+    for _ in range(MAX_HEAL_DAYS):
+        files = sorted(f for f in d.glob("*.npy") if ".tmp" not in f.name)
+        if not files:
+            break
+        last = files[-1]
+        try:
+            arr = np.load(str(last))
+        except Exception:
+            break
+        run = _trailing_padded_run(arr)
+        if run <= PARTIAL_DAY_TAIL_TOLERANCE_MIN:
+            break  # latest day is complete -> nothing more to heal
+        try:
+            last.unlink()
+        except OSError:
+            break
+        earliest_start = date_str_to_start_ms(last.stem)
+        dropped += 1
+        log.info(
+            f"[{coin}] Healing partial day {last.stem}: {run} trailing padded "
+            f"minutes -> dropped, will re-fetch"
+        )
+    if earliest_start is not None:
+        # Rewind the cursor so backfill re-fetches from the earliest dropped day.
+        set_fetched_until(coin, earliest_start)
+    return dropped
+
+
 def build_daily_array(
     candles: list[list], date_str: str, existing: np.ndarray | None = None
 ) -> np.ndarray:
@@ -390,6 +458,7 @@ async def backfill_market(session: aiohttp.ClientSession, market_id: int, coin: 
     after consecutive empty windows to skip pre-listing periods fast.
     """
     cleanup_tmp_files(coin)
+    heal_partial_days(coin)
 
     resume_ts = find_resume_ts(coin)
     if resume_ts:
@@ -452,6 +521,7 @@ async def backfill_market(session: aiohttp.ClientSession, market_id: int, coin: 
 
 async def update_market(session: aiohttp.ClientSession, market_id: int, coin: str):
     """Fetch candles since last data using windowed approach (handles large gaps)."""
+    heal_partial_days(coin)
     resume_ts = find_resume_ts(coin)
     if not resume_ts:
         return await backfill_market(session, market_id, coin)

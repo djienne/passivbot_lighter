@@ -343,6 +343,21 @@ def _record_individual_result(individual, evaluator_config, overrides_list, reco
         del individual.evaluation_metrics
 
 
+def _evaluated_individuals(individuals):
+    """Return only individuals whose fitness has been computed.
+
+    When ``max_evals`` clips a generation mid-batch, ``evaluate_and_record``
+    truncates the offspring it evaluates, leaving the remainder with an empty
+    ``fitness.values`` tuple. NSGA-II crowding-distance (``selNSGA2`` ->
+    ``assignCrowdingDist``) reads the objective count from the first individual
+    and then indexes every individual's objectives, so passing an unevaluated
+    individual raises ``IndexError: tuple index out of range``. Dropping the
+    unevaluated individuals before selection is a no-op in normal (uncapped)
+    generations, where every offspring is evaluated.
+    """
+    return [ind for ind in individuals if ind.fitness.valid]
+
+
 def ea_mu_plus_lambda_stream(
     population,
     toolbox,
@@ -551,7 +566,10 @@ def ea_mu_plus_lambda_stream(
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
         nevals = evaluate_and_record(invalid_ind)
 
-        population[:] = toolbox.select(population + offspring, mu)
+        # A max_evals mid-batch clip can leave some offspring unevaluated; drop
+        # them before NSGA-II selection (see _evaluated_individuals). No-op when
+        # uncapped, where every offspring above was evaluated.
+        population[:] = toolbox.select(population + _evaluated_individuals(offspring), mu)
 
         if halloffame is not None:
             halloffame.update(population)

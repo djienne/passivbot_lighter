@@ -766,6 +766,88 @@ class TestResultRecorder:
             assert recorder.results_file.closed
 
 
+class TestEvaluatedIndividualsGuard:
+    """Regression for the max_evals mid-batch clip.
+
+    When ``max_evals`` truncates the offspring that get evaluated, the remaining
+    offspring keep an empty ``fitness.values``. Feeding them into NSGA-II
+    selection makes DEAP's ``assignCrowdingDist`` index objectives that do not
+    exist -> ``IndexError: tuple index out of range``. ``_evaluated_individuals``
+    drops them before selection.
+    """
+
+    @staticmethod
+    def _make_population():
+        pytest.importorskip("deap")
+        from deap import creator
+
+        for name in ("_CapFitness", "_CapIndividual"):
+            if hasattr(creator, name):
+                delattr(creator, name)
+        creator.create("_CapFitness", ConstraintAwareFitness, weights=(-1.0, -1.0, -1.0))
+        creator.create("_CapIndividual", list, fitness=creator._CapFitness)
+
+        def ind(values, objectives):
+            x = creator._CapIndividual(values)
+            if objectives is not None:
+                x.fitness.values = objectives
+                x.fitness.constraint_violation = 0.0
+                x.constraint_violation = 0.0
+            return x
+
+        # Three mutually non-dominated, fully-evaluated individuals.
+        evaluated = [
+            ind([0.1], (-1.0, -2.0, -0.1)),
+            ind([0.2], (-0.5, -3.0, -0.2)),
+            ind([0.3], (-2.0, -1.0, -0.3)),
+        ]
+        # Offspring clipped by max_evals: never evaluated -> empty fitness.
+        unevaluated = [ind([0.4], None), ind([0.5], None)]
+        return evaluated, unevaluated
+
+    @staticmethod
+    def _cleanup():
+        from deap import creator
+
+        for name in ("_CapFitness", "_CapIndividual"):
+            if hasattr(creator, name):
+                delattr(creator, name)
+
+    def test_unevaluated_individuals_crash_crowding_distance(self):
+        """Documents the bug: unevaluated individuals crash NSGA-II crowding."""
+        from deap.tools.emo import assignCrowdingDist
+
+        evaluated, unevaluated = self._make_population()
+        try:
+            assert all(i.fitness.valid for i in evaluated)
+            assert not any(i.fitness.valid for i in unevaluated)
+            with pytest.raises(IndexError):
+                assignCrowdingDist(evaluated + unevaluated)
+        finally:
+            self._cleanup()
+
+    def test_filter_lets_nsga2_selection_succeed(self):
+        """The fix: filter to evaluated individuals, then selection works."""
+        from deap import tools
+
+        evaluated, unevaluated = self._make_population()
+        try:
+            filtered = optimize._evaluated_individuals(evaluated + unevaluated)
+            assert filtered == evaluated
+            chosen = tools.selNSGA2(filtered, len(evaluated))
+            assert len(chosen) == len(evaluated)
+        finally:
+            self._cleanup()
+
+    def test_filter_is_noop_when_all_evaluated(self):
+        """No behavior change in normal (uncapped) generations."""
+        evaluated, _ = self._make_population()
+        try:
+            assert optimize._evaluated_individuals(evaluated) == evaluated
+        finally:
+            self._cleanup()
+
+
 class TestEvaluator:
     """Test Evaluator class initialization and basic methods."""
 
