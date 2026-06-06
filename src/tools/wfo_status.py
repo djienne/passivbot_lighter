@@ -108,8 +108,8 @@ REMOTE_PROBE = (
     "2>/dev/null | grep PASSIVBOT_REMOTE_LIVE || echo MISSING; "
     "echo; echo @@ACTIVE@@; "
     "cat runs/walkforward/live/active.json 2>/dev/null; "
-    "echo; echo @@HEALTH@@; "
-    "grep -aF '[health]' logs/passivbot_debug.log 2>/dev/null | tail -n 1; "
+    "echo; echo @@LOGMTIME@@; "
+    "stat -c %Y logs/passivbot_debug.log 2>/dev/null || echo 0; "
     "echo; echo @@PNLS@@; "
     "stat -c %Y caches/lighter/lighter_01_pnls.json 2>/dev/null || echo 0; "
     "echo; echo @@END@@"
@@ -243,9 +243,19 @@ def main() -> int:
             elif not ractive:
                 rep.add(FAIL, "remote active.json", "missing/unreadable on VPS")
 
-            health = sec.get("HEALTH", "").strip()
-            rep.add(OK if health else WARN, "VPS health line",
-                    health[:120] if health else "no [health] line found (debug log may be verbose)")
+            # Liveness signal: this passivbot build does not emit [health] lines,
+            # but it streams market-data DEBUG lines continuously, so the debug
+            # log's mtime is a reliable "bot is alive and connected" heartbeat.
+            try:
+                log_mtime = float(sec.get("LOGMTIME", "0") or "0")
+            except ValueError:
+                log_mtime = 0.0
+            if log_mtime <= 0:
+                rep.add(WARN, "VPS debug log", "log missing or unreadable")
+            else:
+                age_s = now_s - log_mtime
+                rep.add(OK if age_s < 600 else WARN, "VPS debug log",
+                        f"updated {_age_str(log_mtime, now_s)} (bot receiving market data)")
 
             try:
                 pnls_mtime = float(sec.get("PNLS", "0") or "0")

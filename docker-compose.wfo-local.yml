@@ -6,6 +6,16 @@ services:
     image: passivbot-lighter-wfo:latest
     container_name: passivbot-wfo-local-manager
     restart: unless-stopped
+    # Reuse Docker's default bridge instead of creating a new project network:
+    # this host runs many compose stacks and the predefined address pools are
+    # exhausted. The manager only needs outbound (SSH to the VPS + Lighter
+    # data download), which the default bridge provides.
+    network_mode: bridge
+    # Unbuffered stdout so watch-loop progress / upload confirmations appear in
+    # `docker logs` in real time (Python block-buffers stdout when not a tty,
+    # otherwise the "skipping upload" / "Uploaded" lines lag behind by a tick).
+    environment:
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ./:/app/
     working_dir: /app

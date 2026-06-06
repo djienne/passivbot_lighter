@@ -332,10 +332,29 @@ def seed_choice_from_config(config_path: str) -> ParetoChoice:
     )
 
 
+# Window fields that actually determine a window's optimization result. The candidates
+# are produced by optimizing the *training* window, and the trade-count guard selects
+# among them using only in-sample rates -- the *test* window feeds neither. The final
+# (live) window's ``test_end`` legitimately advances with wall-clock time as OOS data
+# accrues, so comparing test_start/test_end when validating a cache entry would reject a
+# perfectly valid cache and force an unattended recompute of the current month's config
+# (which is also cross-platform non-deterministic). Validate the train-relevant subset
+# only; ``cache_key`` already encodes the full train config cryptographically.
+_WINDOW_TRAIN_KEYS = ("index", "train_start", "train_end")
+
+
+def _window_train_view(w):
+    if not isinstance(w, dict):
+        return w
+    return {k: w.get(k) for k in _WINDOW_TRAIN_KEYS}
+
+
 def _cache_header_ok(d: Dict[str, Any], expected_key, expected_window, expected_seed) -> bool:
     if expected_key is not None and d.get("cache_key") != expected_key:
         return False
-    if expected_window is not None and d.get("window") != expected_window:
+    if expected_window is not None and (
+        _window_train_view(d.get("window")) != _window_train_view(expected_window)
+    ):
         return False
     if expected_seed is not None and int(d.get("seed", -1)) != int(expected_seed):
         return False

@@ -280,13 +280,54 @@ def run_local(argv: list[str], *, dry_run: bool = False, capture: bool = False) 
     return CmdResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
 
+_SECURE_KEY_CACHE: dict[str, str] = {}
+
+
+def secure_ssh_key(key: str | Path) -> str:
+    """Return a path to the private key with permissions OpenSSH will accept.
+
+    The repo is bind-mounted into the local WFO manager container from a Windows
+    host, so ``lighter.pem`` surfaces inside the Linux container as ``0777`` and
+    OpenSSH refuses it ("UNPROTECTED PRIVATE KEY FILE ... key will be ignored").
+    ``chmod`` on a bind-mounted file is ignored, so when we can't tighten the key
+    in place we copy it once to a private ``0600`` file and reuse that for the
+    process lifetime. On Windows (host conda runs) ssh.exe doesn't enforce POSIX
+    perms, so the key is returned unchanged.
+    """
+    key = str(key)
+    cached = _SECURE_KEY_CACHE.get(key)
+    if cached and os.path.exists(cached):
+        return cached
+    if os.name == "nt":
+        return key
+    try:
+        mode = os.stat(key).st_mode & 0o777
+    except OSError:
+        return key  # let ssh surface the real "no such file" error
+    if mode & 0o077 == 0:
+        return key  # already private enough (<= 0700)
+    # Too open (bind-mounted Windows key surfaces as 0777). NEVER chmod the
+    # original: on a Docker Desktop bind mount a chmod can propagate a mangled
+    # ACL back to the host file and break host-side ssh.exe. Instead copy it once
+    # to a private 0600 file in the container's own filesystem and reuse that.
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="wfo_key_", suffix=".pem")
+        with os.fdopen(fd, "wb") as out, open(key, "rb") as src:
+            out.write(src.read())
+        os.chmod(tmp, 0o600)
+    except OSError:
+        return key
+    _SECURE_KEY_CACHE[key] = tmp
+    return tmp
+
+
 def run_ssh(remote: Remote, command: str, *, dry_run: bool = False, capture: bool = False) -> CmdResult:
     if is_forbidden_remote_command(command):
         raise ValueError(f"refusing unsafe remote optimizer/scheduler command: {command}")
     argv = [
         "ssh",
         "-i",
-        str(remote.ssh_key),
+        secure_ssh_key(remote.ssh_key),
         "-o",
         "StrictHostKeyChecking=no",
         remote.target,
@@ -316,10 +357,11 @@ def run_scp(
     dry_run: bool = False,
     download: bool = False,
 ) -> CmdResult:
+    key = secure_ssh_key(remote.ssh_key)
     if download:
-        argv = ["scp", "-i", str(remote.ssh_key), "-o", "StrictHostKeyChecking=no", f"{remote.target}:{source}", dest]
+        argv = ["scp", "-i", key, "-o", "StrictHostKeyChecking=no", f"{remote.target}:{source}", dest]
     else:
-        argv = ["scp", "-i", str(remote.ssh_key), "-o", "StrictHostKeyChecking=no", str(source), f"{remote.target}:{dest}"]
+        argv = ["scp", "-i", key, "-o", "StrictHostKeyChecking=no", str(source), f"{remote.target}:{dest}"]
     return run_local(argv, dry_run=dry_run)
 
 
