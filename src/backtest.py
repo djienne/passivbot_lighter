@@ -700,7 +700,10 @@ def process_forager_fills(
             continue
         pnls[pside] = profit + loss
         analysis_appendix[f"loss_profit_ratio_{pside}"] = abs(loss / profit)
-    analysis_appendix["pnl_ratio_long_short"] = pnls["long"] / (pnls["long"] + pnls["short"])
+    total_pnl_long_short = pnls["long"] + pnls["short"]
+    analysis_appendix["pnl_ratio_long_short"] = (
+        pnls["long"] / total_pnl_long_short if total_pnl_long_short != 0.0 else 1.0
+    )
     sample_divider = max(1, int(balance_sample_divider))
     if not fdf.empty:
         timestamps_ns = fdf["timestamp"].astype("int64")
@@ -721,10 +724,15 @@ def process_forager_fills(
         btc_cash_series.index = pd.to_datetime(btc_cash_series.index, unit="ns")
         btc_total_balance_series.index = pd.to_datetime(btc_total_balance_series.index, unit="ns")
     else:
-        usd_cash_series = pd.Series(dtype=float, name="usd_cash_wallet")
-        usd_total_balance_series = pd.Series(dtype=float, name="usd_total_balance")
-        btc_cash_series = pd.Series(dtype=float, name="btc_cash_wallet")
-        btc_total_balance_series = pd.Series(dtype=float, name="btc_total_balance")
+        empty_dt_index = pd.DatetimeIndex([])
+        usd_cash_series = pd.Series(dtype=float, name="usd_cash_wallet", index=empty_dt_index)
+        usd_total_balance_series = pd.Series(
+            dtype=float, name="usd_total_balance", index=empty_dt_index
+        )
+        btc_cash_series = pd.Series(dtype=float, name="btc_cash_wallet", index=empty_dt_index)
+        btc_total_balance_series = pd.Series(
+            dtype=float, name="btc_total_balance", index=empty_dt_index
+        )
     equities_array = np.asarray(equities_array)
     equities_index = pd.to_datetime(equities_array[:, 0].astype(np.int64), unit="ms")
     edf = pd.Series(
