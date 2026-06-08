@@ -24,7 +24,7 @@ services:
       - src/tools/wfo_vps_manager.py
       - watch
       - --profile
-      - hype_t8
+      - hype_t12
       - --check-interval-minutes
       - "15"
     deploy:
