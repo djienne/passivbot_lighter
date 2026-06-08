@@ -110,6 +110,19 @@ Success looks like: `Local active` == `Remote active` (new hash); manager log sh
 `passivbot-lighter-live  Up … (healthy)`. (`passivbot-hype-live` is a **separate**
 strategy — leave it alone.)
 
+For a one-shot confirmation that the remote bot is *actually trading the new config*
+**and** that nothing training-related is running on the (underpowered) VPS, use the
+read-only helper:
+```powershell
+docker compose -f docker-compose.wfo-local.yml run --rm passivbot-wfo-local-manager `
+  python src/tools/remote_live_check.py --tail 120
+```
+It prints: running containers (expect only `passivbot-lighter-live` + the separate
+`passivbot-hype-live`, **no `*wfo*` container**), the live bot's `PASSIVBOT_REMOTE_LIVE=1`
+optimization guard, an empty crontab + no systemd timers, and the last N bot-log lines
+(look for `wfo: adopted strategy for period … (hash <new>)` and live `[order]`/`[pnl]`
+activity).
+
 ---
 
 ## Shortcut (less control)
