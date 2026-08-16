@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile_live
     image: passivbot-lighter:latest
     container_name: passivbot-lighter-live
+    # Opt-in only: this folder is for backtests; `docker compose up -d` must not
+    # start a live trader. passivbot_real_run is the one meant to trade.
+    # Start deliberately with: docker compose --profile live up -d
+    profiles: ["live"]
     restart: unless-stopped
     volumes:
       - ./:/app/

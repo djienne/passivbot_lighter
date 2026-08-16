@@ -5,11 +5,19 @@ from typing import Callable, Optional, Dict
 
 try:  # optional in some test environments
     import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    import matplotlib.dates as mdates
+    import matplotlib.patches as mpatches
+    from matplotlib.colors import LinearSegmentedColormap
     from matplotlib.figure import Figure
 except ImportError:  # pragma: no cover
     from types import SimpleNamespace
 
     plt = SimpleNamespace(rcParams={})
+    mticker = SimpleNamespace(FuncFormatter=lambda f: None)
+    mdates = SimpleNamespace()
+    mpatches = SimpleNamespace()
+    LinearSegmentedColormap = None
     Figure = object
 import pandas as pd
 import numpy as np
@@ -709,6 +717,248 @@ def plot_fills_forager(
     return plt
 
 
+_PLOT_COLORS = {
+    "fig_bg": "#f8fafc",
+    "ax_bg": "#ffffff",
+    "equity": "#059669",
+    "equity_fill_top": "#10b981",
+    "balance": "#1d4ed8",
+    "hwm": "#065f46",
+    "start_ref": "#94a3b8",
+    "dd_fill": "#dc2626",
+    "dd_edge": "#b91c1c",
+    "dd_span_fill": "#fecaca",
+    "grid": "#e2e8f0",
+    "spine": "#cbd5e1",
+    "text_head": "#0f172a",
+    "text_body": "#475569",
+    "text_mute": "#94a3b8",
+    "card_border": "#e2e8f0",
+    "cagr_trend": "#f59e0b",
+    "pos": "#059669",
+    "neg": "#b91c1c",
+}
+
+_PLOT_RCPARAMS = {
+    "font.family": ["DejaVu Sans", "Segoe UI", "sans-serif"],
+    "font.size": 10,
+    "axes.labelsize": 11,
+    "axes.edgecolor": _PLOT_COLORS["spine"],
+    "axes.linewidth": 0.8,
+    "xtick.color": "#64748b",
+    "ytick.color": "#64748b",
+    "axes.unicode_minus": False,
+    "figure.dpi": 110,
+    "savefig.dpi": 150,
+    "mathtext.default": "regular",
+}
+
+
+def _compute_drawdown(eq: np.ndarray):
+    """Return (running_peak, dd_pct, peak_before_trough_idx, trough_idx). O(n)."""
+    if eq.size == 0:
+        return eq.copy(), eq.copy(), 0, 0
+    valid = ~np.isnan(eq)
+    if not valid.any():
+        return np.full_like(eq, np.nan), np.zeros_like(eq), 0, 0
+    filled = np.where(valid, eq, -np.inf)
+    peak = np.maximum.accumulate(filled)
+    peak = np.where(valid, peak, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dd_pct = np.where(
+            np.isfinite(peak) & (peak > 0.0),
+            (eq / peak - 1.0) * 100.0,
+            0.0,
+        )
+    finite_dd = np.where(np.isfinite(dd_pct), dd_pct, 0.0)
+    trough_i = int(np.argmin(finite_dd))
+    search_end = max(1, trough_i + 1)
+    pre_slice = np.where(valid[:search_end], eq[:search_end], -np.inf)
+    peak_before_i = int(np.argmax(pre_slice)) if np.isfinite(pre_slice).any() else 0
+    return peak, dd_pct, peak_before_i, trough_i
+
+
+def _fmt_money(v: float, include_cents: bool = False) -> str:
+    if not np.isfinite(v):
+        return "-"
+    if abs(v) >= 1_000_000:
+        return f"${v/1_000_000:,.2f}M"
+    if include_cents:
+        return f"${v:,.2f}"
+    return f"${v:,.0f}"
+
+
+def _add_gradient_fill(ax, x, y, *, color_top: str, alpha_top: float = 0.45):
+    """Apply a vertical gradient fill under curve `(x, y)` by clipping imshow.
+
+    Silently no-ops if imshow/clip path fails (e.g., empty data).
+    """
+    if LinearSegmentedColormap is None:
+        return
+    try:
+        finite = np.isfinite(y)
+        if not finite.any():
+            return
+        ymin = float(np.nanmin(y))
+        ymax = float(np.nanmax(y))
+        if not np.isfinite(ymin) or not np.isfinite(ymax) or ymax <= ymin:
+            return
+        cmap = LinearSegmentedColormap.from_list(
+            "eq_grad", [(1, 1, 1, 0), color_top]
+        )
+        gradient = np.linspace(0.0, 1.0, 256).reshape(-1, 1)
+        im = ax.imshow(
+            gradient,
+            aspect="auto",
+            origin="lower",
+            extent=[
+                mdates.date2num(pd.Timestamp(x[0]).to_pydatetime()),
+                mdates.date2num(pd.Timestamp(x[-1]).to_pydatetime()),
+                ymin,
+                ymax,
+            ],
+            cmap=cmap,
+            alpha=alpha_top,
+            zorder=1.2,
+        )
+        # Build the clipping polygon: curve on top, baseline on bottom.
+        xs = mdates.date2num(pd.to_datetime(x).to_pydatetime().tolist())
+        y_filled = np.where(finite, y, ymin)
+        verts = list(zip(xs, y_filled))
+        verts += [(xs[-1], ymin), (xs[0], ymin)]
+        poly = mpatches.Polygon(verts, closed=True, transform=ax.transData)
+        im.set_clip_path(poly)
+    except Exception:
+        # Fallback: plain fill_between
+        try:
+            ax.fill_between(
+                x, np.nanmin(y), y, color=color_top, alpha=0.12, linewidth=0, zorder=1.2
+            )
+        except Exception:
+            pass
+
+
+def _draw_kpi_cards(fig, cards: list) -> None:
+    """Render a row of KPI cards across the top of the figure.
+
+    Each `cards` entry: (label, value_str, value_color_hex).
+    """
+    n = len(cards)
+    if n == 0:
+        return
+
+    left, right = 0.03, 0.97
+    y_bottom, y_top = 0.885, 0.975
+    card_h = y_top - y_bottom
+    gap_frac = 0.012
+    card_w = (right - left - gap_frac * (n - 1)) / n
+
+    # Use a figure-spanning invisible axis so all card artists share one parent
+    # and matplotlib zorder works predictably between patches and text.
+    card_ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], frameon=False)
+    card_ax.set_xlim(0, 1)
+    card_ax.set_ylim(0, 1)
+    card_ax.set_axis_off()
+
+    for i, (label, value, value_color) in enumerate(cards):
+        x0 = left + i * (card_w + gap_frac)
+        box = mpatches.FancyBboxPatch(
+            (x0, y_bottom),
+            card_w,
+            card_h,
+            boxstyle="round,pad=0,rounding_size=0.01",
+            linewidth=0.8,
+            edgecolor=_PLOT_COLORS["card_border"],
+            facecolor=_PLOT_COLORS["ax_bg"],
+            zorder=4,
+        )
+        card_ax.add_patch(box)
+        card_ax.text(
+            x0 + card_w / 2,
+            y_bottom + card_h * 0.72,
+            label,
+            ha="center",
+            va="center",
+            fontsize=8.5,
+            color=_PLOT_COLORS["text_mute"],
+            fontweight="regular",
+            parse_math=False,
+            zorder=6,
+        )
+        card_ax.text(
+            x0 + card_w / 2,
+            y_bottom + card_h * 0.34,
+            value,
+            ha="center",
+            va="center",
+            fontsize=15,
+            color=value_color,
+            fontweight="bold",
+            parse_math=False,
+            zorder=6,
+        )
+
+
+def _draw_context_header(
+    fig,
+    *,
+    exchange: str,
+    coins_str: str,
+    n_days: int,
+    start_str: str,
+    end_str: str,
+    cfg_name: str,
+    stats_line: str = "",
+) -> None:
+    if stats_line:
+        fig.text(
+            0.5, 0.860, stats_line,
+            ha="center", va="top",
+            fontsize=10.5, color=_PLOT_COLORS["text_head"],
+            parse_math=False,
+        )
+    bits = [exchange, coins_str, f"{n_days} days  ({start_str} → {end_str})"]
+    if cfg_name:
+        bits.append(cfg_name)
+    sub = "   •   ".join(bits)
+    fig.text(
+        0.5, 0.832 if stats_line else 0.855, sub,
+        ha="center", va="top",
+        fontsize=9.5, color=_PLOT_COLORS["text_body"],
+        parse_math=False,
+    )
+
+
+def _draw_footer(fig, *, fee_str: str, min_wallet_str: str) -> None:
+    parts = []
+    if fee_str:
+        parts.append(f"Fees: {fee_str}")
+    if min_wallet_str:
+        parts.append(min_wallet_str)
+    if not parts:
+        return
+    fig.text(
+        0.98, 0.015,
+        "   •   ".join(parts),
+        ha="right", va="bottom",
+        fontsize=11, color=_PLOT_COLORS["text_head"],
+        fontweight="semibold" if False else "normal",
+        parse_math=False,
+    )
+
+
+def _style_axes(ax) -> None:
+    ax.set_facecolor(_PLOT_COLORS["ax_bg"])
+    ax.grid(True, which="major", linestyle="-", linewidth=0.5, color=_PLOT_COLORS["grid"], zorder=0)
+    for name, sp in ax.spines.items():
+        if name in ("top", "right"):
+            sp.set_visible(False)
+        else:
+            sp.set_color(_PLOT_COLORS["spine"])
+            sp.set_linewidth(0.8)
+    ax.tick_params(colors="#64748b", labelsize=9)
+
+
 def create_forager_balance_figures(
     bal_eq: pd.DataFrame,
     figsize=(21, 13),
@@ -719,7 +969,16 @@ def create_forager_balance_figures(
     return_figures: bool | None = None,
     stride: int = 1,
     fast: bool = False,
+    suptitle: str | None = None,
+    info: dict | None = None,
 ) -> dict:
+    """Render equity/drawdown dashboard figure.
+
+    `info` (optional) provides structured metadata for header/footer:
+        exchange, coins (list[str]), cfg_name, starting_balance, n_fills,
+        analysis (dict from backtest), fee_str, min_wallet_str
+    When `info` is absent, falls back to rendering `suptitle` string.
+    """
     stride = max(1, int(stride)) if stride else 1
     df = bal_eq.iloc[::stride]
 
@@ -742,26 +1001,12 @@ def create_forager_balance_figures(
             return np.empty((n_rows, 0))
         return np.column_stack(columns)
 
-    figures = {}
-    panel_configs = [
-        (
-            "USD Cash / Balance / Equity",
-            [
-                ("USD Cash Wallet", "usd_cash_wallet"),
-                ("USD Total Balance", "usd_total_balance"),
-                ("USD Total Equity", "usd_total_equity"),
-            ],
-        ),
-        (
-            "BTC Cash / Balance / Equity",
-            [
-                ("BTC Cash Wallet", "btc_cash_wallet"),
-                ("BTC Total Balance", "btc_total_balance"),
-                ("BTC Total Equity", "btc_total_equity"),
-            ],
-        ),
+    figures: dict = {}
+    series_specs = [
+        ("Balance", "usd_total_balance", _PLOT_COLORS["balance"], 1.3, 0.85),
+        ("Equity", "usd_total_equity", _PLOT_COLORS["equity"], 1.8, 1.0),
     ]
-    panel_data = [_extract_columns(df, [key for _, key in specs]) for _, specs in panel_configs]
+    data = _extract_columns(df, [key for _, key, *_ in series_specs])
     x = df.index.to_numpy()
 
     autoplot = (_ipy_display is not None) if autoplot is None else autoplot
@@ -772,41 +1017,359 @@ def create_forager_balance_figures(
     if include_logy:
         modes = [False, True]
 
+    figsize_full = (17, 10)
+
+    # Pre-compute equity-derived series for both modes
+    eq_col_idx = 1  # usd_total_equity is second in series_specs
+    eq = data[:, eq_col_idx]
+    peak, dd_pct, peak_before_i, trough_i = _compute_drawdown(eq)
+
     for mode in modes:
-        fig, axes = plt.subplots(2, 1, sharex=True, figsize=figsize)
-        y_transform = (lambda arr: np.where(arr > 0.0, arr, np.nan)) if mode else (lambda arr: arr)
+        with plt.rc_context(_PLOT_RCPARAMS):
+            fig = plt.figure(figsize=figsize_full, facecolor=_PLOT_COLORS["fig_bg"])
 
-        for ax, (title, series_specs), data in zip(axes, panel_configs, panel_data):
-            ax.set_yscale("log" if mode else "linear")
+            # Layout: reserve top for KPI cards (0.855 below), plot area 0.05..0.82
+            if mode:
+                # Log variant: single panel
+                ax_eq = fig.add_axes([0.06, 0.06, 0.90, 0.75])
+                ax_dd = None
+            else:
+                ax_eq = fig.add_axes([0.06, 0.26, 0.90, 0.55])
+                ax_dd = fig.add_axes([0.06, 0.06, 0.90, 0.17], sharex=ax_eq)
+
+            _style_axes(ax_eq)
+            if ax_dd is not None:
+                _style_axes(ax_dd)
+                ax_dd.grid(True, which="major", linestyle="-", linewidth=0.5,
+                           color=_PLOT_COLORS["grid"], zorder=0)
+
+            y_transform = (lambda arr: np.where(arr > 0.0, arr, np.nan)) if mode else (lambda arr: arr)
             y_values = y_transform(data)
-            for col_idx, (label, _) in enumerate(series_specs):
-                ax.plot(
-                    x,
-                    y_values[:, col_idx],
-                    label=label,
-                    linewidth=1.0,
-                )
-            ax.set_title(title)
-            ax.grid(True, linestyle="--", alpha=0.3)
-            ax.legend()
-        axes[-1].set_xlabel("Time")
-        fig.tight_layout()
 
-        key = "balance_and_equity_logy" if mode else "balance_and_equity"
-        if return_figures:
-            figures[key] = fig
-        if autoplot:
-            if _ipy_display is not None:
-                _ipy_display(fig)
-            else:  # pragma: no cover
+            ax_eq.set_yscale("log" if mode else "linear")
+
+            # Gradient fill under equity curve (skip on log scale)
+            if not mode and not fast:
+                _add_gradient_fill(
+                    ax_eq, x, y_values[:, eq_col_idx],
+                    color_top=_PLOT_COLORS["equity_fill_top"],
+                    alpha_top=0.40,
+                )
+
+            # Max drawdown shaded span on equity panel
+            if not fast and trough_i > peak_before_i and trough_i < len(x):
+                ax_eq.axvspan(
+                    x[peak_before_i], x[trough_i],
+                    color=_PLOT_COLORS["dd_span_fill"], alpha=0.25, zorder=0.5,
+                )
+
+            # Starting balance reference line
+            if info and info.get("starting_balance") is not None:
                 try:
-                    fig.show()
+                    sb = float(info["starting_balance"])
+                    if sb > 0 and (not mode or sb > 0):
+                        ax_eq.axhline(
+                            sb, color=_PLOT_COLORS["start_ref"],
+                            linestyle=":", linewidth=0.9, alpha=0.85, zorder=1.5,
+                        )
+                        ax_eq.text(
+                            x[-1], sb, f"  start {_fmt_money(sb)}",
+                            va="center", ha="left",
+                            fontsize=8, color=_PLOT_COLORS["text_mute"],
+                            parse_math=False, zorder=1.6,
+                        )
+                except (TypeError, ValueError):
+                    pass
+
+            # High-watermark line
+            if not fast:
+                ax_eq.plot(
+                    x, peak,
+                    color=_PLOT_COLORS["hwm"], linewidth=1.0,
+                    linestyle=(0, (4, 3)), alpha=0.45, zorder=2.3,
+                    label="High-water mark",
+                )
+
+            # Balance + Equity lines
+            for col_idx, (label, _key, color, lw, alpha) in enumerate(series_specs):
+                ax_eq.plot(
+                    x, y_values[:, col_idx],
+                    label=label, color=color, linewidth=lw, alpha=alpha,
+                    zorder=3 if _key == "usd_total_equity" else 2.6,
+                )
+
+            # End-point marker + label
+            if len(x) > 0 and np.isfinite(eq[-1]):
+                ax_eq.scatter(
+                    [x[-1]], [eq[-1]],
+                    color=_PLOT_COLORS["equity"], s=40, zorder=4,
+                    edgecolors="white", linewidths=1.2,
+                )
+                ax_eq.annotate(
+                    _fmt_money(eq[-1]),
+                    xy=(x[-1], eq[-1]),
+                    xytext=(-8, 10), textcoords="offset points",
+                    fontsize=10, fontweight="bold",
+                    color=_PLOT_COLORS["text_head"],
+                    ha="right", va="bottom", parse_math=False, zorder=4,
+                )
+
+            # CAGR trend line in log mode
+            if mode and info and info.get("starting_balance") and len(x) > 1:
+                try:
+                    sb = float(info["starting_balance"])
+                    n_ts = len(x)
+                    days_elapsed = np.arange(n_ts, dtype=float) * (
+                        (pd.Timestamp(x[-1]) - pd.Timestamp(x[0])).total_seconds()
+                        / max(1, n_ts - 1) / 86400.0
+                    )
+                    total_days = max(1e-9, days_elapsed[-1])
+                    end_val = float(eq[-1]) if np.isfinite(eq[-1]) else sb
+                    if sb > 0 and end_val > 0:
+                        cagr = (end_val / sb) ** (365.0 / total_days) - 1.0
+                        trend = sb * (1.0 + cagr) ** (days_elapsed / 365.0)
+                        ax_eq.plot(
+                            x, trend,
+                            color=_PLOT_COLORS["cagr_trend"],
+                            linewidth=1.4, linestyle=(0, (5, 3)),
+                            alpha=0.85, zorder=2.8,
+                            label=f"CAGR trend ({cagr*100:+.1f}%/yr)",
+                        )
                 except Exception:
                     pass
-        if not return_figures:
-            plt.close(fig)
+
+            # Max DD annotation
+            if not fast and trough_i > 0 and trough_i < len(x) and np.isfinite(eq[trough_i]):
+                dd_val = dd_pct[trough_i]
+                in_right = trough_i > len(x) * 0.7
+                off = (-90, -30) if in_right else (30, -35)
+                ha = "right" if in_right else "left"
+                ax_eq.annotate(
+                    f"Max DD\n{dd_val:.1f}%",
+                    xy=(x[trough_i], eq[trough_i]),
+                    xytext=off, textcoords="offset points",
+                    fontsize=9, color=_PLOT_COLORS["dd_edge"],
+                    ha=ha, va="top", parse_math=False,
+                    arrowprops=dict(
+                        arrowstyle="->",
+                        color="#64748b", lw=0.8,
+                        connectionstyle="arc3,rad=0.2",
+                    ),
+                    bbox=dict(
+                        boxstyle="round,pad=0.35",
+                        fc="#fff1f2", ec="#fecaca", lw=0.7,
+                    ),
+                    zorder=5,
+                )
+
+            ax_eq.yaxis.set_major_formatter(
+                mticker.FuncFormatter(lambda v, _pos: _fmt_money(v))
+            )
+            ax_eq.set_ylabel("Equity (USDC)", color=_PLOT_COLORS["text_body"], fontsize=11)
+            ax_eq.margins(x=0.005)
+
+            leg = ax_eq.legend(
+                loc="upper left", frameon=True, framealpha=0.92,
+                edgecolor=_PLOT_COLORS["card_border"], fontsize=9,
+            )
+            leg.get_frame().set_facecolor(_PLOT_COLORS["ax_bg"])
+            leg.set_zorder(6)
+
+            # Drawdown panel
+            if ax_dd is not None:
+                ax_dd.fill_between(
+                    x, dd_pct, 0.0,
+                    color=_PLOT_COLORS["dd_fill"], alpha=0.18, linewidth=0, zorder=1,
+                )
+                ax_dd.plot(
+                    x, dd_pct,
+                    color=_PLOT_COLORS["dd_edge"], linewidth=0.9, zorder=2,
+                )
+                ax_dd.axhline(0.0, color=_PLOT_COLORS["spine"], linewidth=0.8, zorder=1.5)
+                ax_dd.yaxis.set_major_formatter(
+                    mticker.FuncFormatter(lambda v, _pos: f"{v:.0f}%")
+                )
+                dd_min = float(np.nanmin(dd_pct)) if dd_pct.size else 0.0
+                ax_dd.set_ylim(dd_min * 1.08 if dd_min < 0 else -1.0, 0.5)
+                ax_dd.set_ylabel("Drawdown", color=_PLOT_COLORS["text_body"], fontsize=10)
+                ax_dd.margins(x=0.005)
+                # Hide x ticks on equity panel; let drawdown own them
+                plt.setp(ax_eq.get_xticklabels(), visible=False)
+                try:
+                    locator = mdates.AutoDateLocator()
+                    ax_dd.xaxis.set_major_locator(locator)
+                    ax_dd.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+                except Exception:
+                    pass
+            else:
+                try:
+                    locator = mdates.AutoDateLocator()
+                    ax_eq.xaxis.set_major_locator(locator)
+                    ax_eq.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+                except Exception:
+                    pass
+
+            # KPI cards + context header + footer (structured info path)
+            if info is not None:
+                cards = _build_kpi_cards(info, bal_eq)
+                _draw_kpi_cards(fig, cards)
+                _draw_context_header(
+                    fig,
+                    exchange=str(info.get("exchange", "")),
+                    coins_str=",".join(info.get("coins", [])) or "?",
+                    n_days=int(info.get("n_days", 0)),
+                    start_str=str(info.get("start_str", "")),
+                    end_str=str(info.get("end_str", "")),
+                    cfg_name=str(info.get("cfg_name", "")),
+                    stats_line=_build_stats_line(info, bal_eq),
+                )
+                _draw_footer(
+                    fig,
+                    fee_str=str(info.get("fee_str", "") or ""),
+                    min_wallet_str=str(info.get("min_wallet_str", "") or ""),
+                )
+            elif suptitle:
+                # Fallback: render plain suptitle text (legacy path)
+                lines = suptitle.split("\n")
+                fig.text(
+                    0.5, 0.965, lines[0] if lines else "",
+                    ha="center", va="top",
+                    fontsize=16, fontweight="bold",
+                    color=_PLOT_COLORS["text_head"], parse_math=False,
+                )
+                for i, sl in enumerate(lines[1:]):
+                    fig.text(
+                        0.5, 0.925 - i * 0.028, sl,
+                        ha="center", va="top",
+                        fontsize=10, color=_PLOT_COLORS["text_body"],
+                        parse_math=False,
+                    )
+
+            key = "balance_and_equity_logy" if mode else "balance_and_equity"
+            if return_figures:
+                figures[key] = fig
+            if autoplot:
+                if _ipy_display is not None:
+                    _ipy_display(fig)
+                else:  # pragma: no cover
+                    try:
+                        fig.show()
+                    except Exception:
+                        pass
+            if not return_figures:
+                plt.close(fig)
 
     return figures if return_figures else {}
+
+
+def _build_stats_line(info: dict, bal_eq: pd.DataFrame) -> str:
+    """Secondary stats line preserving all metrics that don't fit in KPI cards."""
+    analysis = info.get("analysis") or {}
+
+    def _num(k):
+        v = analysis.get(k)
+        try:
+            return float(v) if v is not None else float("nan")
+        except (TypeError, ValueError):
+            return float("nan")
+
+    try:
+        eq_col = "usd_total_equity" if "usd_total_equity" in bal_eq.columns else None
+        if eq_col is not None and len(bal_eq) > 0:
+            start_eq = float(bal_eq[eq_col].iloc[0])
+            end_eq = float(bal_eq[eq_col].iloc[-1])
+            gain_pct = (end_eq / start_eq - 1.0) * 100.0 if start_eq > 0 else float("nan")
+        else:
+            start_eq = end_eq = gain_pct = float("nan")
+    except Exception:
+        start_eq = end_eq = gain_pct = float("nan")
+
+    adg_pct = _num("adg_usd") * 100.0
+    lpr = _num("loss_profit_ratio")
+    we_max = _num("total_wallet_exposure_max")
+
+    parts = []
+    if np.isfinite(start_eq) and np.isfinite(end_eq):
+        parts.append(f"{_fmt_money(start_eq)} → {_fmt_money(end_eq)}")
+    if np.isfinite(gain_pct):
+        parts.append(f"Gain: {gain_pct:+.1f}%")
+    if np.isfinite(adg_pct):
+        parts.append(f"ADG: {adg_pct:.2f}%/day")
+    if np.isfinite(lpr):
+        parts.append(f"Loss/Profit: {lpr:.3f}")
+    if np.isfinite(we_max):
+        parts.append(f"Max WE: {we_max:.2f}")
+    return "   •   ".join(parts)
+
+
+def _build_kpi_cards(info: dict, bal_eq: pd.DataFrame) -> list:
+    """Build the KPI card tuple list from structured info."""
+    analysis = info.get("analysis") or {}
+
+    def _num(k):
+        v = analysis.get(k)
+        try:
+            return float(v) if v is not None else float("nan")
+        except (TypeError, ValueError):
+            return float("nan")
+
+    # CAGR from equity endpoints
+    try:
+        eq_col = "usd_total_equity" if "usd_total_equity" in bal_eq.columns else None
+        if eq_col is not None and len(bal_eq) > 1:
+            start_eq = float(bal_eq[eq_col].iloc[0])
+            end_eq = float(bal_eq[eq_col].iloc[-1])
+            n_days = max(1, int(info.get("n_days", 0)))
+            if start_eq > 0 and end_eq > 0 and n_days > 0:
+                cagr_pct = ((end_eq / start_eq) ** (365.0 / n_days) - 1.0) * 100.0
+            else:
+                cagr_pct = float("nan")
+        else:
+            cagr_pct = float("nan")
+    except Exception:
+        cagr_pct = float("nan")
+
+    dd_worst_pct = _num("drawdown_worst_usd") * 100.0
+    import math as _math
+    ann = _math.sqrt(365.0)
+    sharpe_ann = _num("sharpe_ratio_usd") * ann
+    sortino_ann = _num("sortino_ratio_usd") * ann
+    gain_x = _num("gain_usd")
+    n_fills = int(info.get("n_fills") or 0)
+
+    def _fmt_pct(v):
+        if not np.isfinite(v):
+            return "—"
+        return f"{v:+.1f}%"
+
+    def _fmt_ratio(v):
+        if not np.isfinite(v):
+            return "—"
+        return f"{v:.2f}"
+
+    def _fmt_gain(v):
+        if not np.isfinite(v):
+            return "—"
+        return f"{v:.2f}x"
+
+    cagr_color = _PLOT_COLORS["pos"] if np.isfinite(cagr_pct) and cagr_pct >= 0 else _PLOT_COLORS["neg"]
+    gain_color = _PLOT_COLORS["pos"] if np.isfinite(gain_x) and gain_x >= 1 else _PLOT_COLORS["neg"]
+
+    min_wallet_str = str(info.get("min_wallet_str") or "")
+    # min_wallet_str is e.g. "Min wallet (init ≥ $15, +10%): $572 USDC" — extract "$572"
+    import re as _re
+    mw_match = _re.search(r"(\$[\d,]+)\s*USDC?", min_wallet_str)
+    min_wallet_val = mw_match.group(1) if mw_match else "—"
+
+    return [
+        ("CAGR", _fmt_pct(cagr_pct), cagr_color),
+        ("MAX DD", _fmt_pct(-abs(dd_worst_pct)) if np.isfinite(dd_worst_pct) else "—", _PLOT_COLORS["neg"]),
+        ("SHARPE (ANN)", _fmt_ratio(sharpe_ann), _PLOT_COLORS["text_head"]),
+        ("SORTINO (ANN)", _fmt_ratio(sortino_ann), _PLOT_COLORS["text_head"]),
+        ("GAIN", _fmt_gain(gain_x), gain_color),
+        ("FILLS", f"{n_fills:,}", _PLOT_COLORS["text_head"]),
+        ("MIN WALLET", min_wallet_val, _PLOT_COLORS["text_head"]),
+    ]
 
 
 def create_forager_coin_figures(

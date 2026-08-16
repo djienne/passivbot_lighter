@@ -31,6 +31,7 @@ sys.argv = [sys.argv[0]] + _rust_remaining
 import numpy as np
 import pandas as pd
 import json
+import math
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
@@ -1064,6 +1065,201 @@ def run_backtest(hlcvs, mss, config: dict, exchange: str, btc_usd_prices, timest
     return fills, equities_array, analysis
 
 
+def _build_plot_info(bal_eq, fdf, analysis, config, exchange, mss=None) -> dict:
+    """Structured metadata for the beautified balance/equity plot."""
+    try:
+        coins = require_config_value(config, f"backtest.coins.{exchange}")
+    except Exception:
+        coins = []
+
+    cfg_path = config.get("_source_config_path") or ""
+    cfg_name = os.path.basename(cfg_path) if cfg_path else ""
+
+    try:
+        start_dt = pd.to_datetime(bal_eq.index[0])
+        end_dt = pd.to_datetime(bal_eq.index[-1])
+        n_days = max(1, (end_dt - start_dt).days)
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_str = end_dt.strftime("%Y-%m-%d")
+    except Exception:
+        start_str = end_str = ""
+        n_days = 0
+
+    try:
+        starting_balance = float(require_config_value(config, "backtest.starting_balance"))
+    except Exception:
+        starting_balance = None
+
+    fee_str = _format_fees_from_mss(mss, coins)
+    min_wallet = _calc_min_wallet_for_config(config, min_order_usd=15.0, margin_pct=0.10)
+    min_wallet_str = (
+        f"Min wallet (init ≥ $15, +10%): ${min_wallet:,.0f} USDC" if min_wallet is not None else ""
+    )
+
+    return {
+        "exchange": exchange,
+        "coins": list(coins),
+        "cfg_name": cfg_name,
+        "starting_balance": starting_balance,
+        "n_fills": int(len(fdf)) if fdf is not None else 0,
+        "analysis": analysis,
+        "fee_str": fee_str,
+        "min_wallet_str": min_wallet_str,
+        "n_days": n_days,
+        "start_str": start_str,
+        "end_str": end_str,
+    }
+
+
+def _build_balance_suptitle(bal_eq, fdf, analysis, config, exchange, mss=None) -> str:
+    def _num(key, default=float("nan")):
+        v = analysis.get(key, default)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        coins = require_config_value(config, f"backtest.coins.{exchange}")
+    except Exception:
+        coins = []
+    coins_str = ",".join(coins) if coins else "?"
+
+    cfg_path = config.get("_source_config_path") or ""
+    cfg_name = os.path.basename(cfg_path) if cfg_path else ""
+
+    try:
+        start_dt = pd.to_datetime(bal_eq.index[0])
+        end_dt = pd.to_datetime(bal_eq.index[-1])
+        n_days = max(1, (end_dt - start_dt).days)
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_str = end_dt.strftime("%Y-%m-%d")
+    except Exception:
+        start_str = end_str = "?"
+        n_days = 0
+
+    equity_col = "usd_total_equity" if "usd_total_equity" in bal_eq.columns else None
+    if equity_col is not None and len(bal_eq) > 0:
+        start_eq = float(bal_eq[equity_col].iloc[0])
+        end_eq = float(bal_eq[equity_col].iloc[-1])
+        gain_pct = (end_eq / start_eq - 1.0) * 100.0 if start_eq > 0 else float("nan")
+    else:
+        start_eq = end_eq = gain_pct = float("nan")
+
+    if start_eq and start_eq > 0 and end_eq > 0 and n_days > 0:
+        cagr_pct = ((end_eq / start_eq) ** (365.0 / n_days) - 1.0) * 100.0
+    else:
+        cagr_pct = float("nan")
+
+    gain_x = _num("gain_usd")
+    dd_worst = _num("drawdown_worst_usd") * 100.0
+    # passivbot sharpe/sortino are daily; crypto runs 24/7 so annualize with sqrt(365)
+    ann_factor = math.sqrt(365.0)
+    sharpe = _num("sharpe_ratio_usd") * ann_factor
+    sortino = _num("sortino_ratio_usd") * ann_factor
+    adg = _num("adg_usd") * 100.0
+    lpr = _num("loss_profit_ratio")
+    we_max = _num("total_wallet_exposure_max")
+    n_fills = int(len(fdf)) if fdf is not None else 0
+
+    min_wallet = _calc_min_wallet_for_config(config, min_order_usd=15.0, margin_pct=0.10)
+
+    fee_str = _format_fees_from_mss(mss, coins)
+
+    header_bits = [exchange, coins_str, f"{n_days} days  ({start_str} → {end_str})"]
+    if cfg_name:
+        header_bits.append(cfg_name)
+    header = "  |  ".join(header_bits)
+    line2 = (
+        f"${start_eq:,.0f} → ${end_eq:,.0f}   |   "
+        f"Gain: {gain_pct:+.1f}% ({gain_x:.2f}x)   |   "
+        f"CAGR: {cagr_pct:+.1f}%   |   "
+        f"Max DD: {dd_worst:.1f}%"
+    )
+    line3 = (
+        f"ADG: {adg:.2f}%/day   |   Sharpe (ann): {sharpe:.2f}   |   Sortino (ann): {sortino:.2f}   |   "
+        f"Loss/Profit: {lpr:.3f}   |   Max WE: {we_max:.2f}   |   Fills: {n_fills:,}"
+    )
+    footer_bits = []
+    if fee_str:
+        footer_bits.append(f"Fees: {fee_str}")
+    if min_wallet is not None:
+        footer_bits.append(
+            f"Min wallet (init ≥ $15, +10%): ${min_wallet:,.0f} USDC"
+        )
+
+    lines = [header, line2, line3]
+    if footer_bits:
+        lines.append("   |   ".join(footer_bits))
+    return "\n".join(lines)
+
+
+def _format_fees_from_mss(mss, coins) -> str:
+    if not mss or not coins:
+        return ""
+    rates = []
+    for c in coins:
+        m = mss.get(c) if isinstance(mss, dict) else None
+        if not isinstance(m, dict):
+            continue
+        mk = m.get("maker_fee", m.get("maker"))
+        tk = m.get("taker_fee", m.get("taker"))
+        try:
+            mk_f = float(mk) if mk is not None else None
+            tk_f = float(tk) if tk is not None else None
+        except (TypeError, ValueError):
+            continue
+        if mk_f is None and tk_f is None:
+            continue
+        rates.append((mk_f, tk_f))
+    if not rates:
+        return ""
+    # If all coins share identical rates, show one pair; otherwise range.
+    makers = [r[0] for r in rates if r[0] is not None]
+    takers = [r[1] for r in rates if r[1] is not None]
+
+    def _fmt(v):
+        return f"{v * 100:.3g}%"
+
+    if makers and all(abs(x - makers[0]) < 1e-12 for x in makers) and \
+       takers and all(abs(x - takers[0]) < 1e-12 for x in takers):
+        return f"maker {_fmt(makers[0])} / taker {_fmt(takers[0])}"
+    mk_part = f"maker {_fmt(min(makers))}–{_fmt(max(makers))}" if makers else ""
+    tk_part = f"taker {_fmt(min(takers))}–{_fmt(max(takers))}" if takers else ""
+    return " / ".join([p for p in (mk_part, tk_part) if p])
+
+
+def _calc_min_wallet_for_config(config, min_order_usd: float, margin_pct: float):
+    """Minimum balance so the strategy's initial entry order clears `min_order_usd`.
+
+    Uses whichever active side (long/short with n_positions>0) produces the
+    tightest constraint (smallest initial entry → largest required balance).
+    """
+    bot = config.get("bot", {}) or {}
+    required = []
+    for side in ("long", "short"):
+        sc = bot.get(side) or {}
+        try:
+            n_pos = int(sc.get("n_positions", 0) or 0)
+            twel = float(sc.get("total_wallet_exposure_limit", 0.0) or 0.0)
+            iqp = float(sc.get("entry_initial_qty_pct", 0.0) or 0.0)
+            allowance = float(sc.get("risk_we_excess_allowance_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if n_pos <= 0 or twel <= 0.0 or iqp <= 0.0:
+            continue
+        per_coin_wel = twel / n_pos
+        eff_wel = per_coin_wel * (1.0 + max(0.0, allowance))
+        denom = eff_wel * iqp
+        if denom <= 0.0:
+            continue
+        required.append(min_order_usd / denom)
+
+    if not required:
+        return None
+    return math.ceil(max(required) * (1.0 + margin_pct))
+
+
 def post_process(
     config,
     hlcvs,
@@ -1073,6 +1269,7 @@ def post_process(
     analysis,
     results_path,
     exchange,
+    mss=None,
 ):
     sts = utc_ms()
     equities_array = np.asarray(equities_array)
@@ -1104,11 +1301,14 @@ def post_process(
     dump_config(sanitized_config, f"{results_path}config.json")
     fdf.to_csv(f"{results_path}fills.csv")
     bal_eq.to_csv(oj(results_path, "balance_and_equity.csv.gz"), compression="gzip")
+    plot_info = _build_plot_info(bal_eq, fdf, analysis, config, exchange, mss=mss)
     balance_figs = create_forager_balance_figures(
         bal_eq,
         include_logy=True,
         autoplot=False,
         return_figures=True,
+        suptitle=_build_balance_suptitle(bal_eq, fdf, analysis, config, exchange, mss=mss),
+        info=plot_info,
     )
     save_figures(balance_figs, results_path)
 
@@ -1215,9 +1415,12 @@ async def main():
     if args.config_path is None:
         logging.info(f"loading default template config configs/template.json")
         config = load_config("configs/template.json", verbose=False)
+        _source_config_path = "configs/template.json"
     else:
         logging.info(f"loading config {args.config_path}")
         config = load_config(args.config_path)
+        _source_config_path = args.config_path
+    config["_source_config_path"] = _source_config_path
     update_config_with_args(config, args, verbose=True)
     config = format_config(config, verbose=False)
     config_logging_value = get_optional_config_value(config, "logging.level", None)
@@ -1301,6 +1504,7 @@ async def main():
             analysis,
             results_path,
             exchange,
+            mss=mss,
         )
     else:
         print("combined false")
@@ -1328,6 +1532,7 @@ async def main():
                 analysis,
                 results_path,
                 exchange,
+                mss=mss,
             )
 
 
