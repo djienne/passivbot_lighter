@@ -66,8 +66,12 @@ def _is_transient_error(exc) -> bool:
 
     Note: quota errors are intentionally excluded; use ``_is_quota_error`` for those.
     """
-    # Catch asyncio/builtin TimeoutError by type (str() is often empty)
-    if isinstance(exc, (TimeoutError, OSError)):
+    # Catch asyncio/builtin TimeoutError by type (str() is often empty).
+    # asyncio.TimeoutError is only an alias of the builtin from 3.11 on; listing
+    # both keeps the classification identical on 3.10 (where aiohttp raises the
+    # asyncio one and it would otherwise fall through as fatal) and on the
+    # python:3.12 production image, where it is a harmless duplicate.
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, OSError)):
         return True
     msg = str(exc).lower()
     if "429" in msg or "too many" in msg or "invalid nonce" in msg:
@@ -1750,11 +1754,20 @@ class LighterBot(Passivbot):
         market_id = self.market_id_map[symbol]
         now_ms = int(utc_ms())
         resolution_s = self._RESOLUTION_SECONDS.get(timeframe, 60)
-        start_ts = since if since else now_ms - resolution_s * n_candles * 1000
         # Lighter API returns the last count_back candles within the window,
         # so cap the window to 500 candles (API max) to ensure forward pagination works.
         api_max = 500
         capped = min(n_candles, api_max)
+        if since:
+            # Explicit start: this is one page of a forward walk, so the window
+            # runs forward from `since` and the caller advances it.
+            start_ts = int(since)
+        else:
+            # No start given: the caller wants the most RECENT n_candles, so the
+            # window must end at now. Deriving it from n_candles instead would,
+            # for any request above the 500 cap, return the OLDEST page of that
+            # span -- a default 5000-candle fetch came back 3.1 days stale.
+            start_ts = now_ms - resolution_s * capped * 1000
         end_ts = min(now_ms, int(start_ts) + resolution_s * capped * 1000)
 
         if not await self._wait_for_read_slot():

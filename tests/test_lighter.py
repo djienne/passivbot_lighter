@@ -824,19 +824,23 @@ class TestErrorClassification:
         assert _is_transient_error(TimeoutError())
         assert _is_transient_error(OSError("connection reset by peer"))
 
-    @pytest.mark.skipif(
-        sys.version_info < (3, 11),
-        reason=(
-            "asyncio.TimeoutError only became an alias of the builtin TimeoutError "
-            "in 3.11. Production images are python:3.12 so the isinstance check in "
-            "_is_transient_error does catch aiohttp timeouts there; on an older "
-            "local interpreter it cannot."
-        ),
-    )
-    def test_asyncio_timeout_is_transient_on_prod_python(self):
-        """aiohttp raises asyncio.TimeoutError; it must count as transient."""
+    def test_asyncio_timeout_is_transient(self):
+        """aiohttp raises asyncio.TimeoutError; it must count as transient.
+
+        asyncio.TimeoutError is a distinct class from the builtin before 3.11,
+        so _is_transient_error names both. Without that, a request timeout is
+        classified fatal on 3.10 and transient on the 3.12 production image --
+        the same incident handled two different ways depending on interpreter.
+        """
         from exchanges.lighter import _is_transient_error
         assert _is_transient_error(asyncio.TimeoutError())
+
+    def test_aiohttp_timeout_errors_are_transient(self):
+        """The concrete timeout types aiohttp raises must all be retried."""
+        from exchanges.lighter import _is_transient_error
+        assert _is_transient_error(aiohttp.ServerTimeoutError())
+        assert _is_transient_error(aiohttp.ConnectionTimeoutError())
+        assert _is_transient_error(aiohttp.ClientConnectorError(MagicMock(), OSError()))
 
 
 # ===========================================================================
@@ -3738,23 +3742,21 @@ class TestFetchOhlcvs1m:
         assert result[0][4] == 15.10  # close
 
     @pytest.mark.asyncio
-    async def test_default_limit_requests_5000_candles_of_history(self, lighter_bot):
-        """Default history is 5000 candles, vs 480 for fetch_ohlcv.
+    async def test_default_limit_asks_for_api_max(self, lighter_bot):
+        """fetch_ohlcvs_1m defaults to 5000 candles, fetch_ohlcv to 480.
 
-        The request itself is capped at the API's 500-candle maximum
-        (``count_back``); the 5000 shows up as the span of the requested window,
-        which the caller pages through via ``since``.
+        Both are clamped to the API's 500-candle per-request maximum, so the
+        difference the wire actually shows is count_back 500 vs 480. Anything
+        beyond 500 has to come from paging with ``since``.
         """
         capture = []
         lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES, capture=capture)
         await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC")
+        assert capture[0][1]["count_back"] == 500  # min(5000, api_max)
 
-        _url, params = capture[0]
-        assert params["count_back"] == 500  # API max per request
-        window_start_minutes_ago = (
-            int(utc_ms()) - params["start_timestamp"]
-        ) / 60_000
-        assert window_start_minutes_ago == pytest.approx(5000, abs=5)
+        capture.clear()
+        await lighter_bot.fetch_ohlcv("HYPE/USDC:USDC", "1m")
+        assert capture[0][1]["count_back"] == 480  # min(480, api_max)
 
     @pytest.mark.asyncio
     async def test_custom_limit(self, lighter_bot):
@@ -3765,6 +3767,57 @@ class TestFetchOhlcvs1m:
 
         _url, params = capture[0]
         assert params["count_back"] == 100
+
+    @pytest.mark.asyncio
+    async def test_window_ends_at_now_when_no_since(self, lighter_bot):
+        """Without `since`, the window must end at now — not in the past.
+
+        Regression: the window used to start n_candles back and run forward only
+        `capped` (500) candles, so any request above the API max returned the
+        OLDEST page of the span. The 5000-candle default landed ~3.1 days stale,
+        which for EMA warmup means seeding from days-old prices.
+        """
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES, capture=capture)
+        await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC")  # default 5000
+
+        _url, params = capture[0]
+        now = int(utc_ms())
+        end_minutes_ago = (now - params["end_timestamp"]) / 60_000
+        span_minutes = (params["end_timestamp"] - params["start_timestamp"]) / 60_000
+        assert end_minutes_ago == pytest.approx(0, abs=2)
+        assert span_minutes == pytest.approx(500, abs=2)
+
+    @pytest.mark.asyncio
+    async def test_explicit_since_still_paginates_forward(self, lighter_bot):
+        """With `since`, the window runs forward from it — pagination unchanged.
+
+        CandlestickManager walks history by advancing `since` with limit=1000,
+        so this path must keep anchoring to the caller's start, not to now.
+        """
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES, capture=capture)
+        since = int(utc_ms()) - 3000 * 60_000  # 3000 minutes back
+        await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC", since=since, limit=1000)
+
+        _url, params = capture[0]
+        assert params["start_timestamp"] == since
+        span_minutes = (params["end_timestamp"] - params["start_timestamp"]) / 60_000
+        assert span_minutes == pytest.approx(500, abs=2)  # one page, capped
+        assert params["count_back"] == 500
+
+    @pytest.mark.asyncio
+    async def test_small_limit_window_unchanged(self, lighter_bot):
+        """A request under the 500 cap keeps its full span and ends at now."""
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES, capture=capture)
+        await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC", limit=100)
+
+        _url, params = capture[0]
+        now = int(utc_ms())
+        assert (now - params["end_timestamp"]) / 60_000 == pytest.approx(0, abs=2)
+        span_minutes = (params["end_timestamp"] - params["start_timestamp"]) / 60_000
+        assert span_minutes == pytest.approx(100, abs=2)
 
     @pytest.mark.asyncio
     async def test_unknown_symbol_returns_empty_list(self, lighter_bot):
