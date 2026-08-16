@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile_live
     image: passivbot-lighter:latest
     container_name: passivbot-lighter-live
+    # Opt-in only: retired project, but folder_list.txt says to move it back before
+    # re-enabling, so guard against a bare `docker compose up -d` waking a trader.
+    # Start deliberately with: docker compose --profile live up -d
+    profiles: ["live"]
     restart: unless-stopped
     volumes:
       - ./:/app/
@@ -26,6 +30,9 @@ services:
     deploy:
       resources:
         limits:
+          # Live bot with a 1-minute WFO rolling check; one WS + periodic REST.
+          # 1.0 matches the other always-on traders and bounds a reconnect spin.
+          cpus: "0.25"
           memory: 512M
     logging:
       driver: json-file

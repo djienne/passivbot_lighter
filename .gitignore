@@ -397,3 +397,6 @@ deploy_target.json
 
 # Claude Code local settings
 .claude/
+
+# 334MB of reference data - do not commit
+ref/

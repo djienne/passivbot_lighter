@@ -30,6 +30,10 @@ services:
     deploy:
       resources:
         limits:
+          # Watch loop wakes every 15 min to drive the VPS over SSH and download
+          # Lighter data — mostly idle, with a data-prep burst per cycle. 2.0 is
+          # ample; the heavy optimize runs on the VPS, not in this container.
+          cpus: "2.0"
           memory: 8G
     logging:
       driver: json-file
