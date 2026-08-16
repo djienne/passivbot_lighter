@@ -692,6 +692,7 @@ class TestFetchPnls:
         # fetch_pnls reads /api/v1/trades and derives realized PnL from the
         # position state on each trade; the API does not report PnL directly.
         lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot.open_orders = {"HYPE/USDC:USDC": [{"id": "1"}]}
         lighter_bot._aiohttp_session = _mock_http_session(MOCK_TRADES)
 
         pnls = await lighter_bot.fetch_pnls()
@@ -700,6 +701,111 @@ class TestFetchPnls:
         assert pnls[0]["pnl"] == pytest.approx(1.50)
         assert pnls[0]["side"] == "sell"
         assert pnls[1]["pnl"] == pytest.approx(-0.30)
+
+    @pytest.mark.asyncio
+    async def test_queries_every_traded_market(self, lighter_bot):
+        """One request per market the bot is involved with, not a fixed market.
+
+        Regression: market_id was hardcoded to 24 (HYPE on mainnet), so PnL for
+        any other coin came back empty while the parser below was already
+        written to map several markets.
+        """
+        lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot.open_orders = {
+            "HYPE/USDC:USDC": [{"id": "1"}],
+            "BTC/USDC:USDC": [{"id": "2"}],
+        }
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(
+            {"trades": []}, capture=capture
+        )
+
+        await lighter_bot.fetch_pnls()
+
+        requested = sorted(params["market_id"] for _url, params in capture)
+        assert requested == sorted(
+            [
+                lighter_bot.market_id_map["BTC/USDC:USDC"],
+                lighter_bot.market_id_map["HYPE/USDC:USDC"],
+            ]
+        )
+        assert 24 not in requested or 24 in lighter_bot.market_id_map.values()
+
+    @pytest.mark.asyncio
+    async def test_market_ids_include_held_positions(self, lighter_bot):
+        """A coin with an open position is queried even with no resting orders."""
+        lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot.open_orders = {}
+        lighter_bot.positions = {
+            "ETH/USDC:USDC": {"long": {"size": 2.0}, "short": {"size": 0.0}},
+            "BTC/USDC:USDC": {"long": {"size": 0.0}, "short": {"size": 0.0}},
+        }
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(
+            {"trades": []}, capture=capture
+        )
+
+        await lighter_bot.fetch_pnls()
+
+        requested = [params["market_id"] for _url, params in capture]
+        assert requested == [lighter_bot.market_id_map["ETH/USDC:USDC"]]
+
+    @pytest.mark.asyncio
+    async def test_fallback_reconstruction_is_per_symbol(self, lighter_bot):
+        """Without exchange position data, each symbol is walked separately.
+
+        The reconstruction carries a running net position, so folding two
+        markets into one sequence would net HYPE against BTC: the BTC buy would
+        be read as closing the HYPE long and book a fictional profit.
+        """
+        # No *_position_size_before fields -> has_position_data stays False.
+        trades = {
+            "trades": [
+                {  # HYPE: buy 1 @ 10
+                    "trade_id": 1, "market_id": 5, "timestamp": 1_000,
+                    "size": 1.0, "price": 10.0,
+                    "ask_account_id": 999, "bid_account_id": 0, "is_maker_ask": True,
+                },
+                {  # BTC: buy 1 @ 100 (different market, must not touch HYPE)
+                    "trade_id": 2, "market_id": 0, "timestamp": 2_000,
+                    "size": 1.0, "price": 100.0,
+                    "ask_account_id": 999, "bid_account_id": 0, "is_maker_ask": True,
+                },
+                {  # HYPE: sell 1 @ 12 -> closes the HYPE long for +2
+                    "trade_id": 3, "market_id": 5, "timestamp": 3_000,
+                    "size": 1.0, "price": 12.0,
+                    "ask_account_id": 0, "bid_account_id": 999, "is_maker_ask": True,
+                },
+            ]
+        }
+        lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot.open_orders = {"HYPE/USDC:USDC": [{"id": "1"}]}
+        lighter_bot._aiohttp_session = _mock_http_session(trades)
+
+        pnls = await lighter_bot.fetch_pnls()
+        by_id = {p["id"]: p for p in pnls}
+
+        # Opening trades realize nothing; the HYPE round trip realizes 1 * (12-10).
+        assert by_id["1"]["pnl"] == pytest.approx(0.0)
+        assert by_id["2"]["pnl"] == pytest.approx(0.0)
+        assert by_id["3"]["pnl"] == pytest.approx(2.0)
+        # One cross-market walk averaged BTC's 100 into the entry (avg 55) and
+        # booked -43.0 on this trade. That is the number this guards against.
+        assert by_id["3"]["pnl"] != pytest.approx(-43.0)
+
+    @pytest.mark.asyncio
+    async def test_no_known_markets_returns_empty(self, lighter_bot):
+        """With nothing approved or held, make no requests rather than guess."""
+        lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot.open_orders = {}
+        lighter_bot.positions = {}
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(
+            MOCK_TRADES, capture=capture
+        )
+
+        assert await lighter_bot.fetch_pnls() == []
+        assert capture == []
 
 
 # ===========================================================================
@@ -2894,6 +3000,7 @@ class TestFetchPnlsStringMarketId:
             ]
         }
         lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot.open_orders = {"HYPE/USDC:USDC": [{"id": "1"}]}
         lighter_bot._aiohttp_session = _mock_http_session(trades_with_string_ids)
 
         pnls = await lighter_bot.fetch_pnls()
@@ -2920,6 +3027,7 @@ class TestFetchPnlsStringMarketId:
             ]
         }
         lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot.open_orders = {"HYPE/USDC:USDC": [{"id": "1"}]}
         lighter_bot._aiohttp_session = _mock_http_session(trades_no_market_id)
 
         pnls = await lighter_bot.fetch_pnls()

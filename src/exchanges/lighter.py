@@ -1523,6 +1523,26 @@ class LighterBot(Passivbot):
         _positions, balance = res
         return balance
 
+    def _relevant_market_symbols(self):
+        """Symbols the bot is actually involved with.
+
+        Approved coins, plus anything it currently holds a position in or has
+        resting orders on -- a coin rotated out of the approved list can still
+        have an open position or fills that matter. Only symbols with a known
+        market id are returned; the empty set means "nothing known yet", and it
+        is up to the caller to decide whether that means all markets or none.
+        """
+        active = set()
+        if hasattr(self, "approved_coins_minus_ignored_coins"):
+            active.update(*self.approved_coins_minus_ignored_coins.values())
+        if hasattr(self, "positions") and isinstance(self.positions, dict):
+            for s, sides in self.positions.items():
+                if any(float(sides.get(ps, {}).get("size", 0)) != 0 for ps in ("long", "short")):
+                    active.add(s)
+        if hasattr(self, "open_orders") and isinstance(self.open_orders, dict):
+            active.update([s for s, orders in self.open_orders.items() if orders])
+        return {s for s in active if s in self.market_id_map}
+
     async def fetch_open_orders(self, symbol=None):
         """Fetch open orders from Lighter API."""
         # Serve from WS cache if fresh
@@ -1540,17 +1560,9 @@ class LighterBot(Passivbot):
                 markets_to_check = [symbol]
             else:
                 # Only check relevant markets (approved + those with positions/open orders)
-                active = set()
-                if hasattr(self, "approved_coins_minus_ignored_coins"):
-                    active.update(*self.approved_coins_minus_ignored_coins.values())
-                if hasattr(self, "positions") and isinstance(self.positions, dict):
-                    for s, sides in self.positions.items():
-                        if any(float(sides.get(ps, {}).get("size", 0)) != 0 for ps in ("long", "short")):
-                            active.add(s)
-                if hasattr(self, "open_orders") and isinstance(self.open_orders, dict):
-                    active.update([s for s, orders in self.open_orders.items() if orders])
-                markets_to_check = [s for s in active if s in self.market_id_map]
+                markets_to_check = list(self._relevant_market_symbols())
                 if not markets_to_check:
+                    # Nothing known yet -- sweep everything rather than miss an order.
                     markets_to_check = list(self.market_id_map.keys())
 
             sem = asyncio.Semaphore(3)
@@ -1860,52 +1872,78 @@ class LighterBot(Passivbot):
             auth = await self._get_auth_token()
             url = f"{self.base_url}/api/v1/trades"
 
+            # /api/v1/trades filters by a single market_id, so query per market.
+            # Scope is whatever the bot actually trades or still holds, taken from
+            # market_id_map -- this used to be a hardcoded 24 (HYPE on mainnet),
+            # which silently returned HYPE-only PnL for any other coin.
+            market_ids = sorted(
+                {self.market_id_map[s] for s in self._relevant_market_symbols()}
+            )
+            if not market_ids:
+                logging.warning(
+                    "fetch_pnls: no approved/held markets known yet - returning no trades"
+                )
+                return []
+
             # Collect trades, paginating as needed
             all_trades = []
-            cursor = None
+            seen_trade_ids = set()
             max_pages = 50 if uncapped else max(1, (limit + 99) // 100)
 
-            for _ in range(max_pages):
-                params = {
-                    "account_index": self.account_index,
-                    "auth": auth,
-                    "sort_by": "timestamp",
-                    "sort_dir": "desc",
-                    "limit": min(100, limit - len(all_trades)),
-                    "market_id": 24,
-                }
-                if cursor:
-                    params["cursor"] = cursor
-
-                session = await self._get_aiohttp_session()
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 429:
-                        self._trigger_global_backoff()
-                        break
-                    if resp.status != 200:
-                        logging.error(f"error fetching pnls: status {resp.status}")
-                        break
-                    data = await resp.json()
-
-                trades = data.get("trades", [])
-                if not trades:
-                    break
-
-                found_start = False
-                for t in trades:
-                    ts = int(t.get("timestamp", 0))
-                    if end_time and ts > int(end_time):
-                        continue
-                    if start_time and ts < int(start_time):
-                        found_start = True
-                        break
-                    all_trades.append(t)
-
-                if found_start or not data.get("next_cursor"):
-                    break
-                cursor = data.get("next_cursor")
+            for market_id in market_ids:
                 if len(all_trades) >= limit:
                     break
+                cursor = None
+
+                for _ in range(max_pages):
+                    params = {
+                        "account_index": self.account_index,
+                        "auth": auth,
+                        "sort_by": "timestamp",
+                        "sort_dir": "desc",
+                        "limit": min(100, limit - len(all_trades)),
+                        "market_id": market_id,
+                    }
+                    if cursor:
+                        params["cursor"] = cursor
+
+                    session = await self._get_aiohttp_session()
+                    async with session.get(url, params=params) as resp:
+                        if resp.status == 429:
+                            self._trigger_global_backoff()
+                            break
+                        if resp.status != 200:
+                            logging.error(
+                                f"error fetching pnls for market {market_id}: "
+                                f"status {resp.status}"
+                            )
+                            break
+                        data = await resp.json()
+
+                    trades = data.get("trades", [])
+                    if not trades:
+                        break
+
+                    found_start = False
+                    for t in trades:
+                        ts = int(t.get("timestamp", 0))
+                        if end_time and ts > int(end_time):
+                            continue
+                        if start_time and ts < int(start_time):
+                            found_start = True
+                            break
+                        tid = t.get("trade_id")
+                        if tid is not None:
+                            if tid in seen_trade_ids:
+                                continue
+                            seen_trade_ids.add(tid)
+                        all_trades.append(t)
+
+                    if found_start or not data.get("next_cursor"):
+                        break
+                    cursor = data.get("next_cursor")
+                    if len(all_trades) >= limit:
+                        break
 
             # Process trades into PnL entries
             pnls = []
@@ -1971,41 +2009,17 @@ class LighterBot(Passivbot):
 
             pnls = sorted(pnls, key=lambda x: x["timestamp"])
 
-            # Fallback: reconstruct PnL if exchange position data was absent
+            # Fallback: reconstruct PnL if exchange position data was absent.
+            # Grouped by symbol: the walk carries a running position, so folding
+            # trades from different markets into one sequence would net HYPE
+            # against SPY and produce nonsense. pnls is already timestamp-sorted,
+            # so each group stays in chronological order.
             if not has_position_data and pnls:
-                net_pos = 0.0
-                avg_entry = 0.0
+                by_symbol = {}
                 for p in pnls:
-                    qty = p["qty"]
-                    price = p["price"]
-                    trade_qty = qty if p["side"] == "buy" else -qty
-                    new_pos = net_pos + trade_qty
-                    computed_pnl = 0.0
-
-                    if net_pos == 0.0:
-                        avg_entry = price
-                    elif (net_pos > 0 and trade_qty < 0) or (net_pos < 0 and trade_qty > 0):
-                        close_qty = min(abs(trade_qty), abs(net_pos))
-                        if net_pos > 0:
-                            computed_pnl = close_qty * (price - avg_entry)
-                        else:
-                            computed_pnl = close_qty * (avg_entry - price)
-                        if new_pos != 0.0 and ((new_pos > 0) != (net_pos > 0)):
-                            avg_entry = price
-                    else:
-                        total_cost = abs(net_pos) * avg_entry + abs(trade_qty) * price
-                        if new_pos != 0.0:
-                            avg_entry = total_cost / abs(new_pos)
-
-                    net_pos = new_pos
-                    p["pnl"] = computed_pnl
-
-                    if net_pos > 0:
-                        p["position_side"] = "long"
-                    elif net_pos < 0:
-                        p["position_side"] = "short"
-                    else:
-                        p["position_side"] = "long" if trade_qty > 0 else "short"
+                    by_symbol.setdefault(p["symbol"], []).append(p)
+                for symbol_pnls in by_symbol.values():
+                    self._reconstruct_pnls_for_symbol(symbol_pnls)
 
             return pnls
         except Exception as e:
@@ -2017,6 +2031,49 @@ class LighterBot(Passivbot):
                 logging.error(f"error fetching pnls: {e}")
                 logging.debug(traceback.format_exc())
             return []
+
+    @staticmethod
+    def _reconstruct_pnls_for_symbol(pnls):
+        """Derive realized PnL for ONE symbol's trades, in place.
+
+        Used when the exchange did not carry position state on the trades. Walks
+        them chronologically keeping net position and average entry, realizing
+        PnL whenever a trade reduces the position. Must be called per symbol --
+        a single walk across markets would net one instrument against another.
+        """
+        net_pos = 0.0
+        avg_entry = 0.0
+        for p in pnls:
+            qty = p["qty"]
+            price = p["price"]
+            trade_qty = qty if p["side"] == "buy" else -qty
+            new_pos = net_pos + trade_qty
+            computed_pnl = 0.0
+
+            if net_pos == 0.0:
+                avg_entry = price
+            elif (net_pos > 0 and trade_qty < 0) or (net_pos < 0 and trade_qty > 0):
+                close_qty = min(abs(trade_qty), abs(net_pos))
+                if net_pos > 0:
+                    computed_pnl = close_qty * (price - avg_entry)
+                else:
+                    computed_pnl = close_qty * (avg_entry - price)
+                if new_pos != 0.0 and ((new_pos > 0) != (net_pos > 0)):
+                    avg_entry = price
+            else:
+                total_cost = abs(net_pos) * avg_entry + abs(trade_qty) * price
+                if new_pos != 0.0:
+                    avg_entry = total_cost / abs(new_pos)
+
+            net_pos = new_pos
+            p["pnl"] = computed_pnl
+
+            if net_pos > 0:
+                p["position_side"] = "long"
+            elif net_pos < 0:
+                p["position_side"] = "short"
+            else:
+                p["position_side"] = "long" if trade_qty > 0 else "short"
 
     # --- Order execution ---
 
