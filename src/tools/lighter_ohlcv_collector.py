@@ -3,8 +3,8 @@ Lighter DEX 1-minute OHLCV collector.
 
 Fetches all available 1m candle history from Lighter and stores as daily .npy files
 compatible with passivbot backtesting format:
-  data/ohlcvs_lighter/{COIN}/YYYY-MM-DD.npy
-  shape (1440, 6) = [timestamp_ms, open, high, low, close, volume]
+  caches/ohlcv/lighter/1m/{COIN}/YYYY-MM-DD.npy
+  dtype [('ts', int64), ('o', float32), ('h', float32), ('l', float32), ('c', float32), ('bv', float32)]
 """
 
 import asyncio
@@ -33,12 +33,13 @@ log = logging.getLogger("lighter-collector")
 # Config
 # ---------------------------------------------------------------------------
 BASE_URL = os.environ.get("BASE_URL", "https://mainnet.zklighter.elliot.ai")
-DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
+LIGHTER_DATA_DIR = Path(os.environ.get("LIGHTER_DATA_DIR", "caches/ohlcv/lighter/1m"))
 SYMBOLS = os.environ.get("SYMBOLS", "BTC,ETH,HYPE")  # comma-separated, empty = all
 EARLIEST_DATE = os.environ.get("EARLIEST_DATE", "2025-01-15")  # Lighter mainnet data starts ~Jan 17, 2025
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "3"))
 REQUEST_INTERVAL = float(os.environ.get("REQUEST_INTERVAL", "0.5"))  # seconds between requests
+RUN_ONCE = os.environ.get("RUN_ONCE", "").strip().lower() in ("1", "true", "yes", "y")
 
 MS_PER_MIN = 60_000
 MS_PER_HOUR = 3_600_000
@@ -46,9 +47,24 @@ MS_PER_DAY = 86_400_000
 WINDOW_MS = 6 * MS_PER_HOUR  # 6 h = 360 min < 500 API limit
 SKIP_WINDOW_MS = 3 * MS_PER_DAY  # jump 3 days when no data found (short enough to not overshoot new listings)
 CANDLES_PER_DAY = 1440
+# A day whose final minutes are forward-filled (padding) was only partially fetched.
+# Tolerate a few genuine zero-volume minutes before treating the tail as padding.
+PARTIAL_DAY_TAIL_TOLERANCE_MIN = 10
+# Safety cap on how many trailing partial days to drop + re-fetch in one pass.
+MAX_HEAL_DAYS = 5
 MAX_RETRIES = 8
 BACKOFF_BASE = 2.0
 BACKOFF_CAP = 120.0
+CANDLE_DTYPE = np.dtype(
+    [
+        ("ts", "<i8"),
+        ("o", "<f4"),
+        ("h", "<f4"),
+        ("l", "<f4"),
+        ("c", "<f4"),
+        ("bv", "<f4"),
+    ]
+)
 
 shutdown_event = asyncio.Event()
 _save_locks: dict[str, threading.Lock] = {}
@@ -217,7 +233,7 @@ async def fetch_candles(
 # Storage
 # ---------------------------------------------------------------------------
 def coin_dir(coin: str) -> Path:
-    d = DATA_DIR / "ohlcvs_lighter" / coin
+    d = LIGHTER_DATA_DIR / coin
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -278,46 +294,124 @@ def cleanup_tmp_files(coin: str):
             pass
 
 
+def _trailing_padded_run(arr: np.ndarray) -> int:
+    """Count trailing minutes that look forward-filled (padding).
+
+    ``build_daily_array`` fills gaps and the not-yet-existing tail of the current
+    UTC day by repeating the last real close with zero base volume, so a padded
+    bar has ``bv == 0.0`` and ``o == h == l == c``. A run of such bars at the very
+    end of a day means the day was only partially fetched.
+    """
+    if arr.dtype.fields is None or "bv" not in arr.dtype.fields:
+        return 0
+    o, h, low, c, bv = arr["o"], arr["h"], arr["l"], arr["c"], arr["bv"]
+    run = 0
+    for i in range(len(arr) - 1, -1, -1):
+        if bv[i] == 0.0 and o[i] == h[i] == low[i] == c[i]:
+            run += 1
+        else:
+            break
+    return run
+
+
+def heal_partial_days(coin: str) -> int:
+    """Drop and queue a clean re-download of any trailing partially-fetched days.
+
+    Each fetch of the in-progress UTC day forward-fills its not-yet-existing tail
+    (padding). ``save_day`` would overlay fresh candles on a later run, but only if
+    the collector actually revisits that day; to make the correction unconditional
+    we delete every trailing padded day file and rewind the cursor to the earliest
+    dropped day's start, so the normal backfill re-fetches it from scratch (no
+    leading back-fill, since fetching resumes at the day boundary).
+
+    Returns the number of day files dropped (capped at ``MAX_HEAL_DAYS``).
+    """
+    d = coin_dir(coin)
+    dropped = 0
+    earliest_start: int | None = None
+    for _ in range(MAX_HEAL_DAYS):
+        files = sorted(f for f in d.glob("*.npy") if ".tmp" not in f.name)
+        if not files:
+            break
+        last = files[-1]
+        try:
+            arr = np.load(str(last))
+        except Exception:
+            break
+        run = _trailing_padded_run(arr)
+        if run <= PARTIAL_DAY_TAIL_TOLERANCE_MIN:
+            break  # latest day is complete -> nothing more to heal
+        try:
+            last.unlink()
+        except OSError:
+            break
+        earliest_start = date_str_to_start_ms(last.stem)
+        dropped += 1
+        log.info(
+            f"[{coin}] Healing partial day {last.stem}: {run} trailing padded "
+            f"minutes -> dropped, will re-fetch"
+        )
+    if earliest_start is not None:
+        # Rewind the cursor so backfill re-fetches from the earliest dropped day.
+        set_fetched_until(coin, earliest_start)
+    return dropped
+
+
 def build_daily_array(
     candles: list[list], date_str: str, existing: np.ndarray | None = None
 ) -> np.ndarray:
     """Build a complete 1440-row daily array, forward/backward filling gaps."""
     day_start_ms = date_str_to_start_ms(date_str)
-    arr = np.full((CANDLES_PER_DAY, 6), np.nan, dtype=np.float64)
+    values = np.full((CANDLES_PER_DAY, 6), np.nan, dtype=np.float64)
 
     # Timestamps
-    arr[:, 0] = np.arange(CANDLES_PER_DAY, dtype=np.float64) * MS_PER_MIN + day_start_ms
+    values[:, 0] = np.arange(CANDLES_PER_DAY, dtype=np.float64) * MS_PER_MIN + day_start_ms
 
     # Existing data
     if existing is not None and existing.shape == (CANDLES_PER_DAY, 6):
         mask = ~np.isnan(existing[:, 1])
-        arr[mask, 1:] = existing[mask, 1:]
+        values[mask, 1:] = existing[mask, 1:]
+    elif existing is not None and existing.shape == (CANDLES_PER_DAY,):
+        if existing.dtype.fields:
+            mask = np.isfinite(existing["c"])
+            values[mask, 1] = existing["o"][mask]
+            values[mask, 2] = existing["h"][mask]
+            values[mask, 3] = existing["l"][mask]
+            values[mask, 4] = existing["c"][mask]
+            values[mask, 5] = existing["bv"][mask]
 
     # Overlay new candles (dedup: new data wins over existing)
     for c in candles:
         idx = (int(c[0]) - day_start_ms) // MS_PER_MIN
         if 0 <= idx < CANDLES_PER_DAY:
-            arr[idx, 1:] = c[1:]
+            values[idx, 1:] = c[1:]
 
     # Forward-fill gaps
     last_close = np.nan
     for i in range(CANDLES_PER_DAY):
-        if np.isnan(arr[i, 1]):
+        if np.isnan(values[i, 1]):
             if not np.isnan(last_close):
-                arr[i, 1:5] = last_close
-                arr[i, 5] = 0.0
+                values[i, 1:5] = last_close
+                values[i, 5] = 0.0
         else:
-            last_close = arr[i, 4]
+            last_close = values[i, 4]
 
     # Backward-fill leading NaN
     for i in range(CANDLES_PER_DAY):
-        if not np.isnan(arr[i, 1]):
+        if not np.isnan(values[i, 1]):
             if i > 0:
-                price = arr[i, 1]
-                arr[:i, 1:5] = price
-                arr[:i, 5] = 0.0
+                price = values[i, 1]
+                values[:i, 1:5] = price
+                values[:i, 5] = 0.0
             break
 
+    arr = np.empty((CANDLES_PER_DAY,), dtype=CANDLE_DTYPE)
+    arr["ts"] = values[:, 0].astype(np.int64)
+    arr["o"] = values[:, 1].astype(np.float32)
+    arr["h"] = values[:, 2].astype(np.float32)
+    arr["l"] = values[:, 3].astype(np.float32)
+    arr["c"] = values[:, 4].astype(np.float32)
+    arr["bv"] = values[:, 5].astype(np.float32)
     return arr
 
 
@@ -336,7 +430,7 @@ def save_day(coin: str, date_str: str, candles: list[list]):
 
         arr = build_daily_array(candles, date_str, existing)
 
-        if np.isnan(arr[:, 1]).all():
+        if np.isnan(arr["c"]).all():
             return
 
         tmp = fpath.parent / f"{fpath.stem}.tmp.npy"
@@ -363,6 +457,7 @@ async def backfill_market(session: aiohttp.ClientSession, market_id: int, coin: 
     after consecutive empty windows to skip pre-listing periods fast.
     """
     cleanup_tmp_files(coin)
+    heal_partial_days(coin)
 
     resume_ts = find_resume_ts(coin)
     if resume_ts:
@@ -425,6 +520,7 @@ async def backfill_market(session: aiohttp.ClientSession, market_id: int, coin: 
 
 async def update_market(session: aiohttp.ClientSession, market_id: int, coin: str):
     """Fetch candles since last data using windowed approach (handles large gaps)."""
+    heal_partial_days(coin)
     resume_ts = find_resume_ts(coin)
     if not resume_ts:
         return await backfill_market(session, market_id, coin)
@@ -472,15 +568,17 @@ async def run():
     signal.signal(signal.SIGTERM, _handle_signal)
 
     log.info("Lighter OHLCV Collector starting")
-    log.info(f"  Data dir:       {DATA_DIR.resolve()}")
+    log.info(f"  Data dir:       {LIGHTER_DATA_DIR.resolve()}")
     log.info(f"  Base URL:       {BASE_URL}")
     log.info(f"  Symbols:        {SYMBOLS or 'all'}")
     log.info(f"  Earliest date:  {EARLIEST_DATE}")
     log.info(f"  Poll interval:  {POLL_INTERVAL}s")
     log.info(f"  Max concurrent: {MAX_CONCURRENT}")
     log.info(f"  Request interval: {REQUEST_INTERVAL}s")
+    log.info(f"  Run once:       {RUN_ONCE}")
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(resolver=aiohttp.resolver.ThreadedResolver())
+    async with aiohttp.ClientSession(connector=connector) as session:
         markets = await discover_markets(session)
         if not markets:
             log.error("No markets found, exiting")
@@ -494,8 +592,9 @@ async def run():
         ]
         await asyncio.gather(*tasks)
 
-        if shutdown_event.is_set():
-            log.info("Collector stopped (shutdown during backfill)")
+        if shutdown_event.is_set() or RUN_ONCE:
+            reason = "shutdown during backfill" if shutdown_event.is_set() else "run once complete"
+            log.info(f"Collector stopped ({reason})")
             return
 
         # Phase 2: Continuous updates

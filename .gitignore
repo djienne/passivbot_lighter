@@ -382,6 +382,11 @@ Cargo.lock
 /caches
 /optimize_results
 
+# Windows junction pointing at lighter_ohlcv_collector/data/ohlcvs_lighter.
+# The Docker collector owns those files; git would follow the junction and
+# commit ~1900 candle files that belong to another project.
+/ohlcvs_lighter
+
 # Git worktrees
 .worktrees/
 

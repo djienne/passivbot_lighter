@@ -514,10 +514,37 @@ class HLCVManager:
         return df.reset_index(drop=True)
 
 
+def _lighter_load_day(fpath: Path) -> np.ndarray:
+    """Load one Lighter day file as a (1440, 6) float64 array.
+
+    The collector writes a structured float32 dtype; older files on disk are the
+    plain 2-D float64 layout. Accept both so a mixed directory still loads.
+    """
+    arr = np.load(str(fpath), allow_pickle=False)
+    if getattr(arr.dtype, "fields", None):
+        out = np.empty((arr.shape[0], 6), dtype=np.float64)
+        out[:, 0] = arr["ts"].astype(np.float64)
+        out[:, 1] = arr["o"].astype(np.float64)
+        out[:, 2] = arr["h"].astype(np.float64)
+        out[:, 3] = arr["l"].astype(np.float64)
+        out[:, 4] = arr["c"].astype(np.float64)
+        out[:, 5] = arr["bv"].astype(np.float64)
+        return out
+    return arr.astype(np.float64, copy=False)
+
+
 async def _prepare_hlcvs_lighter(config, coins, effective_start_ts, requested_start_ts, end_ts):
     """Load pre-downloaded Lighter daily .npy files into backtest format.
 
-    Reads from ohlcvs_lighter/{COIN}/YYYY-MM-DD.npy (shape 1440x6: ts,o,h,l,c,v).
+    Reads from ohlcvs_lighter/{COIN}/YYYY-MM-DD.npy, either the structured
+    float32 dtype written by the collector or the legacy 1440x6 float64 layout
+    (ts,o,h,l,c,v) -- see _lighter_load_day.
+
+    ohlcvs_lighter/ is a junction to lighter_ohlcv_collector's data dir, which
+    the Docker collector keeps current -- normally nothing needs collecting here.
+    If you do run src/tools/lighter_ohlcv_collector.py manually, note it defaults
+    its output to caches/ohlcv/lighter/1m, NOT this path: set
+    LIGHTER_DATA_DIR=ohlcvs_lighter to write where this reader looks.
     Returns (mss, timestamps, unified_array, btc_usd_prices).
     """
     data_dir = Path(config.get("backtest", {}).get("lighter_data_dir", "ohlcvs_lighter"))
@@ -568,7 +595,7 @@ async def _prepare_hlcvs_lighter(config, coins, effective_start_ts, requested_st
             date_str = dt.strftime("%Y-%m-%d")
             fpath = coin_dir / f"{date_str}.npy"
             if fpath.exists():
-                arr = np.load(str(fpath), allow_pickle=False)
+                arr = _lighter_load_day(fpath)
                 # Filter to requested range
                 mask = (arr[:, 0] >= effective_start_ts) & (arr[:, 0] <= end_ts)
                 if mask.any():

@@ -10,6 +10,7 @@ import sys
 import os
 import time
 import types
+import aiohttp
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,8 @@ SRC_DIR = os.path.join(ROOT_DIR, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+from utils import utc_ms
+
 from fixtures.lighter_responses import (
     MOCK_ORDER_BOOKS_RESPONSE,
     MOCK_ACCOUNT_RESPONSE,
@@ -25,6 +28,7 @@ from fixtures.lighter_responses import (
     MOCK_ACTIVE_ORDERS,
     MOCK_CANDLES,
     MOCK_INACTIVE_ORDERS,
+    MOCK_TRADES,
 )
 
 
@@ -47,6 +51,28 @@ sys.modules.setdefault("lighter.exceptions", MagicMock())
 # Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _block_live_network(monkeypatch):
+    """Fail loudly if a test actually reaches the Lighter API.
+
+    Several LighterBot methods build their own aiohttp session and call the REST
+    API directly. When a test mocks only the SDK, the HTTP path stays live and
+    the test quietly talks to the real exchange -- which is how
+    `assert 480 == 3` (a real HYPE candle count) used to happen here.
+
+    Constructing a session is still allowed, since that is inert and one test
+    asserts on it; only an outbound request is blocked.
+    """
+    async def _blocked(self, method, str_or_url, *args, **kwargs):
+        raise RuntimeError(
+            f"Live network call attempted from a test: {method} {str_or_url}. "
+            "Assign _mock_http_session(...) to the bot's _aiohttp_session, or "
+            "patch the method under test."
+        )
+
+    monkeypatch.setattr(aiohttp.ClientSession, "_request", _blocked)
+
+
 def _make_obj(d):
     """Recursively convert a dict into a namespace object."""
     if isinstance(d, dict):
@@ -55,6 +81,50 @@ def _make_obj(d):
     if isinstance(d, list):
         return [_make_obj(item) for item in d]
     return d
+
+
+def _mock_http_session(payload=None, status=200, side_effect=None, capture=None):
+    """Build a mock aiohttp session for the bot's direct-HTTP endpoints.
+
+    Several LighterBot methods (candles, pnls) call `_get_aiohttp_session()` and
+    hit the REST API directly rather than going through the lighter SDK. Assign
+    the result to `bot._aiohttp_session` so those methods stay offline -- if the
+    session is left unmocked the bot builds a real `aiohttp.ClientSession` and
+    the test silently makes a live network call.
+
+    `capture` is an optional list that receives (url, params) for each GET, for
+    assertions about what was requested.
+    """
+    resp = MagicMock()
+    resp.status = status
+    resp.json = AsyncMock(return_value=payload)
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    resp.__aexit__ = AsyncMock(return_value=False)
+
+    def _get(url, params=None, **kwargs):
+        if capture is not None:
+            capture.append((url, params))
+        if side_effect is not None:
+            raise side_effect
+        return resp
+
+    session = MagicMock()
+    session.closed = False
+    session.get.side_effect = _get
+    return session
+
+
+def _bypass_market_metadata_cache(bot):
+    """Force init_markets down the REST path and keep it from writing to disk.
+
+    init_markets short-circuits on `caches/lighter/market_metadata.json` when it
+    is under an hour old. Left alone, the first init_markets test writes that
+    file and every later one silently reads it instead of the mocked
+    order_books response -- so the tests pass or fail depending on run order and
+    on whether a previous run left a cache behind.
+    """
+    bot._load_market_metadata_cache = MagicMock(return_value=False)
+    bot._save_market_metadata_cache = MagicMock()
 
 
 def _build_order_books_response():
@@ -593,35 +663,43 @@ class TestFetchTickers:
 class TestFetchOhlcv:
     @pytest.mark.asyncio
     async def test_fetch_ohlcv(self, lighter_bot):
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(
-            return_value=_make_obj(MOCK_CANDLES)
-        )
+        # fetch_ohlcv hits /api/v1/candles directly (the SDK's CandlestickApi is
+        # only a fallback -- it has a deserialization bug that nulls OHLC values),
+        # so the HTTP session is what needs mocking here.
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES)
         candles = await lighter_bot.fetch_ohlcv("HYPE/USDC:USDC", "1m")
         assert len(candles) == 3
         c = candles[0]
         assert c == [1709500000000, 15.00, 15.20, 14.90, 15.10, 1000.0]
 
+    @pytest.mark.asyncio
+    async def test_fetch_ohlcv_falls_back_to_sdk(self, lighter_bot):
+        """If the direct HTTP call fails, the SDK path still supplies candles."""
+        lighter_bot._aiohttp_session = _mock_http_session(
+            side_effect=Exception("boom")
+        )
+        lighter_bot.candlestick_api.candlesticks = AsyncMock(
+            return_value=_make_obj(MOCK_CANDLES)
+        )
+        candles = await lighter_bot.fetch_ohlcv("HYPE/USDC:USDC", "1m")
+        assert len(candles) == 3
+        assert candles[0][0] == 1709500000000
+
 
 class TestFetchPnls:
     @pytest.mark.asyncio
     async def test_fetch_pnls(self, lighter_bot):
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value=MOCK_INACTIVE_ORDERS)
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session = MagicMock()
-        mock_session.closed = False
-        mock_session.get.return_value = mock_resp
-        lighter_bot._aiohttp_session = mock_session
+        # fetch_pnls reads /api/v1/trades and derives realized PnL from the
+        # position state on each trade; the API does not report PnL directly.
+        lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_TRADES)
 
         pnls = await lighter_bot.fetch_pnls()
         assert len(pnls) == 2
         assert pnls[0]["symbol"] == "HYPE/USDC:USDC"
-        assert pnls[0]["pnl"] == 1.50
+        assert pnls[0]["pnl"] == pytest.approx(1.50)
         assert pnls[0]["side"] == "sell"
-        assert pnls[1]["pnl"] == -0.30
+        assert pnls[1]["pnl"] == pytest.approx(-0.30)
 
 
 # ===========================================================================
@@ -733,7 +811,32 @@ class TestErrorClassification:
     def test_is_transient_error_false(self):
         from exchanges.lighter import _is_transient_error
         assert not _is_transient_error("order not found")
-        assert not _is_transient_error("network timeout")
+        assert not _is_transient_error("insufficient balance")
+
+    def test_is_transient_error_timeout(self):
+        """Timeouts are transient — they must be retried, not surfaced as fatal.
+
+        Both the message form and the bare exception type count: a timeout
+        exception often stringifies to "", so the type is checked first.
+        """
+        from exchanges.lighter import _is_transient_error
+        assert _is_transient_error("network timeout")
+        assert _is_transient_error(TimeoutError())
+        assert _is_transient_error(OSError("connection reset by peer"))
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11),
+        reason=(
+            "asyncio.TimeoutError only became an alias of the builtin TimeoutError "
+            "in 3.11. Production images are python:3.12 so the isinstance check in "
+            "_is_transient_error does catch aiohttp timeouts there; on an older "
+            "local interpreter it cannot."
+        ),
+    )
+    def test_asyncio_timeout_is_transient_on_prod_python(self):
+        """aiohttp raises asyncio.TimeoutError; it must count as transient."""
+        from exchanges.lighter import _is_transient_error
+        assert _is_transient_error(asyncio.TimeoutError())
 
 
 # ===========================================================================
@@ -752,8 +855,23 @@ class TestRateLimiting:
         lighter_bot._trigger_global_backoff()
         assert lighter_bot._global_backoff_until > time.monotonic()
         assert lighter_bot._global_backoff_consecutive == 1
+        # Escalates only once the previous window has expired.
+        lighter_bot._global_backoff_until = time.monotonic() - 0.01
         lighter_bot._trigger_global_backoff()
         assert lighter_bot._global_backoff_consecutive == 2
+
+    def test_concurrent_429s_do_not_stack(self, lighter_bot):
+        """Several 429s inside one backoff window must not compound the delay.
+
+        Requests run in parallel, so a single rate-limit episode surfaces as a
+        burst of 429s; escalating on each would jump straight to the 120s cap.
+        """
+        lighter_bot._trigger_global_backoff()
+        first_until = lighter_bot._global_backoff_until
+        for _ in range(5):
+            lighter_bot._trigger_global_backoff()
+        assert lighter_bot._global_backoff_consecutive == 1
+        assert lighter_bot._global_backoff_until == first_until
 
     def test_reset_global_backoff(self, lighter_bot):
         lighter_bot._global_backoff_consecutive = 3
@@ -970,10 +1088,15 @@ class TestAuthTokenExpiry:
         lighter_bot._auth_token_ts = time.time() - 100
         assert await lighter_bot._get_auth_token() == "cached_token"
 
+    # Tokens are minted with deadline=3600 and reused for 3300s, so "expired"
+    # means older than 3300s — not the 500s these tests used to use, which is
+    # still inside the cache window and never reached the refresh path at all.
+    EXPIRED_AGE = 3400
+
     @pytest.mark.asyncio
     async def test_expired_token_refreshes(self, lighter_bot):
         lighter_bot._auth_token = "old_token"
-        lighter_bot._auth_token_ts = time.time() - 500
+        lighter_bot._auth_token_ts = time.time() - self.EXPIRED_AGE
         lighter_bot.lighter_client.create_auth_token_with_expiry.return_value = (
             "new_token", None
         )
@@ -983,9 +1106,19 @@ class TestAuthTokenExpiry:
     @pytest.mark.asyncio
     async def test_token_refresh_error_returns_old(self, lighter_bot):
         lighter_bot._auth_token = "old_token"
-        lighter_bot._auth_token_ts = time.time() - 500
+        lighter_bot._auth_token_ts = time.time() - self.EXPIRED_AGE
         lighter_bot.lighter_client.create_auth_token_with_expiry.return_value = (
             None, "auth error"
+        )
+        assert await lighter_bot._get_auth_token() == "old_token"
+
+    @pytest.mark.asyncio
+    async def test_token_just_inside_ttl_is_reused(self, lighter_bot):
+        """Boundary: at 3299s the cached token is still served."""
+        lighter_bot._auth_token = "old_token"
+        lighter_bot._auth_token_ts = time.time() - 3299
+        lighter_bot.lighter_client.create_auth_token_with_expiry.return_value = (
+            "new_token", None
         )
         assert await lighter_bot._get_auth_token() == "old_token"
 
@@ -1933,11 +2066,19 @@ class TestCancelRespCodeError:
         )
         lighter_bot.fetch_open_orders = AsyncMock(return_value=[])
 
-        async def _timeout(coro, timeout):
-            coro.close()
-            raise asyncio.TimeoutError()
+        # execute_cancellation uses asyncio.wait_for twice: a 30s guard around
+        # send_tx, and a 2s wait for the WS cancel confirmation. Only the second
+        # should time out here — timing out the first would abort the send and
+        # never reach the REST-fallback path this test is about.
+        real_wait_for = asyncio.wait_for
 
-        with patch("asyncio.wait_for", side_effect=_timeout):
+        async def _timeout_confirmation_only(coro, timeout):
+            if timeout <= 5:  # the WS confirmation wait
+                coro.close()
+                raise asyncio.TimeoutError()
+            return await real_wait_for(coro, timeout)
+
+        with patch("asyncio.wait_for", side_effect=_timeout_confirmation_only):
             order = {"id": "501", "symbol": "HYPE/USDC:USDC"}
             result = await lighter_bot.execute_cancellation(order)
 
@@ -2238,7 +2379,7 @@ class TestQuotaRecoveryOrderError:
 class TestSubscribeWsChannelsComplete:
     @pytest.mark.asyncio
     async def test_subscribes_all_channels(self, lighter_bot):
-        """Should subscribe to account_orders (per market), account_all, and user_stats."""
+        """account_orders + ticker per market, plus account_all and user_stats."""
         ws_mock = AsyncMock()
         auth = "test_auth"
         lighter_bot.active_symbols = ["HYPE/USDC:USDC", "BTC/USDC:USDC"]
@@ -2246,14 +2387,30 @@ class TestSubscribeWsChannelsComplete:
         await lighter_bot._subscribe_ws_channels(ws_mock, auth)
 
         calls = [str(c) for c in ws_mock.send.call_args_list]
-        # 2 account_orders (one per market) + 1 account_all + 1 user_stats = 4
-        assert ws_mock.send.call_count == 4
+        # per market: account_orders + ticker (2 each), plus account_all and
+        # user_stats once = 6. ticker carries real-time BBO and is public.
+        assert ws_mock.send.call_count == 6
         account_orders_calls = [c for c in calls if "account_orders" in c]
         account_all_calls = [c for c in calls if "account_all" in c]
         user_stats_calls = [c for c in calls if "user_stats" in c]
+        ticker_calls = [c for c in calls if "ticker/" in c]
         assert len(account_orders_calls) == 2
         assert len(account_all_calls) == 1
         assert len(user_stats_calls) == 1
+        assert len(ticker_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_ticker_subscription_is_unauthenticated(self, lighter_bot):
+        """ticker is a public channel — the auth token must not be sent with it."""
+        ws_mock = AsyncMock()
+        lighter_bot.active_symbols = ["HYPE/USDC:USDC"]
+
+        await lighter_bot._subscribe_ws_channels(ws_mock, "secret_token")
+
+        for call in ws_mock.send.call_args_list:
+            payload = call.args[0]
+            if "ticker/" in payload:
+                assert "secret_token" not in payload
 
 
 # ===========================================================================
@@ -2607,15 +2764,33 @@ class TestBatchOrderRawValues:
 class TestDetermineUtcOffset:
     @pytest.mark.asyncio
     async def test_offset_from_server_timestamp(self, lighter_bot):
-        """Should compute offset from server timestamp."""
+        """Should compute offset from server timestamp.
+
+        Lighter reports status.timestamp in SECONDS; determine_utc_offset scales
+        it to milliseconds itself, so the mock must supply seconds too.
+        """
         mock_root_api = MagicMock()
         mock_root_api.status = AsyncMock(
-            return_value=types.SimpleNamespace(timestamp=str(time.time() * 1000))
+            return_value=types.SimpleNamespace(timestamp=str(time.time()))
         )
         with patch("lighter.RootApi", return_value=mock_root_api):
             await lighter_bot.determine_utc_offset(verbose=False)
-        # Offset should be close to 0 since we used current time
-        assert abs(lighter_bot.utc_offset) < 3600 * 1000  # less than 1 hour
+        # Server clock == local clock, and the offset snaps to whole hours.
+        assert lighter_bot.utc_offset == 0
+
+    @pytest.mark.asyncio
+    async def test_offset_rounds_to_whole_hours(self, lighter_bot):
+        """A server 3h ahead yields exactly +3h, not a ragged millisecond delta."""
+        three_hours_s = 3 * 60 * 60
+        mock_root_api = MagicMock()
+        mock_root_api.status = AsyncMock(
+            return_value=types.SimpleNamespace(
+                timestamp=str(time.time() + three_hours_s)
+            )
+        )
+        with patch("lighter.RootApi", return_value=mock_root_api):
+            await lighter_bot.determine_utc_offset(verbose=False)
+        assert lighter_bot.utc_offset == 3 * 60 * 60 * 1000
 
     @pytest.mark.asyncio
     async def test_offset_defaults_to_zero_on_error(self, lighter_bot):
@@ -2637,9 +2812,15 @@ class TestBackoffEscalation:
         assert lighter_bot._rl_backoff_base == 15.0
 
     def test_backoff_escalation_sequence(self, lighter_bot):
-        """Verify escalation: 15 -> 30 -> 60 -> 120 (capped)."""
+        """Verify escalation: 15 -> 30 -> 60 -> 120 (capped).
+
+        Each step expires the current window first: _trigger_global_backoff is
+        deliberately a no-op while a window is still open, so that concurrent
+        429s can't stack the counter (see test_concurrent_429s_do_not_stack).
+        """
         expected = [15.0, 30.0, 60.0, 120.0, 120.0]
         for i, exp in enumerate(expected):
+            lighter_bot._global_backoff_until = time.monotonic() - 0.01
             before = time.monotonic()
             lighter_bot._trigger_global_backoff()
             duration = lighter_bot._global_backoff_until - before
@@ -2650,13 +2831,16 @@ class TestBackoffEscalation:
     def test_backoff_resets_after_consecutive_successes(self, lighter_bot):
         """After reset, escalation starts over from 15s."""
         lighter_bot._trigger_global_backoff()  # 15s
+        lighter_bot._global_backoff_until = time.monotonic() - 0.01  # expire it
         lighter_bot._trigger_global_backoff()  # 30s
+        assert lighter_bot._global_backoff_consecutive == 2
         # Reset
         lighter_bot._consecutive_successes = 0
         lighter_bot._reset_global_backoff()
         lighter_bot._reset_global_backoff()  # need 2 consecutive
         assert lighter_bot._global_backoff_consecutive == 0
         # Next backoff should be 15s again
+        lighter_bot._global_backoff_until = time.monotonic() - 0.01
         before = time.monotonic()
         lighter_bot._trigger_global_backoff()
         duration = lighter_bot._global_backoff_until - before
@@ -2689,64 +2873,50 @@ class TestFetchPnlsStringMarketId:
     @pytest.mark.asyncio
     async def test_fetch_pnls_string_market_id(self, lighter_bot):
         """market_id from JSON may be string '5' — should resolve correctly."""
-        orders_with_string_ids = {
-            "orders": [
+        trades_with_string_ids = {
+            "trades": [
                 {
-                    "order_index": 100001,
-                    "client_order_index": 200001,
+                    "trade_id": 900001,
                     "market_id": "5",  # string, not int
-                    "is_ask": True,
-                    "status": "filled",
-                    "price": 15.50,
-                    "size": 2.0,
                     "timestamp": 1709400000000,
-                    "realized_pnl": 1.50,
+                    "size": 2.0,
+                    "price": 15.75,
+                    "ask_account_id": 0,
+                    "bid_account_id": 999,
+                    "is_maker_ask": True,
+                    "maker_position_size_before": 2.0,
+                    "maker_entry_quote_before": 30.0,
                 },
             ]
         }
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value=orders_with_string_ids)
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session = MagicMock()
-        mock_session.closed = False
-        mock_session.get.return_value = mock_resp
-        lighter_bot._aiohttp_session = mock_session
+        lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot._aiohttp_session = _mock_http_session(trades_with_string_ids)
 
         pnls = await lighter_bot.fetch_pnls()
         assert len(pnls) == 1
         assert pnls[0]["symbol"] == "HYPE/USDC:USDC"
-        assert pnls[0]["pnl"] == 1.50
+        assert pnls[0]["pnl"] == pytest.approx(1.50)
 
     @pytest.mark.asyncio
     async def test_fetch_pnls_missing_market_id(self, lighter_bot):
         """If market_id is missing, symbol should be empty string."""
-        orders_no_market_id = {
-            "orders": [
+        trades_no_market_id = {
+            "trades": [
                 {
-                    "order_index": 100001,
-                    "client_order_index": 200001,
-                    "is_ask": False,
-                    "status": "filled",
-                    "price": 14.80,
-                    "size": 1.0,
+                    "trade_id": 900001,
                     "timestamp": 1709400000000,
-                    "realized_pnl": 0.50,
+                    "size": 1.0,
+                    "price": 14.80,
+                    "ask_account_id": 999,
+                    "bid_account_id": 0,
+                    "is_maker_ask": True,
+                    "taker_position_size_before": 1.0,
+                    "taker_entry_quote_before": 14.30,
                 },
             ]
         }
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value=orders_no_market_id)
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session = MagicMock()
-        mock_session.closed = False
-        mock_session.get.return_value = mock_resp
-        lighter_bot._aiohttp_session = mock_session
+        lighter_bot._get_auth_token = AsyncMock(return_value="tok")
+        lighter_bot._aiohttp_session = _mock_http_session(trades_no_market_id)
 
         pnls = await lighter_bot.fetch_pnls()
         assert len(pnls) == 1
@@ -3129,6 +3299,7 @@ class TestInitMarketsFlow:
     async def test_init_markets_populates_all_fields(self, lighter_bot):
         """init_markets should populate markets_dict, caches, and settings."""
         # Mock all dependencies
+        _bypass_market_metadata_cache(lighter_bot)
         lighter_bot.order_api.order_books = AsyncMock(
             return_value=_build_order_books_response()
         )
@@ -3167,9 +3338,16 @@ class TestInitMarketsFlow:
         # Verify settings populated
         assert "HYPE/USDC:USDC" in lighter_bot.symbol_ids
 
-        # Verify per-market maxLeverage from API
+        # maxLeverage comes from the hardcoded _max_leverage_overrides table,
+        # NOT from the order_books payload -- the Lighter SDK does not expose a
+        # per-market leverage field, so every market that is not listed in the
+        # override table gets _max_leverage_default.
+        assert lighter_bot._max_leverage_overrides == {"HYPE": 20}
+        assert lighter_bot._max_leverage_default == 20
         assert lighter_bot.markets_dict["HYPE/USDC:USDC"]["info"]["maxLeverage"] == 20
-        assert lighter_bot.markets_dict["BTC/USDC:USDC"]["info"]["maxLeverage"] == 100
+        assert lighter_bot.markets_dict["BTC/USDC:USDC"]["info"]["maxLeverage"] == 20
+        # The fixture advertises max_leverage 100 for BTC; the code ignores it.
+        assert MOCK_ORDER_BOOKS_RESPONSE["order_books"][1]["max_leverage"] == 100
 
 
 # ===========================================================================
@@ -3553,30 +3731,40 @@ class TestFetchOhlcvs1m:
     @pytest.mark.asyncio
     async def test_returns_candles(self, lighter_bot):
         """fetch_ohlcvs_1m should return parsed candle data."""
-        mock_resp = _make_obj(MOCK_CANDLES)
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(return_value=mock_resp)
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES)
         result = await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC")
         assert len(result) == 3
         assert result[0][0] == 1709500000000  # timestamp
         assert result[0][4] == 15.10  # close
 
     @pytest.mark.asyncio
-    async def test_default_limit_is_5000(self, lighter_bot):
-        """Default limit should be 5000, not 480 like fetch_ohlcv."""
-        mock_resp = _make_obj(MOCK_CANDLES)
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(return_value=mock_resp)
+    async def test_default_limit_requests_5000_candles_of_history(self, lighter_bot):
+        """Default history is 5000 candles, vs 480 for fetch_ohlcv.
+
+        The request itself is capped at the API's 500-candle maximum
+        (``count_back``); the 5000 shows up as the span of the requested window,
+        which the caller pages through via ``since``.
+        """
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES, capture=capture)
         await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC")
-        call_kwargs = lighter_bot.candlestick_api.candlesticks.call_args[1]
-        assert call_kwargs["count_back"] == 5000
+
+        _url, params = capture[0]
+        assert params["count_back"] == 500  # API max per request
+        window_start_minutes_ago = (
+            int(utc_ms()) - params["start_timestamp"]
+        ) / 60_000
+        assert window_start_minutes_ago == pytest.approx(5000, abs=5)
 
     @pytest.mark.asyncio
     async def test_custom_limit(self, lighter_bot):
         """Custom limit should be passed through."""
-        mock_resp = _make_obj(MOCK_CANDLES)
-        lighter_bot.candlestick_api.candlesticks = AsyncMock(return_value=mock_resp)
+        capture = []
+        lighter_bot._aiohttp_session = _mock_http_session(MOCK_CANDLES, capture=capture)
         await lighter_bot.fetch_ohlcvs_1m("HYPE/USDC:USDC", limit=100)
-        call_kwargs = lighter_bot.candlestick_api.candlesticks.call_args[1]
-        assert call_kwargs["count_back"] == 100
+
+        _url, params = capture[0]
+        assert params["count_back"] == 100
 
     @pytest.mark.asyncio
     async def test_unknown_symbol_returns_empty_list(self, lighter_bot):
@@ -3586,7 +3774,14 @@ class TestFetchOhlcvs1m:
 
     @pytest.mark.asyncio
     async def test_error_returns_empty_list(self, lighter_bot):
-        """Exception should return [] (not False like fetch_ohlcv)."""
+        """Exception should return [] (not False like fetch_ohlcv).
+
+        Both the direct HTTP path and the SDK fallback must fail for the call to
+        give up, so both are made to raise.
+        """
+        lighter_bot._aiohttp_session = _mock_http_session(
+            side_effect=Exception("API error")
+        )
         lighter_bot.candlestick_api.candlesticks = AsyncMock(
             side_effect=Exception("API error")
         )
@@ -3601,7 +3796,9 @@ class TestFetchOhlcvs1m:
 class TestInitMarketsMalformed:
     @pytest.fixture
     def lighter_bot(self):
-        return _create_bot()
+        bot = _create_bot()
+        _bypass_market_metadata_cache(bot)
+        return bot
 
     @pytest.mark.asyncio
     async def test_init_markets_api_error_raises(self, lighter_bot):
@@ -3925,7 +4122,14 @@ class TestFetchOhlcvReturnsEmptyList:
 
     @pytest.mark.asyncio
     async def test_exception_returns_empty_list(self, lighter_bot):
-        """fetch_ohlcv should return [] on exception, not False."""
+        """fetch_ohlcv should return [] on exception, not False.
+
+        Both the direct HTTP path and the SDK fallback must fail before the call
+        gives up, so both are made to raise.
+        """
+        lighter_bot._aiohttp_session = _mock_http_session(
+            side_effect=Exception("API error")
+        )
         lighter_bot.candlestick_api.candlesticks = AsyncMock(
             side_effect=Exception("API error")
         )

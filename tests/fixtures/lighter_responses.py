@@ -176,3 +176,44 @@ MOCK_CANCEL_RESPONSE_FAIL = {
     "code": 1,
     "message": "Order not found",
 }
+
+# Simulates GET /api/v1/trades, the endpoint fetch_pnls uses.
+#
+# Realized PnL is not reported by the API -- it is computed from the position
+# state carried on each trade: avg_entry = {role}_entry_quote_before /
+# {role}_position_size_before, then close_qty * (price - avg_entry) for a long
+# being reduced. `role` is maker or taker, resolved from ask_account_id and
+# is_maker_ask relative to our own account_index (0 in tests).
+#
+# Both trades below are our account selling into an existing long at an average
+# entry of 15.0:
+#   trade 1: 2.0 @ 15.75 -> +1.50
+#   trade 2: 3.0 @ 14.90 -> -0.30
+MOCK_TRADES = {
+    "trades": [
+        {
+            "trade_id": 900001,
+            "market_id": 5,
+            "timestamp": 1709400000000,
+            "size": 2.0,
+            "price": 15.75,
+            "ask_account_id": 0,  # we are the ask -> side "sell"
+            "bid_account_id": 999,
+            "is_maker_ask": True,  # we are the maker -> maker_* fields apply
+            "maker_position_size_before": 2.0,
+            "maker_entry_quote_before": 30.0,  # avg entry 15.0
+        },
+        {
+            "trade_id": 900002,
+            "market_id": 5,
+            "timestamp": 1709400100000,
+            "size": 3.0,
+            "price": 14.90,
+            "ask_account_id": 0,
+            "bid_account_id": 999,
+            "is_maker_ask": True,
+            "maker_position_size_before": 3.0,
+            "maker_entry_quote_before": 45.0,  # avg entry 15.0
+        },
+    ]
+}
