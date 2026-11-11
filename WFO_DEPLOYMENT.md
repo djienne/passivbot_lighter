@@ -1,5 +1,7 @@
 # WFO Live Deployment — Architecture & Operations Runbook
 
+> **RETIRED 2026-08-16:** the AWS Tokyo box this runbook deploys to was closed (too expensive) and replaced by a Linode (Akamai) Tokyo VPS, which runs only XEMM (see `Desktop\freqtrade\VPS\README.md`). The live Lighter bot and its monthly WFO upload run nowhere now (not needed, user 2026-08-15). History only.
+
 Operational companion to **`WALK_FORWARD_REQUIREMENTS.md`** (the feature spec, R1–R19).
 That document explains *what* walk-forward optimization is and *why*; this one explains
 the *deployed system* as it actually runs today — the moving parts, how to monitor it,

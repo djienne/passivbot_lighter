@@ -1,5 +1,7 @@
 # Switching the live WFO train length (tX) on the Lighter VPS
 
+> **RETIRED 2026-08-16:** the "Lighter VPS" here is the AWS Tokyo box, closed (too expensive) and replaced by a Linode (Akamai) Tokyo VPS, which runs only XEMM (see `Desktop\freqtrade\VPS\README.md`). The live HYPE Lighter bot runs nowhere now. History only.
+
 How to change the live HYPE bot from one walk-forward train length to another
 (e.g. **t8 → t12**). Verified end-to-end on 2026-06-08 when we switched the live
 deployment from t8 to t12.
